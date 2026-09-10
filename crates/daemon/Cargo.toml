@@ -1,0 +1,13 @@
+[package]
+name = "renderer-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+renderer-core = { path = "../renderer" }
+renderer-schema = { path = "../schema" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"

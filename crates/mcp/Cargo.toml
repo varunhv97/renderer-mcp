@@ -1,0 +1,19 @@
+[package]
+name = "renderer-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "renderer-mcp"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+renderer-daemon = { path = "../daemon" }
+renderer-schema = { path = "../schema" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"
+serde_json.workspace = true
