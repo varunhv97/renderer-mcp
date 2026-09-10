@@ -132,6 +132,16 @@ impl RendererDaemon {
             .render_png(&self.scenes.get(scene_id)?.scene, output)?)
     }
 
+    pub fn render_gif_scene(
+        &self,
+        scene_id: &str,
+        output: &Path,
+    ) -> Result<RenderedImage, DaemonError> {
+        Ok(self
+            .renderer
+            .render_gif(&self.scenes.get(scene_id)?.scene, output)?)
+    }
+
     pub fn render_inline(
         &self,
         scene: &SceneV1,
@@ -330,6 +340,10 @@ pub enum DaemonRequest {
         scene_id: String,
         output: PathBuf,
     },
+    RenderGifScene {
+        scene_id: String,
+        output: PathBuf,
+    },
     DestroyScene {
         scene_id: String,
     },
@@ -442,6 +456,12 @@ fn dispatch(daemon: &mut RendererDaemon, request: DaemonRequest) -> DaemonRespon
             .map(|revision| DaemonResult::Revision { revision }),
         DaemonRequest::RenderScene { scene_id, output } => daemon
             .render_scene(&scene_id, &output)
+            .map(|image| DaemonResult::Rendered {
+                output,
+                image: image.into(),
+            }),
+        DaemonRequest::RenderGifScene { scene_id, output } => daemon
+            .render_gif_scene(&scene_id, &output)
             .map(|image| DaemonResult::Rendered {
                 output,
                 image: image.into(),

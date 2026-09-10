@@ -37,4 +37,6 @@ cargo run -p renderer-cli -- scene --endpoint 127.0.0.1:9472 render demo --outpu
 
 MCP named-scene tools use the same endpoint supplied in
 `RENDERER_DAEMON_ENDPOINT`. The existing `render_scene` MCP tool remains
-available for one-shot inline renders.
+available for one-shot inline renders. Named-scene MCP tools include create,
+get, replace, patch, inline PNG rendering, inline GIF export, local inspection,
+and destroy. Named exports require an explicit `.png` or `.gif` output path.

@@ -1103,9 +1103,11 @@ name = "renderer-mcp"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "image",
  "renderer-daemon",
  "renderer-schema",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
