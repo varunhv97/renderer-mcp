@@ -61,7 +61,7 @@ fn named_scene_tool(name: &str) -> serde_json::Value {
         "create_scene" => (
             "Create a named scene in RENDERER_DAEMON_ENDPOINT.",
             serde_json::json!(["scene_id", "scene"]),
-            serde_json::json!({ "scene_id": { "type": "string" }, "scene": { "type": "object" } }),
+            serde_json::json!({ "scene_id": { "type": "string" }, "scene": { "type": "object" }, "asset_root": { "type": "string" } }),
         ),
         "get_scene" => (
             "Get a named scene and its revision.",
@@ -76,7 +76,7 @@ fn named_scene_tool(name: &str) -> serde_json::Value {
         "replace_scene" => (
             "Replace a named scene, optionally requiring its current revision.",
             serde_json::json!(["scene_id", "scene"]),
-            serde_json::json!({ "scene_id": { "type": "string" }, "scene": { "type": "object" }, "expected_revision": { "type": "integer", "minimum": 1 } }),
+            serde_json::json!({ "scene_id": { "type": "string" }, "scene": { "type": "object" }, "expected_revision": { "type": "integer", "minimum": 1 }, "asset_root": { "type": "string" } }),
         ),
         "render_named_scene" => (
             "Render a named scene to a local PNG path and return inline image content.",
@@ -176,6 +176,10 @@ fn call_named_scene_tool(
                 arguments.get("scene").cloned().ok_or("scene is required")?,
             )
             .map_err(|error| format!("invalid SceneV1: {error}"))?,
+            asset_root: arguments
+                .get("asset_root")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from),
         }),
         "get_scene" => client.call(DaemonRequest::GetScene {
             scene_id: scene_id()?,
@@ -187,6 +191,10 @@ fn call_named_scene_tool(
             )
             .map_err(|error| format!("invalid SceneV1: {error}"))?,
             expected_revision: expected_revision(arguments)?,
+            asset_root: arguments
+                .get("asset_root")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from),
         }),
         "patch_scene" => client.call(DaemonRequest::PatchScene {
             scene_id: scene_id()?,

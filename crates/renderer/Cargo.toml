@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+fontdue.workspace = true
 image.workspace = true
 pollster.workspace = true
 renderer-schema = { path = "../schema" }

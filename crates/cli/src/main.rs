@@ -4,7 +4,11 @@ use renderer_daemon::{DaemonClient, DaemonRequest, DaemonResult, RenderResult, s
 use renderer_schema::{ScenePatchV1, SceneV1};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 #[derive(Parser)]
 #[command(
@@ -113,10 +117,11 @@ fn render_direct(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
     let scene = read_json::<SceneV1>(&input)?;
     let output = output.unwrap_or_else(|| PathBuf::from(".renderer/output/render.png"));
     let daemon = renderer_daemon::RendererDaemon::new()?;
+    let asset_root = asset_root_for(&input);
     let rendered = if output.extension().and_then(|extension| extension.to_str()) == Some("gif") {
-        daemon.render_gif_inline(&scene, &output)?
+        daemon.render_gif_inline_with_asset_root(&scene, &output, &asset_root)?
     } else {
-        daemon.render_inline(&scene, &output)?
+        daemon.render_inline_with_asset_root(&scene, &output, &asset_root)?
     };
     print_json(render_metadata(output, rendered.into()))
 }
@@ -143,6 +148,7 @@ fn run_scene_command(endpoint: SocketAddr, command: SceneCommand) -> Result<()> 
         SceneCommand::Create { scene_id, input } => client.call(DaemonRequest::CreateScene {
             scene_id,
             scene: read_json(&input)?,
+            asset_root: Some(asset_root_for(&input)),
         })?,
         SceneCommand::Get { scene_id } => client.call(DaemonRequest::GetScene { scene_id })?,
         SceneCommand::Replace {
@@ -153,6 +159,7 @@ fn run_scene_command(endpoint: SocketAddr, command: SceneCommand) -> Result<()> 
             scene_id,
             scene: read_json(&input)?,
             expected_revision,
+            asset_root: Some(asset_root_for(&input)),
         })?,
         SceneCommand::Patch { scene_id, input } => client.call(DaemonRequest::PatchScene {
             scene_id,
@@ -174,6 +181,14 @@ fn run_scene_command(endpoint: SocketAddr, command: SceneCommand) -> Result<()> 
         SceneCommand::Health => client.call(DaemonRequest::Health)?,
     };
     print_daemon_result(result)
+}
+
+fn asset_root_for(input: &Path) -> PathBuf {
+    input
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<T> {
@@ -203,4 +218,18 @@ fn render_metadata(path: PathBuf, rendered: RenderResult) -> serde_json::Value {
 fn print_json(value: impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string(&value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_current_directory_for_bare_scene_filenames() {
+        assert_eq!(asset_root_for(Path::new("scene.json")), PathBuf::from("."));
+        assert_eq!(
+            asset_root_for(Path::new("fixtures/scene.json")),
+            PathBuf::from("fixtures")
+        );
+    }
 }

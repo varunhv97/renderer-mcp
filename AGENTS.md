@@ -48,7 +48,14 @@ server. Update these examples when package names or invocation contracts change.
   stable, meaningful coverage; document any approved tolerance.
 - Maintain at least 65% line coverage across the workspace. Run `cargo llvm-cov`
   with `--fail-under-lines 65` locally and enforce the same command in CI.
-  Increase this threshold as the renderer gains a portable GPU test backend.
+- Treat this as a guardrail, not a substitute for behavior coverage. Every
+  change must cover its important success and failure paths; in particular,
+  tests must exercise scene validation/resource limits, atomic patches and
+  revision conflicts, daemon protocol size/time limits, artifact hashes and
+  MIME handling, local asset containment, and renderer geometry/animation
+  logic that is portable without a GPU. GPU smoke tests remain required where
+  an adapter is available. Increase the threshold once a portable GPU backend
+  makes hardware paths instrumentable.
 
 ## Commits and pull requests
 

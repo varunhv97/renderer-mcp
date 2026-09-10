@@ -1,6 +1,7 @@
 //! Off-screen wgpu renderer for normalized RendererCli scenes.
 
 use bytemuck::{Pod, Zeroable};
+use fontdue::Font;
 use image::{
     Delay, Frame, RgbaImage,
     codecs::gif::{GifEncoder, Repeat},
@@ -16,11 +17,19 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 const ELLIPSE_SEGMENTS: usize = 32;
+const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ASSET_PIXELS: u64 = 16_000_000;
+const MAX_IMAGE_RASTER_PIXELS: u64 = 4_000_000;
+const MAX_TEXT_BYTES: usize = 16 * 1024;
+const MAX_TEXT_GLYPHS: usize = 4_096;
+const MAX_GLYPH_SIZE: f32 = 1_024.0;
+const MAX_TEXT_RASTER_PIXELS: u64 = 4_000_000;
 
 #[derive(Debug)]
 pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    font: Font,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +61,10 @@ pub enum RenderError {
     Gif(#[source] image::ImageError),
     #[error("could not hash emitted output: {0}")]
     OutputRead(#[source] std::io::Error),
+    #[error("could not load bundled font")]
+    Font,
+    #[error("asset error: {0}")]
+    Asset(String),
 }
 
 impl GpuRenderer {
@@ -61,14 +74,25 @@ impl GpuRenderer {
 
     async fn new_async() -> Result<Self, RenderError> {
         let instance = wgpu::Instance::default();
-        let adapter = instance
+        let adapter = if let Some(adapter) = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(RenderError::NoAdapter)?;
+        {
+            adapter
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: true,
+                })
+                .await
+                .ok_or(RenderError::NoAdapter)?
+        };
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -79,13 +103,33 @@ impl GpuRenderer {
                 None,
             )
             .await?;
-        Ok(Self { device, queue })
+        let font = Font::from_bytes(
+            include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .map_err(|_| RenderError::Font)?;
+        Ok(Self {
+            device,
+            queue,
+            font,
+        })
     }
 
     pub fn render_png(&self, scene: &SceneV1, output: &Path) -> Result<RenderedImage, RenderError> {
+        let root =
+            std::env::current_dir().map_err(|error| RenderError::Asset(error.to_string()))?;
+        self.render_png_with_asset_root(scene, output, &root)
+    }
+
+    pub fn render_png_with_asset_root(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+        asset_root: &Path,
+    ) -> Result<RenderedImage, RenderError> {
         scene.validate()?;
         ensure_png_output_path(output)?;
-        let (pixels, warnings) = self.render_rgba(scene)?;
+        let (pixels, warnings) = self.render_rgba_with_asset_root(scene, asset_root)?;
         fs::create_dir_all(output.parent().unwrap_or(Path::new(".")))
             .map_err(RenderError::OutputDirectory)?;
         RgbaImage::from_raw(scene.canvas.width, scene.canvas.height, pixels.clone())
@@ -102,6 +146,17 @@ impl GpuRenderer {
     }
 
     pub fn render_gif(&self, scene: &SceneV1, output: &Path) -> Result<RenderedImage, RenderError> {
+        let root =
+            std::env::current_dir().map_err(|error| RenderError::Asset(error.to_string()))?;
+        self.render_gif_with_asset_root(scene, output, &root)
+    }
+
+    pub fn render_gif_with_asset_root(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+        asset_root: &Path,
+    ) -> Result<RenderedImage, RenderError> {
         scene.validate()?;
         let timeline = scene.timeline.as_ref().ok_or(RenderError::InvalidScene(
             renderer_schema::SceneValidationError::InvalidTimeline,
@@ -121,7 +176,8 @@ impl GpuRenderer {
             for frame_index in 0..frame_count {
                 let at_ms = frame_index * 1_000 / fps;
                 let animated = scene_at(scene, at_ms);
-                let (pixels, frame_warnings) = self.render_rgba(&animated)?;
+                let (pixels, frame_warnings) =
+                    self.render_rgba_with_asset_root(&animated, asset_root)?;
                 warnings.extend(frame_warnings);
                 let image = RgbaImage::from_raw(scene.canvas.width, scene.canvas.height, pixels)
                     .expect("validated dimensions match readback length");
@@ -147,6 +203,44 @@ impl GpuRenderer {
     }
 
     pub fn render_rgba(&self, scene: &SceneV1) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        let root =
+            std::env::current_dir().map_err(|error| RenderError::Asset(error.to_string()))?;
+        self.render_rgba_with_asset_root(scene, &root)
+    }
+
+    pub fn render_rgba_with_asset_root(
+        &self,
+        scene: &SceneV1,
+        asset_root: &Path,
+    ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        let mut pixels =
+            Vec::with_capacity((scene.canvas.width * scene.canvas.height * 4) as usize);
+        for _ in 0..scene.canvas.width * scene.canvas.height {
+            pixels.extend(
+                scene
+                    .canvas
+                    .background
+                    .map(|value| (value * 255.0).round() as u8),
+            );
+        }
+        let mut warnings = Vec::new();
+        let mut vector_nodes = Vec::new();
+        for node in &scene.nodes {
+            match &node.kind {
+                NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {
+                    flush_vector_run(self, scene, &mut pixels, &mut warnings, &mut vector_nodes)?;
+                    let mut one_node = scene.clone();
+                    one_node.nodes = vec![node.clone()];
+                    rasterize_text_and_images(&mut pixels, &one_node, asset_root, &self.font)?;
+                }
+                _ => vector_nodes.push(node.clone()),
+            }
+        }
+        flush_vector_run(self, scene, &mut pixels, &mut warnings, &mut vector_nodes)?;
+        Ok((pixels, warnings))
+    }
+
+    fn render_vector_rgba(&self, scene: &SceneV1) -> Result<(Vec<u8>, Vec<String>), RenderError> {
         let (vertices, warnings) = vertices_for_scene(scene);
         let width = scene.canvas.width;
         let height = scene.canvas.height;
@@ -290,6 +384,25 @@ impl GpuRenderer {
     }
 }
 
+fn flush_vector_run(
+    renderer: &GpuRenderer,
+    scene: &SceneV1,
+    pixels: &mut [u8],
+    warnings: &mut Vec<String>,
+    nodes: &mut Vec<renderer_schema::NodeV1>,
+) -> Result<(), RenderError> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let mut run = scene.clone();
+    run.canvas.background = [0.0; 4];
+    run.nodes = std::mem::take(nodes);
+    let (layer, layer_warnings) = renderer.render_vector_rgba(&run)?;
+    blend_premultiplied_layer(pixels, &layer, scene.canvas.width, scene.canvas.height);
+    warnings.extend(layer_warnings);
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
@@ -312,7 +425,7 @@ impl Vertex {
 
 fn vertices_for_scene(scene: &SceneV1) -> (Vec<Vertex>, Vec<String>) {
     let mut vertices = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     for node in &scene.nodes {
         match &node.kind {
             NodeKindV1::Rect {
@@ -351,12 +464,7 @@ fn vertices_for_scene(scene: &SceneV1) -> (Vec<Vertex>, Vec<String>) {
                 );
             }
             NodeKindV1::Path { points, color } => add_path(&mut vertices, points, *color, scene),
-            NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {
-                warnings.push(format!(
-                    "node '{}' is accepted but not yet rasterized",
-                    node.id
-                ));
-            }
+            NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {}
         }
     }
     (vertices, warnings)
@@ -596,6 +704,243 @@ fn interpolate<T: Copy>(
     Some(sorted.last().unwrap_or(&first).1)
 }
 
+fn rasterize_text_and_images(
+    pixels: &mut [u8],
+    scene: &SceneV1,
+    asset_root: &Path,
+    font: &Font,
+) -> Result<(), RenderError> {
+    for node in &scene.nodes {
+        match &node.kind {
+            NodeKindV1::Text {
+                x,
+                y,
+                text,
+                size,
+                color,
+            } => {
+                if text.len() > MAX_TEXT_BYTES {
+                    return Err(RenderError::Asset(format!(
+                        "text node '{}' exceeds 16 KiB",
+                        node.id
+                    )));
+                }
+                let glyph_count = text.chars().count();
+                let canvas_limit = scene.canvas.width.max(scene.canvas.height) as f32;
+                if *size > canvas_limit.min(MAX_GLYPH_SIZE) {
+                    return Err(RenderError::Asset(format!(
+                        "text node '{}' has a font size that exceeds the raster limit",
+                        node.id
+                    )));
+                }
+                let estimated_pixels = (*size).ceil() as u64;
+                let estimated_pixels = estimated_pixels
+                    .checked_mul(estimated_pixels)
+                    .and_then(|pixels| pixels.checked_mul(glyph_count as u64))
+                    .ok_or_else(|| {
+                        RenderError::Asset(format!(
+                            "text node '{}' exceeds the text raster budget",
+                            node.id
+                        ))
+                    })?;
+                if glyph_count > MAX_TEXT_GLYPHS || estimated_pixels > MAX_TEXT_RASTER_PIXELS {
+                    return Err(RenderError::Asset(format!(
+                        "text node '{}' exceeds the text raster budget",
+                        node.id
+                    )));
+                }
+                let mut cursor_x = *x;
+                for character in text.chars() {
+                    let (metrics, bitmap) = font.rasterize(character, *size);
+                    let glyph_x = cursor_x + metrics.xmin as f32;
+                    let glyph_y = *y + (*size - metrics.height as f32 - metrics.ymin as f32);
+                    for row in 0..metrics.height {
+                        for column in 0..metrics.width {
+                            let alpha =
+                                bitmap[row * metrics.width + column] as f32 / 255.0 * color[3];
+                            blend_pixel(
+                                pixels,
+                                scene.canvas.width,
+                                scene.canvas.height,
+                                glyph_x as i32 + column as i32,
+                                glyph_y as i32 + row as i32,
+                                [color[0], color[1], color[2], alpha],
+                            );
+                        }
+                    }
+                    cursor_x += metrics.advance_width;
+                }
+            }
+            NodeKindV1::Image {
+                x,
+                y,
+                width,
+                height,
+                source,
+            } => {
+                let path = resolve_asset(asset_root, source)?;
+                let metadata =
+                    fs::metadata(&path).map_err(|error| RenderError::Asset(error.to_string()))?;
+                if metadata.len() > MAX_ASSET_BYTES {
+                    return Err(RenderError::Asset(format!(
+                        "image '{}' exceeds 16 MiB",
+                        source
+                    )));
+                }
+                let reader = image::ImageReader::open(&path)
+                    .map_err(|error| RenderError::Asset(error.to_string()))?
+                    .with_guessed_format()
+                    .map_err(|error| RenderError::Asset(error.to_string()))?;
+                let (source_width, source_height) = reader.into_dimensions()?;
+                ensure_source_image_dimensions(source_width, source_height, source)?;
+                let target_width = bounded_image_dimension(*width, "width")?;
+                let target_height = bounded_image_dimension(*height, "height")?;
+                ensure_target_image_dimensions(target_width, target_height, source)?;
+                let mut reader = image::ImageReader::open(&path)
+                    .map_err(|error| RenderError::Asset(error.to_string()))?
+                    .with_guessed_format()
+                    .map_err(|error| RenderError::Asset(error.to_string()))?;
+                let mut limits = image::Limits::default();
+                limits.max_image_width = Some(MAX_ASSET_PIXELS as u32);
+                limits.max_image_height = Some(MAX_ASSET_PIXELS as u32);
+                limits.max_alloc = Some(MAX_ASSET_PIXELS * 4);
+                reader.limits(limits);
+                let image = reader.decode()?;
+                let image = image
+                    .resize_exact(
+                        target_width,
+                        target_height,
+                        image::imageops::FilterType::Triangle,
+                    )
+                    .to_rgba8();
+                for (column, row, value) in image.enumerate_pixels() {
+                    blend_pixel(
+                        pixels,
+                        scene.canvas.width,
+                        scene.canvas.height,
+                        *x as i32 + column as i32,
+                        *y as i32 + row as i32,
+                        [
+                            value[0] as f32 / 255.0,
+                            value[1] as f32 / 255.0,
+                            value[2] as f32 / 255.0,
+                            value[3] as f32 / 255.0,
+                        ],
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn bounded_image_dimension(value: f32, name: &str) -> Result<u32, RenderError> {
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded <= 0.0 || rounded > 4_096.0 {
+        return Err(RenderError::Asset(format!(
+            "image {name} must be a finite positive value no greater than 4096"
+        )));
+    }
+    Ok(rounded as u32)
+}
+
+fn ensure_source_image_dimensions(
+    width: u32,
+    height: u32,
+    source: &str,
+) -> Result<(), RenderError> {
+    if u64::from(width) * u64::from(height) > MAX_ASSET_PIXELS {
+        return Err(RenderError::Asset(format!(
+            "image '{}' exceeds 16 million pixels",
+            source
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_target_image_dimensions(
+    width: u32,
+    height: u32,
+    source: &str,
+) -> Result<(), RenderError> {
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_RASTER_PIXELS {
+        return Err(RenderError::Asset(format!(
+            "image '{}' exceeds the 4 million pixel raster budget",
+            source
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_asset(root: &Path, source: &str) -> Result<PathBuf, RenderError> {
+    let relative = Path::new(source);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(RenderError::Asset(
+            "asset paths must be relative and may not traverse parents".into(),
+        ));
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| RenderError::Asset(format!("could not resolve asset root: {error}")))?;
+    let path = root.join(relative).canonicalize().map_err(|error| {
+        RenderError::Asset(format!("could not resolve asset '{source}': {error}"))
+    })?;
+    if path.starts_with(&root) {
+        Ok(path)
+    } else {
+        Err(RenderError::Asset("asset path escapes asset root".into()))
+    }
+}
+
+fn blend_pixel(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: Color) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let offset = (y as usize * width as usize + x as usize) * 4;
+    let alpha = color[3];
+    let destination_alpha = pixels[offset + 3] as f32 / 255.0;
+    let output_alpha = alpha + destination_alpha * (1.0 - alpha);
+    for channel in 0..3 {
+        let destination = pixels[offset + channel] as f32 / 255.0;
+        let value = if output_alpha == 0.0 {
+            0.0
+        } else {
+            (color[channel] * alpha + destination * destination_alpha * (1.0 - alpha))
+                / output_alpha
+        };
+        pixels[offset + channel] = (value * 255.0).round() as u8;
+    }
+    pixels[offset + 3] = (output_alpha * 255.0).round() as u8;
+}
+
+fn blend_premultiplied_layer(destination: &mut [u8], source: &[u8], width: u32, height: u32) {
+    debug_assert_eq!(destination.len(), source.len());
+    for offset in (0..width as usize * height as usize * 4).step_by(4) {
+        let source_alpha = source[offset + 3] as f32 / 255.0;
+        let destination_alpha = destination[offset + 3] as f32 / 255.0;
+        let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+        for channel in 0..3 {
+            let source_premultiplied = source[offset + channel] as f32 / 255.0;
+            let destination_premultiplied =
+                destination[offset + channel] as f32 / 255.0 * destination_alpha;
+            let output_premultiplied =
+                source_premultiplied + destination_premultiplied * (1.0 - source_alpha);
+            let value = if output_alpha == 0.0 {
+                0.0
+            } else {
+                output_premultiplied / output_alpha
+            };
+            destination[offset + channel] = (value * 255.0).round() as u8;
+        }
+        destination[offset + 3] = (output_alpha * 255.0).round() as u8;
+    }
+}
+
 const PRIMITIVE_SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -712,7 +1057,7 @@ mod tests {
         ]);
         let (vertices, warnings) = vertices_for_scene(&scene);
         assert!(vertices.len() > 100);
-        assert_eq!(warnings.len(), 2);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -881,7 +1226,14 @@ mod tests {
 
     #[test]
     fn renders_png_and_gif_on_an_available_gpu() {
-        GpuRenderer::new().ok().iter().for_each(|renderer| {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        {
             let directory = tempfile::tempdir().unwrap();
             let scene = test_scene();
             let png = renderer
@@ -898,7 +1250,95 @@ mod tests {
                 .render_gif(&animated, &directory.path().join("scene.gif"))
                 .unwrap();
             assert_eq!(gif.frame_count, 2);
-        });
+        }
+    }
+
+    #[test]
+    fn rasterizes_text_images_and_constrained_assets_without_a_gpu() {
+        let directory = tempfile::tempdir().unwrap();
+        let asset = directory.path().join("asset.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]))
+            .save(&asset)
+            .unwrap();
+        let mut scene = test_scene();
+        scene.canvas.width = 32;
+        scene.canvas.height = 32;
+        scene.nodes = vec![
+            NodeV1 {
+                id: "text".into(),
+                kind: NodeKindV1::Text {
+                    x: 1.0,
+                    y: 1.0,
+                    text: "A".into(),
+                    size: 12.0,
+                    color: [1.0; 4],
+                },
+            },
+            NodeV1 {
+                id: "image".into(),
+                kind: NodeKindV1::Image {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 4.0,
+                    height: 4.0,
+                    source: "asset.png".into(),
+                },
+            },
+        ];
+        let font = Font::from_bytes(
+            include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let mut pixels = vec![0; 32 * 32 * 4];
+        rasterize_text_and_images(&mut pixels, &scene, directory.path(), &font).unwrap();
+        assert!(pixels.iter().any(|value| *value != 0));
+        assert!(matches!(
+            resolve_asset(directory.path(), "../asset.png"),
+            Err(RenderError::Asset(_))
+        ));
+        assert!(matches!(
+            resolve_asset(directory.path(), "/asset.png"),
+            Err(RenderError::Asset(_))
+        ));
+        blend_pixel(&mut pixels, 32, 32, -1, 0, [1.0; 4]);
+
+        let mut destination = vec![255, 255, 255, 255];
+        // GPU vector layers are read back in premultiplied-alpha form.
+        blend_premultiplied_layer(&mut destination, &[128, 0, 0, 128], 1, 1);
+        assert_eq!(destination, vec![255, 127, 127, 255]);
+
+        assert!(matches!(
+            bounded_image_dimension(f32::MAX, "width"),
+            Err(RenderError::Asset(_))
+        ));
+        assert!(matches!(
+            bounded_image_dimension(4_097.0, "width"),
+            Err(RenderError::Asset(_))
+        ));
+        assert!(matches!(
+            ensure_source_image_dimensions(4_001, 4_000, "oversized.png"),
+            Err(RenderError::Asset(_))
+        ));
+        assert!(matches!(
+            ensure_target_image_dimensions(4_096, 4_096, "oversized.png"),
+            Err(RenderError::Asset(_))
+        ));
+
+        scene.nodes = vec![NodeV1 {
+            id: "oversized-text".into(),
+            kind: NodeKindV1::Text {
+                x: 0.0,
+                y: 0.0,
+                text: "A".into(),
+                size: 2_000.0,
+                color: [1.0; 4],
+            },
+        }];
+        assert!(matches!(
+            rasterize_text_and_images(&mut pixels, &scene, directory.path(), &font),
+            Err(RenderError::Asset(_))
+        ));
     }
 
     fn test_scene() -> SceneV1 {

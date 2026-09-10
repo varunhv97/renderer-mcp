@@ -31,6 +31,7 @@ struct SceneStore {
 struct StoredScene {
     revision: u64,
     scene: SceneV1,
+    asset_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -75,6 +76,8 @@ pub enum DaemonError {
     SceneAlreadyExists(String),
     #[error("scene is too large to return within the daemon response limit")]
     SceneResponseTooLarge,
+    #[error("image scenes require an explicit asset root")]
+    AssetRootRequired,
     #[error("scene revision conflict: expected {expected}, current {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
     #[error("patch operation {index} cannot remove unknown node: {id}")]
@@ -97,8 +100,13 @@ impl RendererDaemon {
         })
     }
 
-    pub fn create_scene(&mut self, scene_id: String, scene: SceneV1) -> Result<u64, DaemonError> {
-        self.scenes.create(scene_id, scene)
+    pub fn create_scene(
+        &mut self,
+        scene_id: String,
+        scene: SceneV1,
+        asset_root: Option<PathBuf>,
+    ) -> Result<u64, DaemonError> {
+        self.scenes.create(scene_id, scene, asset_root)
     }
 
     pub fn get_scene(&self, scene_id: &str) -> Result<SceneSnapshot, DaemonError> {
@@ -110,8 +118,10 @@ impl RendererDaemon {
         scene_id: String,
         scene: SceneV1,
         expected_revision: Option<u64>,
+        asset_root: Option<PathBuf>,
     ) -> Result<u64, DaemonError> {
-        self.scenes.replace(scene_id, scene, expected_revision)
+        self.scenes
+            .replace(scene_id, scene, expected_revision, asset_root)
     }
 
     pub fn patch_scene(&mut self, scene_id: &str, patch: ScenePatchV1) -> Result<u64, DaemonError> {
@@ -127,9 +137,16 @@ impl RendererDaemon {
         scene_id: &str,
         output: &Path,
     ) -> Result<RenderedImage, DaemonError> {
+        let stored = self
+            .scenes
+            .scenes
+            .get(scene_id)
+            .ok_or_else(|| DaemonError::SceneNotFound(scene_id.into()))?;
+        require_asset_root(&stored.scene, &stored.asset_root)?;
+        let root = stored.asset_root.as_deref().unwrap_or(Path::new("."));
         Ok(self
             .renderer
-            .render_png(&self.scenes.get(scene_id)?.scene, output)?)
+            .render_png_with_asset_root(&stored.scene, output, root)?)
     }
 
     pub fn render_gif_scene(
@@ -137,9 +154,16 @@ impl RendererDaemon {
         scene_id: &str,
         output: &Path,
     ) -> Result<RenderedImage, DaemonError> {
+        let stored = self
+            .scenes
+            .scenes
+            .get(scene_id)
+            .ok_or_else(|| DaemonError::SceneNotFound(scene_id.into()))?;
+        require_asset_root(&stored.scene, &stored.asset_root)?;
+        let root = stored.asset_root.as_deref().unwrap_or(Path::new("."));
         Ok(self
             .renderer
-            .render_gif(&self.scenes.get(scene_id)?.scene, output)?)
+            .render_gif_with_asset_root(&stored.scene, output, root)?)
     }
 
     pub fn render_inline(
@@ -150,6 +174,17 @@ impl RendererDaemon {
         Ok(self.renderer.render_png(scene, output)?)
     }
 
+    pub fn render_inline_with_asset_root(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+        asset_root: &Path,
+    ) -> Result<RenderedImage, DaemonError> {
+        Ok(self
+            .renderer
+            .render_png_with_asset_root(scene, output, asset_root)?)
+    }
+
     pub fn render_gif_inline(
         &self,
         scene: &SceneV1,
@@ -158,21 +193,44 @@ impl RendererDaemon {
         Ok(self.renderer.render_gif(scene, output)?)
     }
 
+    pub fn render_gif_inline_with_asset_root(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+        asset_root: &Path,
+    ) -> Result<RenderedImage, DaemonError> {
+        Ok(self
+            .renderer
+            .render_gif_with_asset_root(scene, output, asset_root)?)
+    }
+
     pub fn scene_count(&self) -> usize {
         self.scenes.scenes.len()
     }
 }
 
 impl SceneStore {
-    fn create(&mut self, scene_id: String, scene: SceneV1) -> Result<u64, DaemonError> {
+    fn create(
+        &mut self,
+        scene_id: String,
+        scene: SceneV1,
+        asset_root: Option<PathBuf>,
+    ) -> Result<u64, DaemonError> {
         ensure_scene_id(&scene_id)?;
         scene.validate()?;
         if self.scenes.contains_key(&scene_id) {
             return Err(DaemonError::SceneAlreadyExists(scene_id));
         }
         ensure_snapshot_fits_response(&scene_id, 1, &scene)?;
-        self.scenes
-            .insert(scene_id, StoredScene { revision: 1, scene });
+        require_asset_root(&scene, &asset_root)?;
+        self.scenes.insert(
+            scene_id,
+            StoredScene {
+                revision: 1,
+                scene,
+                asset_root,
+            },
+        );
         Ok(1)
     }
 
@@ -193,6 +251,7 @@ impl SceneStore {
         scene_id: String,
         scene: SceneV1,
         expected_revision: Option<u64>,
+        asset_root: Option<PathBuf>,
     ) -> Result<u64, DaemonError> {
         ensure_scene_id(&scene_id)?;
         scene.validate()?;
@@ -201,9 +260,11 @@ impl SceneStore {
             .get_mut(&scene_id)
             .ok_or_else(|| DaemonError::SceneNotFound(scene_id.clone()))?;
         check_revision(expected_revision, stored.revision)?;
+        require_asset_root(&scene, &asset_root)?;
         ensure_snapshot_fits_response(&scene_id, stored.revision + 1, &scene)?;
         stored.revision += 1;
         stored.scene = scene;
+        stored.asset_root = asset_root;
         Ok(stored.revision)
     }
 
@@ -219,6 +280,7 @@ impl SceneStore {
             apply_operation(&mut candidate, operation, index)?;
         }
         candidate.validate()?;
+        require_asset_root(&candidate, &stored.asset_root)?;
         ensure_snapshot_fits_response(scene_id, stored.revision + 1, &candidate)?;
         stored.revision += 1;
         stored.scene = candidate;
@@ -263,6 +325,19 @@ fn ensure_snapshot_fits_response(
 fn ensure_scene_id(scene_id: &str) -> Result<(), DaemonError> {
     if scene_id.trim().is_empty() {
         Err(DaemonError::EmptySceneId)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_asset_root(scene: &SceneV1, asset_root: &Option<PathBuf>) -> Result<(), DaemonError> {
+    if scene
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, renderer_schema::NodeKindV1::Image { .. }))
+        && asset_root.is_none()
+    {
+        Err(DaemonError::AssetRootRequired)
     } else {
         Ok(())
     }
@@ -323,6 +398,7 @@ pub enum DaemonRequest {
     CreateScene {
         scene_id: String,
         scene: SceneV1,
+        asset_root: Option<PathBuf>,
     },
     GetScene {
         scene_id: String,
@@ -331,6 +407,7 @@ pub enum DaemonRequest {
         scene_id: String,
         scene: SceneV1,
         expected_revision: Option<u64>,
+        asset_root: Option<PathBuf>,
     },
     PatchScene {
         scene_id: String,
@@ -438,8 +515,12 @@ fn read_request(stream: &mut TcpStream) -> Result<DaemonRequest, DaemonError> {
 fn dispatch(daemon: &mut RendererDaemon, request: DaemonRequest) -> DaemonResponse {
     let result = match request {
         DaemonRequest::Health => Ok(DaemonResult::Health),
-        DaemonRequest::CreateScene { scene_id, scene } => daemon
-            .create_scene(scene_id, scene)
+        DaemonRequest::CreateScene {
+            scene_id,
+            scene,
+            asset_root,
+        } => daemon
+            .create_scene(scene_id, scene, asset_root)
             .map(|revision| DaemonResult::Revision { revision }),
         DaemonRequest::GetScene { scene_id } => daemon
             .get_scene(&scene_id)
@@ -448,8 +529,9 @@ fn dispatch(daemon: &mut RendererDaemon, request: DaemonRequest) -> DaemonRespon
             scene_id,
             scene,
             expected_revision,
+            asset_root,
         } => daemon
-            .replace_scene(scene_id, scene, expected_revision)
+            .replace_scene(scene_id, scene, expected_revision, asset_root)
             .map(|revision| DaemonResult::Revision { revision }),
         DaemonRequest::PatchScene { scene_id, patch } => daemon
             .patch_scene(&scene_id, patch)
@@ -598,9 +680,9 @@ mod tests {
     #[test]
     fn patches_are_atomic_and_revisioned_without_a_gpu() {
         let mut store = SceneStore::default();
-        assert_eq!(store.create("scene".into(), scene()).unwrap(), 1);
+        assert_eq!(store.create("scene".into(), scene(), None).unwrap(), 1);
         assert!(matches!(
-            store.create("scene".into(), scene()),
+            store.create("scene".into(), scene(), None),
             Err(DaemonError::SceneAlreadyExists(_))
         ));
         assert_eq!(
@@ -642,6 +724,29 @@ mod tests {
             Err(DaemonError::NodeNotFound { .. })
         ));
         assert_eq!(store.get("scene").unwrap(), before);
+
+        assert!(matches!(
+            store.patch(
+                "scene",
+                ScenePatchV1 {
+                    expected_revision: Some(2),
+                    operations: vec![PatchOperationV1::UpsertNode {
+                        node: NodeV1 {
+                            id: "image".into(),
+                            kind: NodeKindV1::Image {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 1.0,
+                                height: 1.0,
+                                source: "asset.png".into(),
+                            },
+                        },
+                    }],
+                }
+            ),
+            Err(DaemonError::AssetRootRequired)
+        ));
+        assert_eq!(store.get("scene").unwrap(), before);
     }
 
     #[test]
@@ -677,7 +782,7 @@ mod tests {
             },
         });
         assert!(matches!(
-            store.create("scene".into(), oversized),
+            store.create("scene".into(), oversized, None),
             Err(DaemonError::SceneResponseTooLarge)
         ));
         assert!(matches!(
