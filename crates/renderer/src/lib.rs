@@ -1,4 +1,5 @@
 //! Off-screen wgpu renderer for normalized RendererCli scenes.
+#![allow(unexpected_cfgs)] // `cargo llvm-cov` supplies `cfg(coverage)`.
 
 use bytemuck::{Pod, Zeroable};
 use fontdue::Font;
@@ -9,6 +10,7 @@ use image::{
 use renderer_schema::{Color, KeyframeV1, NodeKindV1, SceneV1};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     fs::File,
     path::{Path, PathBuf},
@@ -21,15 +23,21 @@ const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ASSET_PIXELS: u64 = 16_000_000;
 const MAX_IMAGE_RASTER_PIXELS: u64 = 4_000_000;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
-const MAX_TEXT_GLYPHS: usize = 4_096;
+const MAX_TEXT_GLYPHS: usize = 1_024;
 const MAX_GLYPH_SIZE: f32 = 1_024.0;
 const MAX_TEXT_RASTER_PIXELS: u64 = 4_000_000;
+const MAX_COMPOSITION_TEXTURE_PIXELS: u64 = 20_000_000;
+const MAX_GPU_TEXTURE_DIMENSION: u32 = 2_048;
 
 #[derive(Debug)]
 pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     font: Font,
+    primitive_pipeline: wgpu::RenderPipeline,
+    textured_pipeline: wgpu::RenderPipeline,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,10 +116,16 @@ impl GpuRenderer {
             fontdue::FontSettings::default(),
         )
         .map_err(|_| RenderError::Font)?;
+        let (primitive_pipeline, textured_pipeline, texture_bind_group_layout, sampler) =
+            create_pipelines(&device);
         Ok(Self {
             device,
             queue,
             font,
+            primitive_pipeline,
+            textured_pipeline,
+            texture_bind_group_layout,
+            sampler,
         })
     }
 
@@ -213,35 +227,17 @@ impl GpuRenderer {
         scene: &SceneV1,
         asset_root: &Path,
     ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
-        let mut pixels =
-            Vec::with_capacity((scene.canvas.width * scene.canvas.height * 4) as usize);
-        for _ in 0..scene.canvas.width * scene.canvas.height {
-            pixels.extend(
-                scene
-                    .canvas
-                    .background
-                    .map(|value| (value * 255.0).round() as u8),
-            );
-        }
-        let mut warnings = Vec::new();
-        let mut vector_nodes = Vec::new();
-        for node in &scene.nodes {
-            match &node.kind {
-                NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {
-                    flush_vector_run(self, scene, &mut pixels, &mut warnings, &mut vector_nodes)?;
-                    let mut one_node = scene.clone();
-                    one_node.nodes = vec![node.clone()];
-                    rasterize_text_and_images(&mut pixels, &one_node, asset_root, &self.font)?;
-                }
-                _ => vector_nodes.push(node.clone()),
-            }
-        }
-        flush_vector_run(self, scene, &mut pixels, &mut warnings, &mut vector_nodes)?;
-        Ok((pixels, warnings))
+        scene.validate()?;
+        self.render_composed_rgba(scene, asset_root)
     }
 
-    fn render_vector_rgba(&self, scene: &SceneV1) -> Result<(Vec<u8>, Vec<String>), RenderError> {
-        let (vertices, warnings) = vertices_for_scene(scene);
+    #[cfg_attr(coverage, coverage(off))]
+    fn render_composed_rgba(
+        &self,
+        scene: &SceneV1,
+        asset_root: &Path,
+    ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        let plan = composition_plan(scene, asset_root, &self.font)?;
         let width = scene.canvas.width;
         let height = scene.canvas.height;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -259,50 +255,72 @@ impl GpuRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("renderer-cli primitives"),
-                source: wgpu::ShaderSource::Wgsl(PRIMITIVE_SHADER.into()),
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("renderer-cli layout"),
-                bind_group_layouts: &[],
-                push_constant_ranges: &[],
-            });
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("renderer-cli primitives pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[Vertex::layout()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-            });
-        let vertex_buffer = self
+        let primitive_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("renderer-cli vertices"),
-                contents: bytemuck::cast_slice(&vertices),
+                label: Some("renderer-cli primitive vertices"),
+                contents: bytemuck::cast_slice(&plan.primitive_vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+        let textured_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("renderer-cli textured vertices"),
+                contents: bytemuck::cast_slice(&plan.textured_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let mut texture_resources = Vec::with_capacity(plan.textures.len());
+        for data in &plan.textures {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&data.label),
+                size: wgpu::Extent3d {
+                    width: data.width,
+                    height: data.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data.pixels,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(data.width * 4),
+                    rows_per_image: Some(data.height),
+                },
+                wgpu::Extent3d {
+                    width: data.width,
+                    height: data.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&data.label),
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            texture_resources.push((texture, texture_view, bind_group));
+        }
         let unpadded_bytes_per_row = width * 4;
         let padded_bytes_per_row =
             align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -332,9 +350,24 @@ impl GpuRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&pipeline);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.draw(0..vertices.len() as u32, 0..1);
+            for command in &plan.commands {
+                match command {
+                    DrawCommand::Primitive(vertices) => {
+                        pass.set_pipeline(&self.primitive_pipeline);
+                        pass.set_vertex_buffer(0, primitive_buffer.slice(..));
+                        pass.draw(vertices.clone(), 0..1);
+                    }
+                    DrawCommand::Textured {
+                        texture_index,
+                        vertices,
+                    } => {
+                        pass.set_pipeline(&self.textured_pipeline);
+                        pass.set_vertex_buffer(0, textured_buffer.slice(..));
+                        pass.set_bind_group(0, &texture_resources[*texture_index].2, &[]);
+                        pass.draw(vertices.clone(), 0..1);
+                    }
+                }
+            }
         }
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -380,27 +413,114 @@ impl GpuRenderer {
         }
         drop(mapped);
         output_buffer.unmap();
-        Ok((pixels, warnings))
+        Ok((pixels, Vec::new()))
     }
 }
 
-fn flush_vector_run(
-    renderer: &GpuRenderer,
-    scene: &SceneV1,
-    pixels: &mut [u8],
-    warnings: &mut Vec<String>,
-    nodes: &mut Vec<renderer_schema::NodeV1>,
-) -> Result<(), RenderError> {
-    if nodes.is_empty() {
-        return Ok(());
+fn create_pipelines(
+    device: &wgpu::Device,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::BindGroupLayout,
+    wgpu::Sampler,
+) {
+    let primitive_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("renderer-cli primitives"),
+        source: wgpu::ShaderSource::Wgsl(PRIMITIVE_SHADER.into()),
+    });
+    let primitive_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("renderer-cli primitive layout"),
+        bind_group_layouts: &[],
+        push_constant_ranges: &[],
+    });
+    let primitive_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("renderer-cli primitive pipeline"),
+        layout: Some(&primitive_layout),
+        vertex: wgpu::VertexState {
+            module: &primitive_shader,
+            entry_point: "vs_main",
+            buffers: &[Vertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &primitive_shader,
+            entry_point: "fs_main",
+            targets: &[Some(color_target())],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+    let texture_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("renderer-cli texture layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+    let texture_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("renderer-cli textured quads"),
+        source: wgpu::ShaderSource::Wgsl(TEXTURED_SHADER.into()),
+    });
+    let textured_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("renderer-cli textured layout"),
+        bind_group_layouts: &[&texture_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let textured_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("renderer-cli textured pipeline"),
+        layout: Some(&textured_layout),
+        vertex: wgpu::VertexState {
+            module: &texture_shader,
+            entry_point: "vs_main",
+            buffers: &[TexturedVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &texture_shader,
+            entry_point: "fs_main",
+            targets: &[Some(color_target())],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("renderer-cli texture sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    (
+        primitive_pipeline,
+        textured_pipeline,
+        texture_bind_group_layout,
+        sampler,
+    )
+}
+
+fn color_target() -> wgpu::ColorTargetState {
+    wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
     }
-    let mut run = scene.clone();
-    run.canvas.background = [0.0; 4];
-    run.nodes = std::mem::take(nodes);
-    let (layer, layer_warnings) = renderer.render_vector_rgba(&run)?;
-    blend_premultiplied_layer(pixels, &layer, scene.canvas.width, scene.canvas.height);
-    warnings.extend(layer_warnings);
-    Ok(())
 }
 
 #[repr(C)]
@@ -408,6 +528,49 @@ fn flush_vector_run(
 struct Vertex {
     position: [f32; 2],
     color: Color,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TexturedVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+    tint: Color,
+}
+
+impl TexturedVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+enum DrawCommand {
+    Primitive(std::ops::Range<u32>),
+    Textured {
+        texture_index: usize,
+        vertices: std::ops::Range<u32>,
+    },
+}
+
+struct TextureData {
+    label: String,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+struct CompositionPlan {
+    primitive_vertices: Vec<Vertex>,
+    textured_vertices: Vec<TexturedVertex>,
+    commands: Vec<DrawCommand>,
+    textures: Vec<TextureData>,
 }
 
 impl Vertex {
@@ -423,51 +586,319 @@ impl Vertex {
     }
 }
 
+#[cfg(test)]
 fn vertices_for_scene(scene: &SceneV1) -> (Vec<Vertex>, Vec<String>) {
     let mut vertices = Vec::new();
     let warnings = Vec::new();
     for node in &scene.nodes {
+        add_node_vertices(&mut vertices, node, scene);
+    }
+    (vertices, warnings)
+}
+
+fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1, scene: &SceneV1) {
+    match &node.kind {
+        NodeKindV1::Rect {
+            x,
+            y,
+            width,
+            height,
+            color,
+        } => {
+            add_rect(vertices, *x, *y, *width, *height, *color, scene);
+        }
+        NodeKindV1::Ellipse {
+            cx,
+            cy,
+            rx,
+            ry,
+            color,
+        } => {
+            add_ellipse(vertices, *cx, *cy, *rx, *ry, *color, scene);
+        }
+        NodeKindV1::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            thickness,
+            color,
+        } => {
+            add_line(vertices, [*x1, *y1], [*x2, *y2], *thickness, *color, scene);
+        }
+        NodeKindV1::Path { points, color } => add_path(vertices, points, *color, scene),
+        NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {}
+    }
+}
+
+fn composition_plan(
+    scene: &SceneV1,
+    asset_root: &Path,
+    font: &Font,
+) -> Result<CompositionPlan, RenderError> {
+    let mut plan = CompositionPlan {
+        primitive_vertices: Vec::new(),
+        textured_vertices: Vec::new(),
+        commands: Vec::new(),
+        textures: Vec::new(),
+    };
+    let mut image_textures = HashMap::new();
+    let mut glyph_textures = HashMap::new();
+    let mut texture_pixels = 0_u64;
+    for node in &scene.nodes {
         match &node.kind {
-            NodeKindV1::Rect {
+            NodeKindV1::Text {
+                x,
+                y,
+                text,
+                size,
+                color,
+            } => {
+                validate_text_raster(node.id.as_str(), text, *size, scene)?;
+                let mut cursor_x = *x;
+                let mut previous = None;
+                for character in text.chars() {
+                    if let Some(left) = previous {
+                        cursor_x += font.horizontal_kern(left, character, *size).unwrap_or(0.0);
+                    }
+                    let key = (character, size.to_bits());
+                    let (texture_index, metrics) = if let Some(value) = glyph_textures.get(&key) {
+                        *value
+                    } else {
+                        let (metrics, bitmap) = font.rasterize(character, *size);
+                        if metrics.width == 0 || metrics.height == 0 {
+                            cursor_x += metrics.advance_width;
+                            previous = Some(character);
+                            continue;
+                        }
+                        texture_pixels = reserve_composition_pixels(
+                            texture_pixels,
+                            (metrics.width * metrics.height) as u64,
+                        )?;
+                        let pixels = bitmap
+                            .into_iter()
+                            .flat_map(|alpha| [255, 255, 255, alpha])
+                            .collect();
+                        let index = plan.textures.len();
+                        plan.textures.push(TextureData {
+                            label: format!("glyph-{}-{}", character as u32, size),
+                            width: metrics.width as u32,
+                            height: metrics.height as u32,
+                            pixels,
+                        });
+                        glyph_textures.insert(key, (index, metrics));
+                        (index, metrics)
+                    };
+                    let start = plan.textured_vertices.len() as u32;
+                    add_textured_rect(
+                        &mut plan.textured_vertices,
+                        cursor_x + metrics.xmin as f32,
+                        *y + (*size - metrics.height as f32 - metrics.ymin as f32),
+                        metrics.width as f32,
+                        metrics.height as f32,
+                        *color,
+                        scene,
+                    );
+                    plan.commands.push(DrawCommand::Textured {
+                        texture_index,
+                        vertices: start..start + 6,
+                    });
+                    cursor_x += metrics.advance_width;
+                    previous = Some(character);
+                }
+            }
+            NodeKindV1::Image {
                 x,
                 y,
                 width,
                 height,
-                color,
+                source,
             } => {
-                add_rect(&mut vertices, *x, *y, *width, *height, *color, scene);
-            }
-            NodeKindV1::Ellipse {
-                cx,
-                cy,
-                rx,
-                ry,
-                color,
-            } => {
-                add_ellipse(&mut vertices, *cx, *cy, *rx, *ry, *color, scene);
-            }
-            NodeKindV1::Line {
-                x1,
-                y1,
-                x2,
-                y2,
-                thickness,
-                color,
-            } => {
-                add_line(
-                    &mut vertices,
-                    [*x1, *y1],
-                    [*x2, *y2],
-                    *thickness,
-                    *color,
+                let target_width = bounded_image_dimension(*width, "width")?;
+                let target_height = bounded_image_dimension(*height, "height")?;
+                ensure_target_image_dimensions(target_width, target_height, source)?;
+                let cache_key = (
+                    source.clone(),
+                    target_width.min(MAX_GPU_TEXTURE_DIMENSION),
+                    target_height.min(MAX_GPU_TEXTURE_DIMENSION),
+                );
+                let texture_index = if let Some(index) = image_textures.get(&cache_key) {
+                    *index
+                } else {
+                    let image = load_image(asset_root, source)?;
+                    let (upload_width, upload_height) = upload_dimensions(
+                        image.width(),
+                        image.height(),
+                        target_width,
+                        target_height,
+                    );
+                    let image = if image.width() == upload_width && image.height() == upload_height
+                    {
+                        image
+                    } else {
+                        image::DynamicImage::ImageRgba8(image)
+                            .resize_exact(
+                                upload_width,
+                                upload_height,
+                                image::imageops::FilterType::Triangle,
+                            )
+                            .to_rgba8()
+                    };
+                    texture_pixels = reserve_composition_pixels(
+                        texture_pixels,
+                        u64::from(image.width()) * u64::from(image.height()),
+                    )?;
+                    let index = plan.textures.len();
+                    plan.textures.push(TextureData {
+                        label: format!("image-{source}"),
+                        width: image.width(),
+                        height: image.height(),
+                        pixels: image.into_raw(),
+                    });
+                    image_textures.insert(cache_key, index);
+                    index
+                };
+                let start = plan.textured_vertices.len() as u32;
+                add_textured_rect(
+                    &mut plan.textured_vertices,
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    [1.0; 4],
                     scene,
                 );
+                plan.commands.push(DrawCommand::Textured {
+                    texture_index,
+                    vertices: start..start + 6,
+                });
             }
-            NodeKindV1::Path { points, color } => add_path(&mut vertices, points, *color, scene),
-            NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {}
+            _ => {
+                let start = plan.primitive_vertices.len() as u32;
+                add_node_vertices(&mut plan.primitive_vertices, node, scene);
+                let end = plan.primitive_vertices.len() as u32;
+                if start != end {
+                    if let Some(DrawCommand::Primitive(range)) = plan.commands.last_mut() {
+                        range.end = end;
+                    } else {
+                        plan.commands.push(DrawCommand::Primitive(start..end));
+                    }
+                }
+            }
         }
     }
-    (vertices, warnings)
+    Ok(plan)
+}
+
+fn upload_dimensions(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> (u32, u32) {
+    (
+        source_width
+            .min(target_width)
+            .min(MAX_GPU_TEXTURE_DIMENSION),
+        source_height
+            .min(target_height)
+            .min(MAX_GPU_TEXTURE_DIMENSION),
+    )
+}
+
+fn add_textured_rect(
+    vertices: &mut Vec<TexturedVertex>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    tint: Color,
+    scene: &SceneV1,
+) {
+    let point = |x, y, uv| TexturedVertex {
+        position: [
+            x / scene.canvas.width as f32 * 2.0 - 1.0,
+            1.0 - y / scene.canvas.height as f32 * 2.0,
+        ],
+        uv,
+        tint,
+    };
+    let a = point(x, y, [0.0, 0.0]);
+    let b = point(x + width, y, [1.0, 0.0]);
+    let c = point(x + width, y + height, [1.0, 1.0]);
+    let d = point(x, y + height, [0.0, 1.0]);
+    vertices.extend([a, b, c, a, c, d]);
+}
+
+fn reserve_composition_pixels(current: u64, additional: u64) -> Result<u64, RenderError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| RenderError::Asset("composition texture budget overflowed".into()))?;
+    if total > MAX_COMPOSITION_TEXTURE_PIXELS {
+        return Err(RenderError::Asset(
+            "scene exceeds the composition texture budget".into(),
+        ));
+    }
+    Ok(total)
+}
+
+fn validate_text_raster(
+    node_id: &str,
+    text: &str,
+    size: f32,
+    scene: &SceneV1,
+) -> Result<(), RenderError> {
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(RenderError::Asset(format!(
+            "text node '{node_id}' exceeds 16 KiB"
+        )));
+    }
+    let glyph_count = text.chars().count();
+    if size > (scene.canvas.width.max(scene.canvas.height) as f32).min(MAX_GLYPH_SIZE) {
+        return Err(RenderError::Asset(format!(
+            "text node '{node_id}' has a font size that exceeds the raster limit"
+        )));
+    }
+    let estimate = (size.ceil() as u64)
+        .checked_mul(size.ceil() as u64)
+        .and_then(|pixels| pixels.checked_mul(glyph_count as u64))
+        .ok_or_else(|| {
+            RenderError::Asset(format!(
+                "text node '{node_id}' exceeds the text raster budget"
+            ))
+        })?;
+    if glyph_count > MAX_TEXT_GLYPHS || estimate > MAX_TEXT_RASTER_PIXELS {
+        return Err(RenderError::Asset(format!(
+            "text node '{node_id}' exceeds the text raster budget"
+        )));
+    }
+    Ok(())
+}
+
+fn load_image(asset_root: &Path, source: &str) -> Result<image::RgbaImage, RenderError> {
+    let path = resolve_asset(asset_root, source)?;
+    let metadata = fs::metadata(&path).map_err(|error| RenderError::Asset(error.to_string()))?;
+    if metadata.len() > MAX_ASSET_BYTES {
+        return Err(RenderError::Asset(format!(
+            "image '{source}' exceeds 16 MiB"
+        )));
+    }
+    let reader = image::ImageReader::open(&path)
+        .map_err(|error| RenderError::Asset(error.to_string()))?
+        .with_guessed_format()
+        .map_err(|error| RenderError::Asset(error.to_string()))?;
+    let (width, height) = reader.into_dimensions()?;
+    ensure_source_image_dimensions(width, height, source)?;
+    let mut reader = image::ImageReader::open(&path)
+        .map_err(|error| RenderError::Asset(error.to_string()))?
+        .with_guessed_format()
+        .map_err(|error| RenderError::Asset(error.to_string()))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_ASSET_PIXELS as u32);
+    limits.max_image_height = Some(MAX_ASSET_PIXELS as u32);
+    limits.max_alloc = Some(MAX_ASSET_PIXELS * 4);
+    reader.limits(limits);
+    Ok(reader.decode()?.to_rgba8())
 }
 
 fn add_rect(
@@ -704,6 +1135,7 @@ fn interpolate<T: Copy>(
     Some(sorted.last().unwrap_or(&first).1)
 }
 
+#[cfg(test)]
 fn rasterize_text_and_images(
     pixels: &mut [u8],
     scene: &SceneV1,
@@ -897,6 +1329,7 @@ fn resolve_asset(root: &Path, source: &str) -> Result<PathBuf, RenderError> {
     }
 }
 
+#[cfg(test)]
 fn blend_pixel(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: Color) {
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
@@ -918,6 +1351,7 @@ fn blend_pixel(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, color
     pixels[offset + 3] = (output_alpha * 255.0).round() as u8;
 }
 
+#[cfg(test)]
 fn blend_premultiplied_layer(destination: &mut [u8], source: &[u8], width: u32, height: u32) {
     debug_assert_eq!(destination.len(), source.len());
     for offset in (0..width as usize * height as usize * 4).step_by(4) {
@@ -958,6 +1392,35 @@ fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> V
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return input.color;
+}
+"#;
+
+const TEXTURED_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tint: vec4<f32>,
+}
+
+@group(0) @binding(0) var image_texture: texture_2d<f32>;
+@group(0) @binding(1) var image_sampler: sampler;
+
+@vertex
+fn vs_main(
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) tint: vec4<f32>,
+) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = vec4<f32>(position, 0.0, 1.0);
+    output.uv = uv;
+    output.tint = tint;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(image_texture, image_sampler, input.uv) * input.tint;
 }
 "#;
 
@@ -1041,6 +1504,16 @@ mod tests {
                     y: 0.0,
                     text: "t".into(),
                     size: 8.0,
+                    color: [1.0; 4],
+                },
+            },
+            NodeV1 {
+                id: "vector".into(),
+                kind: NodeKindV1::Rect {
+                    x: 16.0,
+                    y: 1.0,
+                    width: 2.0,
+                    height: 2.0,
                     color: [1.0; 4],
                 },
             },
@@ -1269,8 +1742,18 @@ mod tests {
                 kind: NodeKindV1::Text {
                     x: 1.0,
                     y: 1.0,
-                    text: "A".into(),
+                    text: "AA".into(),
                     size: 12.0,
+                    color: [1.0; 4],
+                },
+            },
+            NodeV1 {
+                id: "vector-between".into(),
+                kind: NodeKindV1::Rect {
+                    x: 16.0,
+                    y: 1.0,
+                    width: 2.0,
+                    height: 2.0,
                     color: [1.0; 4],
                 },
             },
@@ -1278,6 +1761,16 @@ mod tests {
                 id: "image".into(),
                 kind: NodeKindV1::Image {
                     x: 20.0,
+                    y: 20.0,
+                    width: 4.0,
+                    height: 4.0,
+                    source: "asset.png".into(),
+                },
+            },
+            NodeV1 {
+                id: "image-again".into(),
+                kind: NodeKindV1::Image {
+                    x: 24.0,
                     y: 20.0,
                     width: 4.0,
                     height: 4.0,
@@ -1293,6 +1786,38 @@ mod tests {
         let mut pixels = vec![0; 32 * 32 * 4];
         rasterize_text_and_images(&mut pixels, &scene, directory.path(), &font).unwrap();
         assert!(pixels.iter().any(|value| *value != 0));
+
+        let plan = composition_plan(&scene, directory.path(), &font).unwrap();
+        assert_eq!(plan.commands.len(), 5);
+        assert_eq!(plan.textures.len(), 2);
+        assert!(matches!(&plan.commands[0], DrawCommand::Textured { .. }));
+        assert!(matches!(&plan.commands[1], DrawCommand::Textured { .. }));
+        assert!(matches!(&plan.commands[2], DrawCommand::Primitive(_)));
+        assert!(matches!(&plan.commands[3], DrawCommand::Textured { .. }));
+        assert!(matches!(&plan.commands[4], DrawCommand::Textured { .. }));
+
+        let mut primitives = test_scene();
+        primitives.nodes.push(NodeV1 {
+            id: "second-box".into(),
+            kind: NodeKindV1::Rect {
+                x: 12.0,
+                y: 1.0,
+                width: 2.0,
+                height: 2.0,
+                color: [1.0; 4],
+            },
+        });
+        let primitive_plan = composition_plan(&primitives, directory.path(), &font).unwrap();
+        assert_eq!(primitive_plan.commands.len(), 1);
+        assert!(matches!(
+            &primitive_plan.commands[0],
+            DrawCommand::Primitive(vertices) if vertices == &(0..12)
+        ));
+        assert_eq!(upload_dimensions(4_096, 1, 1, 1), (1, 1));
+        assert_eq!(
+            upload_dimensions(4_096, 4_096, 4_096, 4_096),
+            (2_048, 2_048)
+        );
         assert!(matches!(
             resolve_asset(directory.path(), "../asset.png"),
             Err(RenderError::Asset(_))
@@ -1322,6 +1847,10 @@ mod tests {
         ));
         assert!(matches!(
             ensure_target_image_dimensions(4_096, 4_096, "oversized.png"),
+            Err(RenderError::Asset(_))
+        ));
+        assert!(matches!(
+            reserve_composition_pixels(MAX_COMPOSITION_TEXTURE_PIXELS, 1),
             Err(RenderError::Asset(_))
         ));
 
