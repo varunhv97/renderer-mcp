@@ -1092,6 +1092,8 @@ version = "0.1.0"
 dependencies = [
  "renderer-core",
  "renderer-schema",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
 ]

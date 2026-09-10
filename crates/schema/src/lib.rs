@@ -8,6 +8,7 @@ pub const SCENE_VERSION_V1: &str = "renderer.scene.v1";
 pub const MAX_CANVAS_DIMENSION: u32 = 4_096;
 pub const MAX_NODES: usize = 10_000;
 pub const MAX_PATH_POINTS: usize = 4_096;
+pub const MAX_PATCH_OPERATIONS: usize = 1_000;
 /// Maximum number of encoded animation frames. This bounds per-frame setup work.
 pub const MAX_ANIMATION_FRAMES: u64 = 300;
 /// Maximum aggregate raster work for one animation, measured in output pixels.
@@ -263,6 +264,33 @@ pub enum AnimatedPropertyV1 {
     Color(Color),
 }
 
+/// A bounded, typed scene mutation. Applying all operations is atomic.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ScenePatchV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    pub operations: Vec<PatchOperationV1>,
+}
+
+impl ScenePatchV1 {
+    pub fn validate(&self) -> Result<(), SceneValidationError> {
+        if self.operations.is_empty() || self.operations.len() > MAX_PATCH_OPERATIONS {
+            return Err(SceneValidationError::InvalidPatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PatchOperationV1 {
+    SetCanvas { canvas: CanvasV1 },
+    UpsertNode { node: NodeV1 },
+    RemoveNode { id: String },
+    SetTimeline { timeline: TimelineV1 },
+    ClearTimeline,
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum SceneValidationError {
     #[error("unsupported scene version: {0}")]
@@ -291,6 +319,8 @@ pub enum SceneValidationError {
     TooManyPathPoints { actual: usize, maximum: usize },
     #[error("text nodes must not be empty")]
     EmptyText,
+    #[error("patch must contain 1 through {MAX_PATCH_OPERATIONS} operations")]
+    InvalidPatch,
     #[error("keyframe target does not identify a scene node: {0}")]
     UnknownKeyframeTarget(String),
     #[error("animation has {actual} frames; maximum is {maximum}")]
@@ -613,5 +643,25 @@ mod tests {
             value.validate(),
             Err(SceneValidationError::TooManyAnimationPixels { .. })
         ));
+    }
+
+    #[test]
+    fn validates_bounded_nonempty_patches() {
+        assert_eq!(
+            ScenePatchV1 {
+                expected_revision: None,
+                operations: vec![],
+            }
+            .validate(),
+            Err(SceneValidationError::InvalidPatch)
+        );
+        assert_eq!(
+            ScenePatchV1 {
+                expected_revision: Some(1),
+                operations: vec![PatchOperationV1::ClearTimeline],
+            }
+            .validate(),
+            Ok(())
+        );
     }
 }
