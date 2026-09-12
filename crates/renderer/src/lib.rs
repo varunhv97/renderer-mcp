@@ -74,6 +74,11 @@ pub enum RenderError {
     Font,
     #[error("asset error: {0}")]
     Asset(String),
+    /// The scene's `effect.shader` failed WGSL compile validation once
+    /// wrapped in the fixed post-process template. Kept at the end of this
+    /// enum to minimize merge-conflict risk with parallel changes elsewhere.
+    #[error("invalid effect shader: {0}")]
+    InvalidEffectShader(String),
 }
 
 impl GpuRenderer {
@@ -241,6 +246,13 @@ impl GpuRenderer {
         let plan = composition_plan(scene, asset_root, &self.font)?;
         let width = scene.canvas.width;
         let height = scene.canvas.height;
+        // When a scene-level effect is present, nodes are composited into
+        // this texture as an *intermediate* (sampled, not read back) and a
+        // second full-screen pass below writes the final, effect-applied
+        // pixels elsewhere. With no effect, this texture is the one and only
+        // render target and is read back directly, exactly as before this
+        // feature existed: no extra texture or pass is allocated.
+        let has_effect = scene.effect.is_some();
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("renderer-cli target"),
             size: wgpu::Extent3d {
@@ -252,7 +264,11 @@ impl GpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: if has_effect {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            },
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -370,9 +386,73 @@ impl GpuRenderer {
                 }
             }
         }
+        // Second, optional full-screen pass: run the scene's post-process
+        // effect, sampling the just-composited scene texture and writing
+        // the transformed pixels to a separate texture that gets read back.
+        // This keeps the no-effect path's allocation and pass count
+        // unchanged (see `has_effect` above).
+        let effect_texture;
+        let final_texture = if let Some(effect) = &scene.effect {
+            let pipeline = self.build_effect_pipeline(&effect.shader)?;
+            let created = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("renderer-cli effect target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let effect_view = created.create_view(&wgpu::TextureViewDescriptor::default());
+            let effect_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("renderer-cli effect bind group"),
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("renderer-cli effect pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &effect_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &effect_bind_group, &[]);
+                // Full-screen triangle: the vertex shader derives clip-space
+                // position and UV from `vertex_index` alone, so no vertex
+                // buffer is bound here.
+                pass.draw(0..3, 0..1);
+            }
+            effect_texture = created;
+            &effect_texture
+        } else {
+            &texture
+        };
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
-                texture: &texture,
+                texture: final_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -415,6 +495,80 @@ impl GpuRenderer {
         drop(mapped);
         output_buffer.unmap();
         Ok((pixels, Vec::new()))
+    }
+
+    /// Builds the render pipeline for a scene's full-canvas post-process
+    /// effect by wrapping the author-supplied WGSL `effect` function in a
+    /// fixed template (see `wrap_effect_shader`): a full-screen-triangle
+    /// vertex stage and a fragment stage that samples the composited scene
+    /// texture and calls the user's function. This is the entire security
+    /// boundary between untrusted shader text and the GPU: authors never
+    /// supply bindings, vertex data, or a full pipeline.
+    ///
+    /// `wgpu::Device::create_shader_module` and `create_render_pipeline` do
+    /// not return `Result` — by default, invalid WGSL is reported to the
+    /// device's uncaptured-error handler, which panics. Since shader text
+    /// here comes from untrusted scene JSON that a client can submit to a
+    /// long-running daemon, both calls are wrapped in an error scope so a
+    /// malformed effect shader becomes a normal `Err` instead of a process
+    /// crash.
+    ///
+    /// This validates that the shader *compiles*; it cannot and does not
+    /// bound how expensive a well-formed shader is to *run* (e.g. an
+    /// intentionally expensive loop in `effect`). Slow-but-valid shaders are
+    /// an accepted residual risk for V1, consistent with how the rest of
+    /// this renderer treats resource limits as safe defaults rather than
+    /// exhaustive guarantees.
+    fn build_effect_pipeline(
+        &self,
+        user_shader: &str,
+    ) -> Result<wgpu::RenderPipeline, RenderError> {
+        let wrapped = wrap_effect_shader(user_shader);
+
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("renderer-cli effect shader"),
+                source: wgpu::ShaderSource::Wgsl(wrapped.into()),
+            });
+        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+            return Err(RenderError::InvalidEffectShader(error.to_string()));
+        }
+
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("renderer-cli effect layout"),
+                bind_group_layouts: &[&self.texture_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("renderer-cli effect pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: EFFECT_VERTEX_ENTRY_POINT,
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: EFFECT_FRAGMENT_ENTRY_POINT,
+                    targets: &[Some(effect_color_target())],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+            return Err(RenderError::InvalidEffectShader(error.to_string()));
+        }
+        Ok(pipeline)
     }
 }
 
@@ -520,6 +674,21 @@ fn color_target() -> wgpu::ColorTargetState {
     wgpu::ColorTargetState {
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
+    }
+}
+
+/// Color target for the full-canvas effect pass. Unlike `color_target`
+/// (used to composite potentially-transparent primitives/text/images over
+/// each other and over the canvas background), the effect pass fully
+/// replaces every pixel of its target with the wrapped shader's output, so
+/// alpha blending must be disabled — otherwise a low- or zero-alpha effect
+/// output would blend against the (uninitialized/cleared) target instead of
+/// being written directly, silently discarding the effect's result.
+fn effect_color_target() -> wgpu::ColorTargetState {
+    wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        blend: None,
         write_mask: wgpu::ColorWrites::ALL,
     }
 }
@@ -1425,6 +1594,60 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const EFFECT_VERTEX_ENTRY_POINT: &str = "renderer_cli_effect_vs";
+const EFFECT_FRAGMENT_ENTRY_POINT: &str = "renderer_cli_effect_fs";
+
+/// Wraps a scene author's WGSL `effect` function in the fixed post-process
+/// template: a full-screen-triangle vertex stage (no vertex buffer; the
+/// triangle covers the viewport and is derived purely from
+/// `@builtin(vertex_index)`) and a fragment stage that samples the
+/// already-composited scene texture, calls `effect(uv, color)`, and writes
+/// the result. The user-supplied text is inserted verbatim between the
+/// fixed vertex stage and fixed fragment stage; the entry points use
+/// distinctive names so they cannot collide with anything a scene author's
+/// `effect` function defines.
+///
+/// This wrapping is the entire security boundary for scene-level effects:
+/// authors only ever author a pure per-pixel color transform and never see
+/// or control bind group layouts, vertex data, or texture access.
+fn wrap_effect_shader(user_shader: &str) -> String {
+    format!(
+        r#"
+struct RendererCliEffectVaryings {{
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}}
+
+@group(0) @binding(0) var renderer_cli_effect_texture: texture_2d<f32>;
+@group(0) @binding(1) var renderer_cli_effect_sampler: sampler;
+
+@vertex
+fn {EFFECT_VERTEX_ENTRY_POINT}(@builtin(vertex_index) vertex_index: u32) -> RendererCliEffectVaryings {{
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let position = positions[vertex_index];
+    var output: RendererCliEffectVaryings;
+    output.clip_position = vec4<f32>(position, 0.0, 1.0);
+    output.uv = vec2<f32>(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);
+    return output;
+}}
+
+// ---- begin scene-author effect shader (untrusted; pure color transform only) ----
+{user_shader}
+// ---- end scene-author effect shader ----
+
+@fragment
+fn {EFFECT_FRAGMENT_ENTRY_POINT}(input: RendererCliEffectVaryings) -> @location(0) vec4<f32> {{
+    let sampled = textureSample(renderer_cli_effect_texture, renderer_cli_effect_sampler, input.uv);
+    return effect(input.uv, sampled);
+}}
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1450,6 +1673,7 @@ mod tests {
                 },
             }],
             timeline: None,
+            effect: None,
         };
         let (vertices, warnings) = vertices_for_scene(&scene);
         assert_eq!(vertices.len(), 6);
@@ -1727,6 +1951,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn applies_a_full_canvas_effect_shader_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        // `test_scene()`'s canvas background is fully transparent black
+        // ([0,0,0,0]) and its only node (a red rect) does not cover pixel
+        // (0,0). 0.0 and 1.0 round-trip exactly through the sRGB transfer
+        // function used by the `Rgba8UnormSrgb` intermediate texture, so an
+        // exact-byte comparison at that pixel is meaningful (not sensitive
+        // to sRGB rounding) while still exercising the real GPU pass: RGB
+        // channels invert 0 -> 255 and alpha (never gamma-corrected) passes
+        // through unchanged.
+        let scene = test_scene();
+        let (without_effect, warnings) = renderer.render_rgba(&scene).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(&without_effect[0..4], &[0, 0, 0, 0]);
+
+        let mut scene = scene;
+        scene.effect = Some(renderer_schema::EffectV1 {
+            shader: "fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> {\n\
+                     return vec4<f32>(1.0 - color.rgb, color.a);\n\
+                     }"
+            .into(),
+        });
+        let (with_effect, warnings) = renderer.render_rgba(&scene).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(&with_effect[0..4], &[255, 255, 255, 0]);
+
+        assert_ne!(
+            without_effect, with_effect,
+            "applying the invert effect must change the composited output"
+        );
+    }
+
+    #[test]
+    fn an_invalid_effect_shader_returns_an_error_instead_of_panicking() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let mut scene = test_scene();
+
+        // References an undefined identifier: must fail WGSL compile
+        // validation, not panic the process.
+        scene.effect = Some(renderer_schema::EffectV1 {
+            shader: "fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> {\n\
+                     return this_identifier_does_not_exist;\n\
+                     }"
+            .into(),
+        });
+        let result = renderer.render_rgba(&scene);
+        assert!(
+            matches!(result, Err(RenderError::InvalidEffectShader(_))),
+            "expected InvalidEffectShader, got {result:?}"
+        );
+
+        // Missing the required `effect` function signature entirely: the
+        // template's fragment stage calls `effect(uv, color)`, which will
+        // fail to resolve.
+        scene.effect = Some(renderer_schema::EffectV1 {
+            shader: "fn not_the_right_name(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> {\n\
+                     return color;\n\
+                     }"
+            .into(),
+        });
+        let result = renderer.render_rgba(&scene);
+        assert!(
+            matches!(result, Err(RenderError::InvalidEffectShader(_))),
+            "expected InvalidEffectShader, got {result:?}"
+        );
+
+        // The renderer (and process) must still be usable afterwards.
+        scene.effect = None;
+        assert!(renderer.render_rgba(&scene).is_ok());
+    }
+
     /// Golden-image tolerance for `renders_golden_scenes_within_tolerance_on_an_available_gpu`.
     ///
     /// The renderer draws hard-edged triangles with no MSAA, so shape edges
@@ -1898,6 +2206,41 @@ mod tests {
         );
     }
 
+    /// Golden-image coverage for a scene-level full-canvas WGSL post-process
+    /// effect (a color invert), using the same tolerance-and-skip pattern as
+    /// `renders_golden_scenes_within_tolerance_on_an_available_gpu`. Fixture
+    /// files use the `golden_effect_` prefix to avoid colliding with that
+    /// test's fixtures.
+    #[test]
+    fn renders_a_golden_effect_scene_within_tolerance_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let asset_root = golden_asset_root();
+        let scene_file = "golden_effect_invert.scene.json";
+        let golden_file = "golden_effect_invert.expected.png";
+        let scene = load_golden_scene(scene_file);
+        assert!(scene.effect.is_some(), "{scene_file}: expected an effect");
+        let (pixels, warnings) = renderer
+            .render_rgba_with_asset_root(&scene, &asset_root)
+            .unwrap_or_else(|error| panic!("failed to render {scene_file}: {error}"));
+        assert!(
+            warnings.is_empty(),
+            "{scene_file}: unexpected warnings: {warnings:?}"
+        );
+        assert_matches_golden(
+            scene_file,
+            &pixels,
+            scene.canvas.width,
+            scene.canvas.height,
+            &asset_root.join(golden_file),
+        );
+    }
+
     #[test]
     fn rasterizes_text_images_and_constrained_assets_without_a_gpu() {
         let directory = tempfile::tempdir().unwrap();
@@ -2061,6 +2404,7 @@ mod tests {
                 },
             }],
             timeline: None,
+            effect: None,
         }
     }
 }
