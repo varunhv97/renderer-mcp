@@ -17,6 +17,7 @@ pub const MAX_ANIMATION_PIXELS: u64 = 64 * 1024 * 1024;
 pub type Color = [f32; 4];
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SceneV1 {
     pub version: String,
     pub canvas: CanvasV1,
@@ -59,6 +60,7 @@ impl SceneV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanvasV1 {
     pub width: u32,
     pub height: u32,
@@ -96,7 +98,7 @@ impl NodeV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NodeKindV1 {
     Rect {
         x: f32,
@@ -195,12 +197,14 @@ impl NodeKindV1 {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PointV1 {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimelineV1 {
     pub fps: u16,
     pub duration_ms: u32,
@@ -251,6 +255,7 @@ impl TimelineV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyframeV1 {
     pub at_ms: u32,
     pub target: String,
@@ -259,6 +264,7 @@ pub struct KeyframeV1 {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum AnimatedPropertyV1 {
     Opacity(f32),
     Color(Color),
@@ -266,6 +272,7 @@ pub enum AnimatedPropertyV1 {
 
 /// A bounded, typed scene mutation. Applying all operations is atomic.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScenePatchV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
@@ -282,7 +289,7 @@ impl ScenePatchV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PatchOperationV1 {
     SetCanvas { canvas: CanvasV1 },
     UpsertNode { node: NodeV1 },
@@ -410,6 +417,54 @@ mod tests {
             value.validate(),
             Err(SceneValidationError::UnsupportedVersion(_))
         ));
+    }
+
+    #[test]
+    fn rejects_a_misplaced_top_level_background_field_instead_of_ignoring_it() {
+        // `background` belongs under `canvas`, not at the scene's top level.
+        // Before `deny_unknown_fields`, a misplaced field like this was
+        // silently dropped by serde: the scene deserialized and validated
+        // successfully, but rendered with the default (transparent)
+        // background instead of the caller's intended color, with no
+        // diagnostic anywhere pointing at the mistake.
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64},
+            "background": {"kind": "solid", "color": [0.039, 0.067, 0.157, 1.0]},
+            "nodes": []
+        }"#;
+        let error = serde_json::from_str::<SceneV1>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("background"),
+            "expected the unknown `background` field to be named in the error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_fields_nested_under_canvas() {
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64, "colour": [1.0, 1.0, 1.0, 1.0]},
+            "nodes": []
+        }"#;
+        assert!(serde_json::from_str::<SceneV1>(json).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_fields_on_a_node() {
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64},
+            "nodes": [{
+                "id": "box", "kind": "rect",
+                "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                "color": [1.0, 1.0, 1.0, 1.0],
+                "strokeWidth": 2.0
+            }]
+        }"#;
+        assert!(serde_json::from_str::<SceneV1>(json).is_err());
     }
 
     #[test]
