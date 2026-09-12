@@ -1727,6 +1727,177 @@ mod tests {
         }
     }
 
+    /// Golden-image tolerance for `renders_golden_scenes_within_tolerance_on_an_available_gpu`.
+    ///
+    /// The renderer draws hard-edged triangles with no MSAA, so shape edges
+    /// are exact given identical input; the only sources of legitimate,
+    /// non-bug pixel drift across GPUs/drivers are: (1) fontdue's
+    /// anti-aliased glyph coverage combined with sRGB-aware alpha blending on
+    /// `Rgba8UnormSrgb`, where different GPUs may round the linear<->sRGB
+    /// conversion by a few least-significant bits, and (2) bilinear texture
+    /// sampling when an image is uploaded below its target size (as in these
+    /// fixtures) and stretched by the GPU sampler, whose interpolation
+    /// weights can differ minutely by hardware. Neither should ever move a
+    /// pixel by more than a handful of 8-bit levels, and neither should
+    /// affect more than a thin sliver of pixels along glyph/image edges.
+    ///
+    /// A genuine regression (wrong placement, dropped alpha blending, wrong
+    /// composition order) shifts whole regions of the image by large amounts
+    /// and/or moves a large fraction of pixels, which these two independent
+    /// checks both catch:
+    ///   - `GOLDEN_MAX_MISMATCHED_PIXEL_RATIO`: at most 0.75% of pixels may
+    ///     differ by more than `GOLDEN_MAX_CHANNEL_DELTA` in any channel.
+    ///   - `GOLDEN_MAX_MEAN_CHANNEL_DELTA`: the average per-channel delta
+    ///     across the whole image must stay under 1 of 255 levels, which
+    ///     bounds cumulative drift even if it were spread thinly.
+    const GOLDEN_MAX_CHANNEL_DELTA: u8 = 8;
+    const GOLDEN_MAX_MISMATCHED_PIXEL_RATIO: f64 = 0.0075;
+    const GOLDEN_MAX_MEAN_CHANNEL_DELTA: f64 = 1.0;
+
+    fn golden_asset_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/golden")
+    }
+
+    fn load_golden_scene(name: &str) -> SceneV1 {
+        let path = golden_asset_root().join(name);
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read fixture {path:?}: {error}"));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("failed to parse fixture {path:?}: {error}"))
+    }
+
+    /// Asserts `actual` (raw RGBA8 pixels for a `width`x`height` render)
+    /// matches the checked-in golden PNG at `golden_path` within the
+    /// documented tolerance. See the comment on the `GOLDEN_*` constants
+    /// above for the rationale.
+    fn assert_matches_golden(
+        label: &str,
+        actual: &[u8],
+        width: u32,
+        height: u32,
+        golden_path: &Path,
+    ) {
+        let golden = image::open(golden_path)
+            .unwrap_or_else(|error| panic!("failed to open golden image {golden_path:?}: {error}"))
+            .to_rgba8();
+        assert_eq!(golden.width(), width, "{label}: golden width mismatch");
+        assert_eq!(golden.height(), height, "{label}: golden height mismatch");
+        let golden = golden.into_raw();
+        assert_eq!(
+            actual.len(),
+            golden.len(),
+            "{label}: pixel buffer length mismatch"
+        );
+
+        let pixel_count = width as usize * height as usize;
+        let mut mismatched_pixels = 0usize;
+        let mut sum_abs_delta: u64 = 0;
+        let (actual_pixels, _) = actual.as_chunks::<4>();
+        let (golden_pixels, _) = golden.as_chunks::<4>();
+        for (actual_pixel, golden_pixel) in actual_pixels.iter().zip(golden_pixels.iter()) {
+            let mut pixel_mismatched = false;
+            for channel in 0..4 {
+                let delta = (actual_pixel[channel] as i16 - golden_pixel[channel] as i16)
+                    .unsigned_abs() as u8;
+                sum_abs_delta += delta as u64;
+                if delta > GOLDEN_MAX_CHANNEL_DELTA {
+                    pixel_mismatched = true;
+                }
+            }
+            if pixel_mismatched {
+                mismatched_pixels += 1;
+            }
+        }
+        let mismatched_ratio = mismatched_pixels as f64 / pixel_count as f64;
+        let mean_channel_delta = sum_abs_delta as f64 / (pixel_count as f64 * 4.0);
+        assert!(
+            mismatched_ratio <= GOLDEN_MAX_MISMATCHED_PIXEL_RATIO,
+            "{label}: {mismatched_pixels}/{pixel_count} pixels ({:.3}%) exceeded the \
+             per-channel tolerance of {GOLDEN_MAX_CHANNEL_DELTA}; allowed up to {:.3}%",
+            mismatched_ratio * 100.0,
+            GOLDEN_MAX_MISMATCHED_PIXEL_RATIO * 100.0
+        );
+        assert!(
+            mean_channel_delta <= GOLDEN_MAX_MEAN_CHANNEL_DELTA,
+            "{label}: mean per-channel delta {mean_channel_delta:.3} exceeded {GOLDEN_MAX_MEAN_CHANNEL_DELTA}"
+        );
+    }
+
+    /// Perceptual golden-image coverage for text/image rasterization and
+    /// scene composition, per the approved acceptance plan for the local
+    /// text/image rasterization increment ("Use deterministic golden images
+    /// to verify text/image placement, alpha blend, node ordering, and
+    /// PNG/GIF output on a supported GPU host"). Skips gracefully (rather
+    /// than failing) on a host with no GPU adapter, mirroring
+    /// `renders_png_and_gif_on_an_available_gpu`.
+    #[test]
+    fn renders_golden_scenes_within_tolerance_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let asset_root = golden_asset_root();
+
+        // Covers text placement, image placement, and alpha blending across
+        // overlapping vector, text, and image nodes.
+        let cases = [
+            (
+                "golden_text_image_placement.scene.json",
+                "golden_text_image_placement.expected.png",
+            ),
+            (
+                "golden_alpha_blend.scene.json",
+                "golden_alpha_blend.expected.png",
+            ),
+            (
+                "golden_order_image_first.scene.json",
+                "golden_order_image_first.expected.png",
+            ),
+            (
+                "golden_order_vector_first.scene.json",
+                "golden_order_vector_first.expected.png",
+            ),
+        ];
+        for (scene_file, golden_file) in cases {
+            let scene = load_golden_scene(scene_file);
+            let (pixels, warnings) = renderer
+                .render_rgba_with_asset_root(&scene, &asset_root)
+                .unwrap_or_else(|error| panic!("failed to render {scene_file}: {error}"));
+            assert!(
+                warnings.is_empty(),
+                "{scene_file}: unexpected warnings: {warnings:?}"
+            );
+            assert_matches_golden(
+                scene_file,
+                &pixels,
+                scene.canvas.width,
+                scene.canvas.height,
+                &asset_root.join(golden_file),
+            );
+        }
+
+        // `golden_order_image_first.scene.json` and
+        // `golden_order_vector_first.scene.json` declare the same
+        // partially-transparent image and rect nodes in opposite order.
+        // Composition is a strict painter's-algorithm pass over declaration
+        // order, so swapping the order must change the blended result.
+        let image_first = load_golden_scene("golden_order_image_first.scene.json");
+        let vector_first = load_golden_scene("golden_order_vector_first.scene.json");
+        let (image_first_pixels, _) = renderer
+            .render_rgba_with_asset_root(&image_first, &asset_root)
+            .unwrap();
+        let (vector_first_pixels, _) = renderer
+            .render_rgba_with_asset_root(&vector_first, &asset_root)
+            .unwrap();
+        assert_ne!(
+            image_first_pixels, vector_first_pixels,
+            "scene-declaration order must affect the composited output"
+        );
+    }
+
     #[test]
     fn rasterizes_text_images_and_constrained_assets_without_a_gpu() {
         let directory = tempfile::tempdir().unwrap();

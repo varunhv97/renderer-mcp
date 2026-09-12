@@ -1,0 +1,9 @@
+{
+  "version": "renderer.scene.v1",
+  "canvas": { "width": 64, "height": 64, "background": [0.05, 0.06, 0.1, 1.0] },
+  "nodes": [
+    { "id": "panel", "kind": "rect", "x": 4.0, "y": 4.0, "width": 56.0, "height": 56.0, "color": [0.12, 0.16, 0.24, 1.0] },
+    { "id": "icon", "kind": "image", "x": 8.0, "y": 8.0, "width": 20.0, "height": 20.0, "source": "golden_fixture.png" },
+    { "id": "label", "kind": "text", "x": 8.0, "y": 34.0, "text": "Hi", "size": 18.0, "color": [1.0, 1.0, 1.0, 1.0] }
+  ]
+}
