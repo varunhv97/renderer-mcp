@@ -830,6 +830,7 @@ mod tests {
                 },
             }],
             timeline: None,
+            effect: None,
         }
     }
 

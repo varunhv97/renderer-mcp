@@ -1,0 +1,12 @@
+{
+  "version": "renderer.scene.v1",
+  "canvas": { "width": 64, "height": 64, "background": [0.1, 0.2, 0.8, 1.0] },
+  "nodes": [
+    { "id": "red", "kind": "rect", "x": 8.0, "y": 8.0, "width": 40.0, "height": 40.0, "color": [1.0, 0.0, 0.0, 0.5] },
+    { "id": "blue", "kind": "ellipse", "cx": 40.0, "cy": 40.0, "rx": 20.0, "ry": 20.0, "color": [0.0, 0.0, 1.0, 0.5] },
+    { "id": "label", "kind": "text", "x": 12.0, "y": 12.0, "text": "A", "size": 24.0, "color": [1.0, 1.0, 1.0, 0.6] }
+  ],
+  "effect": {
+    "shader": "fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> { return vec4<f32>(1.0 - color.rgb, color.a); }"
+  }
+}

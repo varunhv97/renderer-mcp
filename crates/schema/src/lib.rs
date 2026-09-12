@@ -13,6 +13,8 @@ pub const MAX_PATCH_OPERATIONS: usize = 1_000;
 pub const MAX_ANIMATION_FRAMES: u64 = 300;
 /// Maximum aggregate raster work for one animation, measured in output pixels.
 pub const MAX_ANIMATION_PIXELS: u64 = 64 * 1024 * 1024;
+/// Maximum byte length of a user-supplied post-process effect shader.
+pub const MAX_EFFECT_SHADER_BYTES: usize = 64 * 1024;
 
 pub type Color = [f32; 4];
 
@@ -24,6 +26,8 @@ pub struct SceneV1 {
     pub nodes: Vec<NodeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline: Option<TimelineV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<EffectV1>,
 }
 
 impl SceneV1 {
@@ -53,6 +57,37 @@ impl SceneV1 {
         }
         if let Some(timeline) = &self.timeline {
             timeline.validate(&ids, self.canvas.width, self.canvas.height)?;
+        }
+        if let Some(effect) = &self.effect {
+            effect.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// A scene-level, full-canvas WGSL post-process effect.
+///
+/// `shader` is WGSL source that must define exactly one function with the
+/// signature `fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>`. The
+/// renderer wraps this pure per-pixel color transform in an internal,
+/// fixed template (vertex stage, texture bindings) so authors never touch
+/// bindings or vertex data directly; that template is the entire security
+/// boundary between untrusted scene input and the GPU pipeline.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct EffectV1 {
+    pub shader: String,
+}
+
+impl EffectV1 {
+    fn validate(&self) -> Result<(), SceneValidationError> {
+        if self.shader.is_empty() {
+            return Err(SceneValidationError::EmptyEffectShader);
+        }
+        if self.shader.len() > MAX_EFFECT_SHADER_BYTES {
+            return Err(SceneValidationError::EffectShaderTooLarge {
+                actual: self.shader.len(),
+                maximum: MAX_EFFECT_SHADER_BYTES,
+            });
         }
         Ok(())
     }
@@ -329,6 +364,10 @@ pub enum SceneValidationError {
     TooManyAnimationPixels { actual: u64, maximum: u64 },
     #[error("timeline must use 1-60 FPS, last no more than 10 seconds, and contain valid frames")]
     InvalidTimeline,
+    #[error("effect shader must not be empty")]
+    EmptyEffectShader,
+    #[error("effect shader is {actual} bytes; maximum is {maximum}")]
+    EffectShaderTooLarge { actual: usize, maximum: usize },
 }
 
 fn transparent() -> Color {
@@ -384,6 +423,7 @@ mod tests {
                 },
             }],
             timeline: None,
+            effect: None,
         }
     }
 
@@ -663,5 +703,39 @@ mod tests {
             .validate(),
             Ok(())
         );
+    }
+
+    #[test]
+    fn rejects_an_empty_effect_shader() {
+        let mut value = scene();
+        value.effect = Some(EffectV1 {
+            shader: String::new(),
+        });
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::EmptyEffectShader)
+        );
+    }
+
+    #[test]
+    fn rejects_an_oversized_effect_shader() {
+        let mut value = scene();
+        value.effect = Some(EffectV1 {
+            shader: "a".repeat(MAX_EFFECT_SHADER_BYTES + 1),
+        });
+        assert!(matches!(
+            value.validate(),
+            Err(SceneValidationError::EffectShaderTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_a_valid_effect_shader() {
+        let mut value = scene();
+        value.effect = Some(EffectV1 {
+            shader: "fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> { return color; }"
+                .into(),
+        });
+        assert_eq!(value.validate(), Ok(()));
     }
 }

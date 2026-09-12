@@ -1,0 +1,13 @@
+{
+  "version": "renderer.scene.v1",
+  "canvas": { "width": 640, "height": 360, "background": [0.04, 0.06, 0.12, 1.0] },
+  "nodes": [
+    { "id": "title", "kind": "rect", "x": 56.0, "y": 52.0, "width": 528.0, "height": 76.0, "color": [0.25, 0.55, 0.98, 1.0] },
+    { "id": "left", "kind": "ellipse", "cx": 150.0, "cy": 215.0, "rx": 58.0, "ry": 58.0, "color": [0.15, 0.85, 0.65, 1.0] },
+    { "id": "right", "kind": "ellipse", "cx": 490.0, "cy": 215.0, "rx": 58.0, "ry": 58.0, "color": [0.98, 0.61, 0.25, 1.0] },
+    { "id": "link", "kind": "line", "x1": 208.0, "y1": 215.0, "x2": 432.0, "y2": 215.0, "thickness": 10.0, "color": [0.9, 0.94, 1.0, 1.0] }
+  ],
+  "effect": {
+    "shader": "fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> { return vec4<f32>(1.0 - color.rgb, color.a); }"
+  }
+}
