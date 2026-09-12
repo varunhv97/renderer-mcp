@@ -1,5 +1,6 @@
 //! Off-screen wgpu renderer for normalized RendererCli scenes.
-#![allow(unexpected_cfgs)] // `cargo llvm-cov` supplies `cfg(coverage)`.
+#![allow(unexpected_cfgs)] // `cargo llvm-cov` supplies `cfg(coverage)`/`cfg(coverage_nightly)`.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 use bytemuck::{Pod, Zeroable};
 use fontdue::Font;
@@ -231,7 +232,7 @@ impl GpuRenderer {
         self.render_composed_rgba(scene, asset_root)
     }
 
-    #[cfg_attr(coverage, coverage(off))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn render_composed_rgba(
         &self,
         scene: &SceneV1,
