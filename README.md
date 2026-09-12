@@ -5,9 +5,11 @@ A local GPU-accelerated visual runtime for coding agents.
 The workspace is intentionally CLI and MCP first: agents submit a versioned JSON
 scene or drawing-command document, receive a saved image plus structured
 metadata, and can keep a named scene alive during a local daemon session.
-Scenes compose vector shapes, local raster images, and embedded-font text into
-one ordered GPU pass; PNG and keyframed GIF export both work from the same
-scene document.
+Scenes compose vector shapes, local raster and SVG images, and embedded-font
+text into one ordered GPU pass; PNG and keyframed GIF export both work from
+the same scene document. Image nodes accept local PNG, JPEG, GIF, WebP, or
+SVG assets; SVG assets are rasterized directly at each node's declared size
+rather than decoded and rescaled.
 
 ## Development
 

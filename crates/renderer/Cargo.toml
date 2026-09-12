@@ -10,6 +10,7 @@ fontdue.workspace = true
 image.workspace = true
 pollster.workspace = true
 renderer-schema = { path = "../schema" }
+resvg.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
