@@ -232,4 +232,67 @@ mod tests {
             PathBuf::from("fixtures")
         );
     }
+
+    #[test]
+    fn render_metadata_classifies_mime_type_by_frame_count() {
+        let single_frame = render_metadata(
+            PathBuf::from("out.png"),
+            RenderResult {
+                width: 4,
+                height: 4,
+                sha256: "abc".into(),
+                frame_count: 1,
+                warnings: vec![],
+            },
+        );
+        assert_eq!(single_frame["mime_type"], "image/png");
+        assert_eq!(single_frame["path"], "out.png");
+
+        let animated = render_metadata(
+            PathBuf::from("out.gif"),
+            RenderResult {
+                width: 4,
+                height: 4,
+                sha256: "abc".into(),
+                frame_count: 3,
+                warnings: vec!["slow".into()],
+            },
+        );
+        assert_eq!(animated["mime_type"], "image/gif");
+        assert_eq!(animated["frame_count"], 3);
+    }
+
+    #[test]
+    fn read_json_reports_missing_files_and_invalid_json() {
+        let missing = read_json::<SceneV1>(&PathBuf::from("/no/such/scene.json"));
+        assert!(
+            missing
+                .expect_err("missing file must fail")
+                .to_string()
+                .contains("could not read")
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let bad = directory.path().join("bad.json");
+        fs::write(&bad, "not json").unwrap();
+        let invalid = read_json::<SceneV1>(&bad);
+        assert!(
+            invalid
+                .expect_err("invalid json must fail")
+                .to_string()
+                .contains("scene is not valid JSON")
+        );
+    }
+
+    #[test]
+    fn print_daemon_result_handles_every_non_render_variant() {
+        assert!(print_daemon_result(DaemonResult::Health).is_ok());
+        assert!(print_daemon_result(DaemonResult::Destroyed).is_ok());
+        assert!(print_daemon_result(DaemonResult::Revision { revision: 7 }).is_ok());
+    }
+
+    #[test]
+    fn print_json_serializes_and_prints() {
+        assert!(print_json(serde_json::json!({ "ok": true })).is_ok());
+    }
 }

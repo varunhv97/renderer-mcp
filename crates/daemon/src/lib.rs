@@ -652,7 +652,9 @@ fn ensure_loopback(endpoint: SocketAddr) -> Result<(), DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use renderer_schema::{CanvasV1, NodeKindV1, NodeV1, SCENE_VERSION_V1};
+    use renderer_schema::{
+        CanvasV1, NodeKindV1, NodeV1, SCENE_VERSION_V1, SceneValidationError, TimelineV1,
+    };
     use std::thread;
 
     fn scene() -> SceneV1 {
@@ -810,5 +812,355 @@ mod tests {
             Err(DaemonError::Connection(error)) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
         ));
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn ensure_scene_id_rejects_blank_ids() {
+        assert!(matches!(
+            ensure_scene_id(""),
+            Err(DaemonError::EmptySceneId)
+        ));
+        assert!(matches!(
+            ensure_scene_id("   "),
+            Err(DaemonError::EmptySceneId)
+        ));
+        assert!(ensure_scene_id("ok").is_ok());
+    }
+
+    #[test]
+    fn error_response_maps_every_error_kind_to_a_stable_code() {
+        let cases: Vec<(DaemonError, &str)> = vec![
+            (
+                DaemonError::RevisionConflict {
+                    expected: 1,
+                    actual: 2,
+                },
+                "revision_conflict",
+            ),
+            (DaemonError::SceneNotFound("s".into()), "not_found"),
+            (
+                DaemonError::NodeNotFound {
+                    index: 0,
+                    id: "n".into(),
+                },
+                "not_found",
+            ),
+            (
+                DaemonError::SceneAlreadyExists("s".into()),
+                "already_exists",
+            ),
+            (
+                DaemonError::InvalidScene(SceneValidationError::EmptyNodeId),
+                "invalid_scene",
+            ),
+            (DaemonError::EmptySceneId, "invalid_scene"),
+            (DaemonError::SceneResponseTooLarge, "invalid_scene"),
+            (DaemonError::Protocol("bad".into()), "invalid_request"),
+            (DaemonError::AssetRootRequired, "internal_error"),
+        ];
+        for (error, expected_code) in cases {
+            let message = error.to_string();
+            let response = error_response(error);
+            assert!(response.result.is_none());
+            let protocol_error = response.error.unwrap();
+            assert_eq!(protocol_error.code, expected_code);
+            assert_eq!(protocol_error.message, message);
+        }
+    }
+
+    #[test]
+    fn scene_count_and_gif_inline_rendering_without_a_named_scene() {
+        let Ok(daemon) = RendererDaemon::new() else {
+            return;
+        };
+        assert_eq!(daemon.scene_count(), 0);
+        let mut animated = scene();
+        animated.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1000,
+            keyframes: vec![],
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("inline.gif");
+        assert!(daemon.render_gif_inline(&animated, &output).is_ok());
+    }
+
+    #[test]
+    fn dispatch_handles_every_request_kind_end_to_end() {
+        let Ok(mut daemon) = RendererDaemon::new() else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+
+        let health = dispatch(&mut daemon, DaemonRequest::Health);
+        assert!(matches!(health.result, Some(DaemonResult::Health)));
+
+        let create = dispatch(
+            &mut daemon,
+            DaemonRequest::CreateScene {
+                scene_id: "s".into(),
+                scene: scene(),
+                asset_root: None,
+            },
+        );
+        assert!(matches!(
+            create.result,
+            Some(DaemonResult::Revision { revision: 1 })
+        ));
+
+        let get = dispatch(
+            &mut daemon,
+            DaemonRequest::GetScene {
+                scene_id: "s".into(),
+            },
+        );
+        assert!(matches!(get.result, Some(DaemonResult::Scene { .. })));
+
+        let missing = dispatch(
+            &mut daemon,
+            DaemonRequest::GetScene {
+                scene_id: "nope".into(),
+            },
+        );
+        assert_eq!(missing.error.unwrap().code, "not_found");
+
+        let conflict = dispatch(
+            &mut daemon,
+            DaemonRequest::ReplaceScene {
+                scene_id: "s".into(),
+                scene: scene(),
+                expected_revision: Some(99),
+                asset_root: None,
+            },
+        );
+        assert_eq!(conflict.error.unwrap().code, "revision_conflict");
+
+        let replace = dispatch(
+            &mut daemon,
+            DaemonRequest::ReplaceScene {
+                scene_id: "s".into(),
+                scene: scene(),
+                expected_revision: Some(1),
+                asset_root: None,
+            },
+        );
+        assert!(matches!(
+            replace.result,
+            Some(DaemonResult::Revision { revision: 2 })
+        ));
+
+        let patch = dispatch(
+            &mut daemon,
+            DaemonRequest::PatchScene {
+                scene_id: "s".into(),
+                patch: ScenePatchV1 {
+                    expected_revision: Some(2),
+                    operations: vec![
+                        PatchOperationV1::SetCanvas {
+                            canvas: CanvasV1 {
+                                width: 16,
+                                height: 16,
+                                background: [0.0; 4],
+                            },
+                        },
+                        // "box" already exists: this replaces it in place
+                        // rather than pushing a new node.
+                        PatchOperationV1::UpsertNode {
+                            node: NodeV1 {
+                                id: "box".into(),
+                                kind: NodeKindV1::Rect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: 4.0,
+                                    height: 4.0,
+                                    color: [1.0; 4],
+                                },
+                            },
+                        },
+                        PatchOperationV1::SetTimeline {
+                            timeline: TimelineV1 {
+                                fps: 1,
+                                duration_ms: 1000,
+                                keyframes: vec![],
+                            },
+                        },
+                    ],
+                },
+            },
+        );
+        assert!(matches!(
+            patch.result,
+            Some(DaemonResult::Revision { revision: 3 })
+        ));
+
+        let render = dispatch(
+            &mut daemon,
+            DaemonRequest::RenderScene {
+                scene_id: "s".into(),
+                output: directory.path().join("s.png"),
+            },
+        );
+        assert!(matches!(render.result, Some(DaemonResult::Rendered { .. })));
+
+        let render_gif = dispatch(
+            &mut daemon,
+            DaemonRequest::RenderGifScene {
+                scene_id: "s".into(),
+                output: directory.path().join("s.gif"),
+            },
+        );
+        assert!(matches!(
+            render_gif.result,
+            Some(DaemonResult::Rendered { .. })
+        ));
+
+        let destroy = dispatch(
+            &mut daemon,
+            DaemonRequest::DestroyScene {
+                scene_id: "s".into(),
+            },
+        );
+        assert!(matches!(destroy.result, Some(DaemonResult::Destroyed)));
+
+        let destroy_missing = dispatch(
+            &mut daemon,
+            DaemonRequest::DestroyScene {
+                scene_id: "s".into(),
+            },
+        );
+        assert_eq!(destroy_missing.error.unwrap().code, "not_found");
+    }
+
+    #[test]
+    fn serve_dispatches_over_tcp_and_enforces_protocol_limits() {
+        let Ok(picker) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let endpoint = picker.local_addr().unwrap();
+        drop(picker);
+        thread::spawn(move || {
+            let _ = serve(endpoint);
+        });
+
+        let client = DaemonClient::new(endpoint).unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            if client.call(DaemonRequest::Health).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !ready {
+            // No GPU adapter available in this environment: `serve` cannot
+            // construct a `RendererDaemon`, so there is nothing listening.
+            return;
+        }
+
+        let mut malformed = TcpStream::connect(endpoint).unwrap();
+        malformed.write_all(b"not json\n").unwrap();
+        let mut response = String::new();
+        malformed.read_to_string(&mut response).unwrap();
+        assert!(response.contains("invalid_request"));
+
+        let mut wrong_version = TcpStream::connect(endpoint).unwrap();
+        wrong_version
+            .write_all(br#"{"version":"nope","method":"health"}"#)
+            .unwrap();
+        wrong_version.write_all(b"\n").unwrap();
+        let mut response = String::new();
+        wrong_version.read_to_string(&mut response).unwrap();
+        assert!(response.contains("unsupported daemon request version"));
+
+        let mut oversized = TcpStream::connect(endpoint).unwrap();
+        oversized
+            .write_all(&vec![b'a'; MAX_REQUEST_BYTES + 2])
+            .unwrap();
+        let mut response = String::new();
+        oversized.read_to_string(&mut response).unwrap();
+        assert!(response.contains("exceeds 1 MiB limit"));
+
+        assert!(matches!(
+            client.call(DaemonRequest::Health),
+            Ok(DaemonResult::Health)
+        ));
+    }
+
+    #[test]
+    fn client_call_reports_oversized_or_malformed_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let _ = BufReader::new(&stream)
+                .take(MAX_REQUEST_BYTES as u64)
+                .read_until(b'\n', &mut request);
+            let _ = stream.write_all(&vec![b'a'; MAX_REQUEST_BYTES + 2]);
+        });
+        let client = DaemonClient::new(endpoint).unwrap();
+        assert!(matches!(
+            client.call(DaemonRequest::Health),
+            Err(DaemonError::Protocol(message)) if message.contains("exceeds 1 MiB limit")
+        ));
+        server.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let _ = BufReader::new(&stream)
+                .take(MAX_REQUEST_BYTES as u64)
+                .read_until(b'\n', &mut request);
+            let _ =
+                stream.write_all(br#"{"version":"nope","result":{"kind":"health"},"error":null}"#);
+            let _ = stream.write_all(b"\n");
+        });
+        let client = DaemonClient::new(endpoint).unwrap();
+        assert!(matches!(
+            client.call(DaemonRequest::Health),
+            Err(DaemonError::Protocol(message)) if message.contains("unsupported daemon response version")
+        ));
+        server.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let _ = BufReader::new(&stream)
+                .take(MAX_REQUEST_BYTES as u64)
+                .read_until(b'\n', &mut request);
+            let _ =
+                stream.write_all(br#"{"version":"renderer.daemon.v1","result":null,"error":null}"#);
+            let _ = stream.write_all(b"\n");
+        });
+        let client = DaemonClient::new(endpoint).unwrap();
+        assert!(matches!(
+            client.call(DaemonRequest::Health),
+            Err(DaemonError::Protocol(message)) if message == "daemon returned no result"
+        ));
+        server.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let _ = BufReader::new(&stream)
+                .take(MAX_REQUEST_BYTES as u64)
+                .read_until(b'\n', &mut request);
+            let _ = stream.write_all(
+                br#"{"version":"renderer.daemon.v1","result":null,"error":{"code":"not_found","message":"missing"}}"#,
+            );
+            let _ = stream.write_all(b"\n");
+        });
+        let client = DaemonClient::new(endpoint).unwrap();
+        assert!(matches!(
+            client.call(DaemonRequest::Health),
+            Err(DaemonError::Protocol(message)) if message == "not_found: missing"
+        ));
+        server.join().unwrap();
     }
 }
