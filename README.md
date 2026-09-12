@@ -73,6 +73,21 @@ The daemon only ever binds a loopback address, caps requests at 1 MiB, and
 rejects unknown fields/operations. Everything under `.renderer/` is generated
 local output and is not committed.
 
+### Per-session performance metrics
+
+Each `daemon serve` run is one session. A background thread appends one JSON
+line per request to `.renderer/metrics/<session-id>.jsonl` (method, scene ID,
+duration, and outcome) so local performance testing doesn't need extra
+instrumentation:
+
+```sh
+cat .renderer/metrics/*.jsonl | jq -c '{method, duration_ms, success}'
+```
+
+Recording only enqueues onto a channel from the request-handling path, so it
+adds no latency there; if the metrics directory can't be created, the daemon
+logs a warning and keeps serving without it.
+
 ## MCP server
 
 `renderer-mcp` speaks newline-delimited JSON-RPC over stdio (`initialize`,
