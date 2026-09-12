@@ -1,0 +1,10 @@
+{
+  "version": "renderer.scene.v1",
+  "canvas": { "width": 64, "height": 64, "background": [0.05, 0.06, 0.1, 1.0] },
+  "nodes": [
+    { "id": "panel", "kind": "rect", "x": 4.0, "y": 4.0, "width": 56.0, "height": 56.0, "color": [0.12, 0.16, 0.24, 1.0] },
+    { "id": "badge", "kind": "image", "x": 8.0, "y": 8.0, "width": 32.0, "height": 32.0, "source": "golden_svg_badge.svg" },
+    { "id": "accent", "kind": "rect", "x": 30.0, "y": 30.0, "width": 12.0, "height": 12.0, "color": [1.0, 1.0, 1.0, 0.5] },
+    { "id": "label", "kind": "text", "x": 8.0, "y": 44.0, "text": "Hi", "size": 16.0, "color": [1.0, 1.0, 1.0, 1.0] }
+  ]
+}
