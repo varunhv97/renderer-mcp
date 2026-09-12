@@ -8,13 +8,16 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
 pub const DAEMON_PROTOCOL_VERSION: &str = "renderer.daemon.v1";
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_METRICS_DIR: &str = ".renderer/metrics";
 
 #[derive(Debug)]
 pub struct RendererDaemon {
@@ -466,12 +469,125 @@ pub struct DaemonProtocolError {
     pub message: String,
 }
 
+/// One JSON-lines event describing a single daemon request, appended to a
+/// per-session metrics file by a dedicated background thread so recording
+/// never adds latency to request handling.
+#[derive(Clone, Debug, Serialize)]
+struct MetricEvent {
+    session_id: String,
+    timestamp_ms: u128,
+    method: String,
+    scene_id: Option<String>,
+    duration_ms: f64,
+    success: bool,
+    error_code: Option<String>,
+}
+
+/// Records request timings for one daemon session (one `serve` invocation)
+/// without blocking the connection-handling loop: `record` only pushes onto
+/// an unbounded channel, and a background thread owns the actual file I/O.
+struct MetricsRecorder {
+    session_id: String,
+    sender: mpsc::Sender<MetricEvent>,
+}
+
+impl MetricsRecorder {
+    /// Starts a session, creating `metrics_dir` and a `<session_id>.jsonl`
+    /// file inside it. Returns `Err` only if the directory/file cannot be
+    /// created; callers should treat that as non-fatal and serve without
+    /// metrics rather than refuse to start the daemon.
+    fn start(metrics_dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(metrics_dir)?;
+        let session_id = format!(
+            "session-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or_default(),
+            std::process::id()
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(metrics_dir.join(format!("{session_id}.jsonl")))?;
+        let (sender, receiver) = mpsc::channel::<MetricEvent>();
+        thread::spawn(move || {
+            for event in receiver {
+                if let Ok(line) = serde_json::to_string(&event) {
+                    let _ = writeln!(file, "{line}");
+                    let _ = file.flush();
+                }
+            }
+        });
+        Ok(Self { session_id, sender })
+    }
+
+    fn record(
+        &self,
+        method: &str,
+        scene_id: Option<&str>,
+        duration: Duration,
+        success: bool,
+        error_code: Option<&str>,
+    ) {
+        let event = MetricEvent {
+            session_id: self.session_id.clone(),
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or_default(),
+            method: method.into(),
+            scene_id: scene_id.map(str::to_owned),
+            duration_ms: duration.as_secs_f64() * 1000.0,
+            success,
+            error_code: error_code.map(str::to_owned),
+        };
+        // An unbounded send only fails if the receiver thread is gone, which
+        // only happens if it panicked; dropping the event is preferable to
+        // letting a metrics failure affect scene rendering.
+        let _ = self.sender.send(event);
+    }
+}
+
+/// A short label plus the scene ID (if any) a request applies to, used only
+/// for metrics: it must not require cloning the (potentially large) scene
+/// payload out of the request.
+fn request_label(request: &DaemonRequest) -> (&'static str, Option<&str>) {
+    match request {
+        DaemonRequest::Health => ("health", None),
+        DaemonRequest::CreateScene { scene_id, .. } => ("create_scene", Some(scene_id)),
+        DaemonRequest::GetScene { scene_id } => ("get_scene", Some(scene_id)),
+        DaemonRequest::ReplaceScene { scene_id, .. } => ("replace_scene", Some(scene_id)),
+        DaemonRequest::PatchScene { scene_id, .. } => ("patch_scene", Some(scene_id)),
+        DaemonRequest::RenderScene { scene_id, .. } => ("render_scene", Some(scene_id)),
+        DaemonRequest::RenderGifScene { scene_id, .. } => ("render_gif_scene", Some(scene_id)),
+        DaemonRequest::DestroyScene { scene_id } => ("destroy_scene", Some(scene_id)),
+    }
+}
+
 pub fn serve(endpoint: SocketAddr) -> Result<(), DaemonError> {
+    serve_with_metrics_dir(endpoint, Some(Path::new(DEFAULT_METRICS_DIR)))
+}
+
+/// Same as [`serve`], but lets callers redirect (or disable, via `None`)
+/// per-session metrics output. Tests use this to avoid writing into the
+/// repository's `.renderer/` directory.
+pub fn serve_with_metrics_dir(
+    endpoint: SocketAddr,
+    metrics_dir: Option<&Path>,
+) -> Result<(), DaemonError> {
     ensure_loopback(endpoint)?;
     let listener = TcpListener::bind(endpoint).map_err(DaemonError::Bind)?;
     let mut daemon = RendererDaemon::new()?;
+    let metrics = metrics_dir.and_then(|dir| match MetricsRecorder::start(dir) {
+        Ok(recorder) => Some(recorder),
+        Err(error) => {
+            eprintln!("warning: session metrics disabled, could not start ({error})");
+            None
+        }
+    });
     for mut stream in listener.incoming().flatten() {
-        let _ = handle_connection(&mut daemon, &mut stream);
+        let _ = handle_connection(&mut daemon, &mut stream, metrics.as_ref());
     }
     Ok(())
 }
@@ -479,11 +595,31 @@ pub fn serve(endpoint: SocketAddr) -> Result<(), DaemonError> {
 fn handle_connection(
     daemon: &mut RendererDaemon,
     stream: &mut TcpStream,
+    metrics: Option<&MetricsRecorder>,
 ) -> Result<(), DaemonError> {
-    let response = match read_request(stream) {
+    let start = Instant::now();
+    let request = read_request(stream);
+    // Own the label's strings up front: `request_label` borrows from
+    // `request`, and that borrow can't outlive `request` being moved into
+    // `dispatch` below.
+    let label = request.as_ref().ok().map(|request| {
+        let (method, scene_id) = request_label(request);
+        (method, scene_id.map(str::to_owned))
+    });
+    let response = match request {
         Ok(request) => dispatch(daemon, request),
         Err(error) => error_response(error),
     };
+    if let Some(recorder) = metrics {
+        let (method, scene_id) = label.unwrap_or(("invalid_request", None));
+        recorder.record(
+            method,
+            scene_id.as_deref(),
+            start.elapsed(),
+            response.error.is_none(),
+            response.error.as_ref().map(|error| error.code.as_str()),
+        );
+    }
     serde_json::to_writer(&mut *stream, &response)
         .map_err(|error| DaemonError::Protocol(error.to_string()))?;
     stream.write_all(b"\n").map_err(DaemonError::Connection)?;
@@ -656,6 +792,24 @@ mod tests {
         CanvasV1, NodeKindV1, NodeV1, SCENE_VERSION_V1, SceneValidationError, TimelineV1,
     };
     use std::thread;
+
+    /// Polls a metrics directory until it contains a file whose contents
+    /// satisfy `ready`, or gives up after ~1s. Metrics are written by a
+    /// background thread, so tests can't assume events have landed the
+    /// instant a client call returns.
+    fn poll_metrics_file(dir: &Path, ready: impl Fn(&str) -> bool) -> String {
+        for _ in 0..50 {
+            if let Ok(mut entries) = std::fs::read_dir(dir)
+                && let Some(Ok(entry)) = entries.next()
+                && let Ok(contents) = std::fs::read_to_string(entry.path())
+                && ready(&contents)
+            {
+                return contents;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        String::new()
+    }
 
     fn scene() -> SceneV1 {
         SceneV1 {
@@ -1038,8 +1192,10 @@ mod tests {
         };
         let endpoint = picker.local_addr().unwrap();
         drop(picker);
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics_path = metrics_dir.path().to_path_buf();
         thread::spawn(move || {
-            let _ = serve(endpoint);
+            let _ = serve_with_metrics_dir(endpoint, Some(&metrics_path));
         });
 
         let client = DaemonClient::new(endpoint).unwrap();
@@ -1084,6 +1240,102 @@ mod tests {
             client.call(DaemonRequest::Health),
             Ok(DaemonResult::Health)
         ));
+
+        // Metrics are written by a background thread, so poll briefly rather
+        // than assuming the events have landed the instant the client calls
+        // above return.
+        let logged = poll_metrics_file(metrics_dir.path(), |contents| {
+            contents.matches("\"method\":\"health\"").count() >= 2
+        });
+        assert!(
+            logged.contains("\"success\":true"),
+            "expected at least one successful health event in the session metrics file"
+        );
+        assert!(
+            logged.contains("\"method\":\"invalid_request\""),
+            "expected the malformed-JSON request to be recorded too"
+        );
+    }
+
+    #[test]
+    fn metrics_recorder_appends_json_lines_without_blocking_callers() {
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = MetricsRecorder::start(directory.path()).unwrap();
+        recorder.record(
+            "render_scene",
+            Some("demo"),
+            Duration::from_millis(12),
+            true,
+            None,
+        );
+        recorder.record(
+            "get_scene",
+            Some("missing"),
+            Duration::from_micros(500),
+            false,
+            Some("not_found"),
+        );
+        drop(recorder);
+
+        let contents = poll_metrics_file(directory.path(), |text| text.lines().count() >= 2);
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["method"], "render_scene");
+        assert_eq!(first["scene_id"], "demo");
+        assert_eq!(first["success"], true);
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["method"], "get_scene");
+        assert_eq!(second["success"], false);
+        assert_eq!(second["error_code"], "not_found");
+    }
+
+    #[test]
+    fn serve_with_metrics_dir_none_disables_metrics_without_failing() {
+        let Ok(picker) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let endpoint = picker.local_addr().unwrap();
+        drop(picker);
+        thread::spawn(move || {
+            let _ = serve_with_metrics_dir(endpoint, None);
+        });
+
+        let client = DaemonClient::new(endpoint).unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            if client.call(DaemonRequest::Health).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !ready {
+            return;
+        }
+        assert!(matches!(
+            client.call(DaemonRequest::Health),
+            Ok(DaemonResult::Health)
+        ));
+    }
+
+    #[test]
+    fn request_label_identifies_every_request_kind() {
+        assert_eq!(request_label(&DaemonRequest::Health), ("health", None));
+        assert_eq!(
+            request_label(&DaemonRequest::CreateScene {
+                scene_id: "s".into(),
+                scene: scene(),
+                asset_root: None,
+            }),
+            ("create_scene", Some("s"))
+        );
+        assert_eq!(
+            request_label(&DaemonRequest::DestroyScene {
+                scene_id: "s".into()
+            }),
+            ("destroy_scene", Some("s"))
+        );
     }
 
     #[test]
