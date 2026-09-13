@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "renderer": {
+      "type": "stdio",
+      "command": "/Users/varvenka/Projects/RendererCli/target/release/renderer-mcp",
+      "args": [],
+      "env": {
+        "RENDERER_DAEMON_ENDPOINT": "127.0.0.1:9472"
+      }
+    }
+  }
+}
