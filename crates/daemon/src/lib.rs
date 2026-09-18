@@ -888,7 +888,7 @@ fn ensure_loopback(endpoint: SocketAddr) -> Result<(), DaemonError> {
 mod tests {
     use super::*;
     use renderer_schema::{
-        CanvasV1, NodeKindV1, NodeV1, SCENE_VERSION_V1, SceneValidationError, TimelineV1,
+        CanvasV1, FillV1, NodeKindV1, NodeV1, SCENE_VERSION_V1, SceneValidationError, TimelineV1,
     };
     use std::thread;
 
@@ -926,7 +926,8 @@ mod tests {
                     y: 0.0,
                     width: 8.0,
                     height: 8.0,
-                    color: [1.0; 4],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0; 4]),
                 },
             }],
             timeline: None,
@@ -1037,7 +1038,7 @@ mod tests {
                 y: 0.0,
                 text: "x".repeat(MAX_REQUEST_BYTES),
                 size: 1.0,
-                color: [1.0; 4],
+                fill: FillV1::Solid([1.0; 4]),
             },
         });
         assert!(matches!(
@@ -1231,7 +1232,8 @@ mod tests {
                                     y: 0.0,
                                     width: 4.0,
                                     height: 4.0,
-                                    color: [1.0; 4],
+                                    corner_radius: 0.0,
+                                    fill: FillV1::Solid([1.0; 4]),
                                 },
                             },
                         },

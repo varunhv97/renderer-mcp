@@ -285,7 +285,7 @@ fn canvas_schema() -> serde_json::Value {
 ///
 /// `description_prefix` is prepended to the generic color-format
 /// explanation so each call site can say what the color is *for* (fill,
-/// stroke, keyframe target, ...).
+/// stroke, keyframe target, gradient stop, ...).
 fn color_schema(description_prefix: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "array",
@@ -293,6 +293,74 @@ fn color_schema(description_prefix: &str) -> serde_json::Value {
         "minItems": 4,
         "maxItems": 4,
         "description": format!("{description_prefix} RGBA color as an array [r, g, b, a], each channel a float from 0.0 through 1.0.")
+    })
+}
+
+/// Shared fill schema for a node's `color` field (`renderer_schema::
+/// FillV1`): accepts either a plain 4-element RGBA array (a solid fill,
+/// identical to -- and 100% backward compatible with -- every scene
+/// authored before gradients existed) or a gradient object. The JSON
+/// *property key* stays `color` on the wire even though the underlying
+/// Rust field is named `fill` (see `FillV1`'s doc comment in
+/// `renderer_schema` for why); this schema is wired up under that same
+/// `"color"` property name at every call site below.
+///
+/// `supports_gradient` distinguishes node kinds that render a true,
+/// continuous per-pixel gradient (`Rect`/`Ellipse`) from those that only
+/// resolve a gradient to one flat, representative color (`Line`/`Path`/
+/// `Text` -- the 50/50 midpoint blend of the gradient's two stops); the
+/// generated description states this plainly either way, so callers don't
+/// assume gradient support that a given node kind doesn't actually have.
+fn fill_schema(description_prefix: &str, supports_gradient: bool) -> serde_json::Value {
+    let gradient_note = if supports_gradient {
+        "This node kind renders a gradient object as a real, continuous per-pixel gradient."
+    } else {
+        "This node kind does not render a true per-pixel gradient: a gradient object here is \
+         resolved to one flat color, the 50/50 midpoint blend of its two stops."
+    };
+    serde_json::json!({
+        "description": format!(
+            "{description_prefix} Either a plain solid RGBA array [r, g, b, a] (each channel a \
+             float from 0.0 through 1.0), or a gradient object: {{\"kind\": \"linear_gradient\", \
+             \"from\": [r,g,b,a], \"to\": [r,g,b,a], \"angle_degrees\": 0.0}} for a linear \
+             gradient, or {{\"kind\": \"radial_gradient\", \"center\": [r,g,b,a], \"edge\": \
+             [r,g,b,a]}} for a radial gradient (center-to-edge). {gradient_note}"
+        ),
+        "oneOf": [
+            {
+                "type": "array",
+                "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                "minItems": 4,
+                "maxItems": 4,
+                "description": "A solid RGBA color as an array [r, g, b, a], each channel a float from 0.0 through 1.0."
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "from", "to", "angle_degrees"],
+                "description": "A linear gradient between two colors along a direction.",
+                "properties": {
+                    "kind": { "const": "linear_gradient", "description": "Gradient type discriminator." },
+                    "from": color_schema("Gradient start color, at the gradient direction's start."),
+                    "to": color_schema("Gradient end color, at the gradient direction's end."),
+                    "angle_degrees": {
+                        "type": "number",
+                        "description": "Gradient direction in degrees. 0 points along +x (left-to-right); increasing values rotate clockwise."
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "center", "edge"],
+                "description": "A radial gradient from a center color to an edge color.",
+                "properties": {
+                    "kind": { "const": "radial_gradient", "description": "Gradient type discriminator." },
+                    "center": color_schema("Gradient color at the shape's center."),
+                    "edge": color_schema("Gradient color at the shape's boundary.")
+                }
+            }
+        ]
     })
 }
 
@@ -364,7 +432,7 @@ fn rect_node_schema() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": ["id", "kind", "x", "y", "width", "height", "color"],
-        "description": "A filled, axis-aligned rectangle.",
+        "description": "A filled, axis-aligned rectangle, optionally with rounded corners.",
         "properties": {
             "id": node_id_schema(),
             "translate": translate_schema(),
@@ -373,7 +441,13 @@ fn rect_node_schema() -> serde_json::Value {
             "y": { "type": "number", "description": "Top edge Y coordinate in pixels, from the canvas's top-left corner." },
             "width": { "type": "number", "exclusiveMinimum": 0, "description": "Width in pixels; must be finite and greater than 0." },
             "height": { "type": "number", "exclusiveMinimum": 0, "description": "Height in pixels; must be finite and greater than 0." },
-            "color": color_schema("Fill color."),
+            "corner_radius": {
+                "type": "number",
+                "minimum": 0.0,
+                "default": 0.0,
+                "description": "Optional corner rounding radius in pixels. Defaults to 0.0 (sharp, right-angle corners) when omitted. Must be finite, non-negative, and no larger than half of the smaller of `width`/`height` -- larger values are rejected, not clamped."
+            },
+            "color": fill_schema("Fill.", true),
         }
     })
 }
@@ -392,7 +466,7 @@ fn ellipse_node_schema() -> serde_json::Value {
             "cy": { "type": "number", "description": "Center Y coordinate in pixels, from the canvas's top-left corner." },
             "rx": { "type": "number", "exclusiveMinimum": 0, "description": "Horizontal radius in pixels; must be finite and greater than 0." },
             "ry": { "type": "number", "exclusiveMinimum": 0, "description": "Vertical radius in pixels; must be finite and greater than 0." },
-            "color": color_schema("Fill color."),
+            "color": fill_schema("Fill.", true),
         }
     })
 }
@@ -412,7 +486,7 @@ fn line_node_schema() -> serde_json::Value {
             "x2": { "type": "number", "description": "End point X coordinate in pixels, from the canvas's top-left corner." },
             "y2": { "type": "number", "description": "End point Y coordinate in pixels, from the canvas's top-left corner." },
             "thickness": { "type": "number", "exclusiveMinimum": 0, "description": "Line thickness in pixels; must be finite and greater than 0." },
-            "color": color_schema("Line color."),
+            "color": fill_schema("Line color.", false),
         }
     })
 }
@@ -434,7 +508,7 @@ fn path_node_schema() -> serde_json::Value {
                 "maxItems": MAX_PATH_POINTS,
                 "description": format!("Ordered vertices of the polygon. At least 3 points are required (fewer cannot enclose an area); at most {MAX_PATH_POINTS}.")
             },
-            "color": color_schema("Fill color."),
+            "color": fill_schema("Fill.", false),
         }
     })
 }
@@ -453,7 +527,7 @@ fn text_node_schema() -> serde_json::Value {
             "y": { "type": "number", "description": "Y coordinate in pixels, from the canvas's top-left corner, positioning the top of the text's em-square (not its baseline)." },
             "text": { "type": "string", "minLength": 1, "description": "The text to render; must be non-empty." },
             "size": { "type": "number", "exclusiveMinimum": 0, "description": "Font size in pixels; must be finite and greater than 0." },
-            "color": color_schema("Text color."),
+            "color": fill_schema("Text color.", false),
         }
     })
 }
@@ -1107,6 +1181,55 @@ mod tests {
                 .unwrap();
             assert!(translate_description.contains("offset"));
         }
+
+        // Every node kind's `color` property documents both the solid-array
+        // shape and the gradient-object shape (`FillV1`), and states
+        // whether that node kind renders a gradient for real or only a flat
+        // representative color.
+        for branch in node_branches {
+            let kind = branch["properties"]["kind"]["const"].as_str().unwrap();
+            if kind == "image" {
+                continue; // Image nodes have no color/fill field at all.
+            }
+            let fill_schema = &branch["properties"]["color"];
+            let fill_variants = fill_schema["oneOf"].as_array().unwrap();
+            assert_eq!(
+                fill_variants.len(),
+                3,
+                "expected solid + linear + radial for {kind}"
+            );
+            let gradient_kinds: Vec<_> = fill_variants[1..]
+                .iter()
+                .map(|variant| variant["properties"]["kind"]["const"].as_str().unwrap())
+                .collect();
+            assert_eq!(gradient_kinds, vec!["linear_gradient", "radial_gradient"]);
+            let description = fill_schema["description"].as_str().unwrap();
+            let supports_gradient = matches!(kind, "rect" | "ellipse");
+            assert_eq!(
+                description.contains("real, continuous per-pixel gradient"),
+                supports_gradient,
+                "{kind}'s color schema should state whether it renders a real gradient"
+            );
+        }
+
+        // `rect`'s corner_radius is documented, defaults to 0.0, and is
+        // optional (not in `required`).
+        let rect_branch = node_branches
+            .iter()
+            .find(|branch| branch["properties"]["kind"]["const"] == "rect")
+            .unwrap();
+        assert_eq!(rect_branch["properties"]["corner_radius"]["default"], 0.0);
+        let corner_radius_description = rect_branch["properties"]["corner_radius"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(corner_radius_description.contains("rounding"));
+        let rect_required: Vec<_> = rect_branch["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(!rect_required.contains(&"corner_radius"));
 
         let property_branches = scene_schema["properties"]["timeline"]["properties"]["keyframes"]
             ["items"]["properties"]["property"]["oneOf"]
