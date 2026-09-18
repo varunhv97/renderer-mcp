@@ -63,6 +63,20 @@ fn no_terminal_message(path: &Path) -> String {
     )
 }
 
+/// Message reported (as [`ShowOutcome::message`], status `"displayed"`,
+/// protocol `"system_viewer"`) when `run` opens the image with the OS's own
+/// default file opener instead of writing terminal escape sequences -- see
+/// [`open_with_system_viewer`] for why.
+const SYSTEM_VIEWER_MESSAGE: &str = "no controlling terminal was safely writable for this \
+     process (see docs); opened the image in the system's default viewer instead";
+
+/// Message reported (as [`ShowOutcome::message`], status `"no_op"`) for a
+/// clear request that has nothing to do, because the corresponding `show`
+/// call (if any) went through [`open_with_system_viewer`] rather than
+/// writing any inline terminal state that could be cleared.
+const SYSTEM_VIEWER_CLEAR_MESSAGE: &str = "the image (if any) was opened in a separate system \
+     viewer window rather than displayed inline; close that window manually";
+
 /// Request to [`run`].
 #[derive(Debug, Clone)]
 pub struct ShowRequest {
@@ -212,6 +226,22 @@ pub fn run(request: ShowRequest) -> Result<ShowOutcome, TerminalError> {
                 path: Some(path),
             });
         }
+        TerminalResolution::DiscoveredDevice => {
+            if open_with_system_viewer(&path) {
+                return Ok(ShowOutcome {
+                    status: "displayed",
+                    protocol: Some("system_viewer".to_string()),
+                    path: Some(path),
+                    message: Some(SYSTEM_VIEWER_MESSAGE.to_string()),
+                });
+            }
+            return Ok(ShowOutcome {
+                status: "no_terminal",
+                protocol: None,
+                message: Some(no_terminal_message(&path)),
+                path: Some(path),
+            });
+        }
         TerminalResolution::Target(target) => target,
     };
 
@@ -277,6 +307,12 @@ fn run_clear(tty: Option<&Path>) -> Result<ShowOutcome, TerminalError> {
             protocol: None,
             path: None,
             message: Some(NO_TERMINAL_CLEAR_MESSAGE.to_string()),
+        }),
+        TerminalResolution::DiscoveredDevice => Ok(ShowOutcome {
+            status: "no_op",
+            protocol: Some("system_viewer".to_string()),
+            path: None,
+            message: Some(SYSTEM_VIEWER_CLEAR_MESSAGE.to_string()),
         }),
         TerminalResolution::Target(target) => {
             let mut sink = open_sink(&target)?;
@@ -457,6 +493,29 @@ enum TerminalTarget {
 #[derive(Debug)]
 enum TerminalResolution {
     Target(TerminalTarget),
+    /// Stdout isn't a terminal, but a real tty device was found by walking
+    /// this process's ancestors (see `discover_ancestor_tty_device`).
+    /// Deliberately *not* folded into `Target(TerminalTarget::Device(_))`:
+    /// whenever this branch is reached at all, it's because this process
+    /// has no controlling terminal of its own -- almost always meaning it's
+    /// running as a subprocess of some other interactive program (a coding
+    /// agent's own TUI, most commonly) that is itself actively driving that
+    /// same discovered device. Writing raw escape sequences directly into a
+    /// tty this process doesn't control is unsafe in exactly that
+    /// situation: the two writers' bytes can interleave mid-escape-sequence
+    /// and corrupt the terminal emulator's parser state in a way not even a
+    /// full terminal reset run the same (tty-less) way can recover, since
+    /// `reset` itself needs the same ioctl access this process lacks.
+    /// Confirmed live: a raw ANSI half-block write from exactly this kind
+    /// of nested, controlling-terminal-less process left a real Terminal.app
+    /// window showing solid stuck background color; `reset` run via the
+    /// same subprocess path failed with "Inappropriate ioctl for device"
+    /// and the window had to be closed and reopened. `run` handles this
+    /// case via `open_with_system_viewer` instead. An explicit `--tty`
+    /// override still resolves to `Target(TerminalTarget::Device)` and
+    /// keeps the old inline-write behavior, since a caller passing that
+    /// flag is knowingly taking responsibility for it being safe.
+    DiscoveredDevice,
     NoTerminal,
 }
 
@@ -469,11 +528,42 @@ fn resolve_terminal_target(explicit_tty: Option<&Path>) -> TerminalResolution {
     }
     #[cfg(unix)]
     {
-        if let Some(device) = discover_ancestor_tty_device() {
-            return TerminalResolution::Target(TerminalTarget::Device(device));
+        if discover_ancestor_tty_device().is_some() {
+            return TerminalResolution::DiscoveredDevice;
         }
     }
     TerminalResolution::NoTerminal
+}
+
+/// Best-effort: launches the OS's own default file opener (a separate GUI
+/// process -- e.g. Preview.app via `open` on macOS) as a substitute for
+/// writing image-protocol bytes into a discovered-but-unowned ancestor tty.
+/// See [`TerminalResolution::DiscoveredDevice`]'s doc comment for why this
+/// exists. Returns `true` iff the opener process was spawned successfully
+/// (its own success/failure at actually displaying the file isn't
+/// observable from here, same as any other fire-and-forget GUI launch).
+/// `false` on an unsupported OS (anything but macOS/Linux) or if the opener
+/// command itself couldn't be spawned (e.g. `xdg-open` not installed).
+fn open_with_system_viewer(path: &Path) -> bool {
+    let Some(opener) = system_opener_command() else {
+        return false;
+    };
+    ProcessCommand::new(opener).arg(path).spawn().is_ok()
+}
+
+/// Which OS-native "open this file with its default app" command
+/// [`open_with_system_viewer`] should use, if any. Split out as its own
+/// pure function so this platform mapping is unit-testable independent of
+/// actually spawning a process (which pops a real GUI window and so isn't
+/// something a test should do).
+fn system_opener_command() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("open")
+    } else if cfg!(target_os = "linux") {
+        Some("xdg-open")
+    } else {
+        None
+    }
 }
 
 fn open_sink(target: &TerminalTarget) -> Result<Box<dyn Write>, TerminalError> {
@@ -1758,6 +1848,20 @@ mod tests {
         assert!(message.contains("no interactive terminal detected"));
         assert!(message.contains("/tmp/example.png"));
         assert!(message.contains("open it manually"));
+    }
+
+    /// Locks in `open_with_system_viewer`'s platform mapping without
+    /// actually spawning a process (which would pop a real GUI window).
+    #[test]
+    fn system_opener_command_resolves_per_platform() {
+        let opener = system_opener_command();
+        if cfg!(target_os = "macos") {
+            assert_eq!(opener, Some("open"));
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(opener, Some("xdg-open"));
+        } else {
+            assert_eq!(opener, None);
+        }
     }
 
     // `run`'s own top-level orchestration (path-required-unless-clear,

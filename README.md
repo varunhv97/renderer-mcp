@@ -172,10 +172,23 @@ If not (for example when `renderer` is invoked as a detached subprocess by
 an agent's tool-calling mechanism, so stdout is piped rather than a tty),
 `show` walks the process ancestry (`ps -o ppid=,tty= -p <pid>`, capped at 32
 ancestors) looking for the nearest ancestor process that does have a
-controlling terminal, and writes there instead. This only works on macOS and
-Linux; on Windows, or if no real terminal can be found either way, `show`
-prints `no interactive terminal detected; image saved at <path>, open it
-manually` and exits 0 rather than failing.
+controlling terminal -- but does **not** write escape sequences there
+directly. Confirmed live: doing so previously corrupted a real terminal
+window, because that discovered tty is almost always being actively driven
+by another program at the same time (most commonly the very coding-agent
+TUI this call is running inside), and the two writers' raw bytes can
+interleave mid-escape-sequence and leave the terminal's parser in a stuck
+state that not even a terminal reset run the same way can recover from (it
+needs the same tty ioctl access this subprocess doesn't have). Instead,
+`show` launches the OS's own default file opener as a separate process --
+`open` on macOS, `xdg-open` on Linux -- reports `"protocol":"system_viewer"`,
+and lets that GUI application (e.g. Preview) display the image in its own
+window, untangled from the terminal entirely. `--tty <path>` still writes
+escape sequences directly to an explicitly named device, for a caller that
+knows that target is safe. On an OS with no such opener, or if no real
+terminal can be found in the ancestry at all, `show` prints `no interactive
+terminal detected; image saved at <path>, open it manually` and exits 0
+rather than failing.
 
 The terminal protocol is auto-detected from environment variables unless
 overridden:
