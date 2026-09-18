@@ -117,6 +117,28 @@ cargo run -p renderer-cli -- show out.gif --loops 3
 cargo run -p renderer-cli -- show --clear
 ```
 
+### cmux native file preview
+
+In [cmux](https://cmux.dev) (a native macOS terminal for running coding
+agents, built on Ghostty), `show` skips terminal escape sequences entirely
+and instead opens the file in cmux's own **native file-preview panel** -- a
+UI surface completely separate from the terminal grid, so unlike a raw pty
+write it can never land on top of an agent's own actively-redrawn TUI (e.g.
+Claude Code's input box). This is detected automatically: if the
+`CMUX_SOCKET_PATH` environment variable is set and its Unix domain socket
+actually accepts a connection, `show` sends a `file.open` JSON-RPC request
+over that socket and reports `"protocol":"cmux"` in its status JSON, instead
+of running any of the Kitty/iTerm2/ANSI detection below. If the variable is
+unset, or the socket can't be reached, `show` falls back to the
+terminal-protocol behavior described in the rest of this section, unchanged.
+Both static PNGs and animated GIFs open the same way -- cmux decodes and
+loops the GIF itself, so there's no simulated-animation loop to run.
+`show --clear` in cmux closes the most recently opened preview surface (its
+id is persisted to `.renderer/cmux-preview-surface.json`, following the same
+local-generated-state convention as `.renderer/metrics/`) via cmux's
+`surface.close` RPC, or is a no-op if nothing was recorded yet -- rather than
+sending a Kitty delete-all command that would have no effect there.
+
 If stdout is itself a terminal, escape sequences are written there directly.
 If not (for example when `renderer` is invoked as a detached subprocess by
 an agent's tool-calling mechanism, so stdout is piped rather than a tty),
@@ -148,8 +170,10 @@ looping itself.
 
 Flags: `--tty <path>` writes to a specific device file instead of
 auto-detecting one (mainly for testing against a particular terminal
-session); `--protocol <auto|kitty|iterm2|ansi>` overrides detection;
-`--clear` sends only a Kitty delete-all-images command and exits; `--loops
+session); `--protocol <auto|kitty|iterm2|ansi>` overrides detection (this
+flag has no effect on the cmux path, which is tried first regardless);
+`--clear` sends only a Kitty delete-all-images command and exits (or, in
+cmux, closes the last-opened preview surface as described above); `--loops
 <n>` bounds a simulated/native animation's loop count.
 
 ## MCP server

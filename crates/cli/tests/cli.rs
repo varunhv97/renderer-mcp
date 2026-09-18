@@ -422,6 +422,7 @@ fn show_clear_sends_only_the_kitty_delete_all_command() {
     std::fs::write(&tty_path, b"").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("CMUX_SOCKET_PATH")
         .args(["show", "--clear", "--tty", tty_path.to_str().unwrap()])
         .output()
         .unwrap();
@@ -442,6 +443,7 @@ fn show_writes_a_kitty_transmit_command_for_a_static_png() {
     std::fs::write(&tty_path, b"").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("CMUX_SOCKET_PATH")
         .args([
             "show",
             png_path.to_str().unwrap(),
@@ -474,6 +476,7 @@ fn show_writes_an_iterm2_osc_1337_command_for_a_static_png() {
     std::fs::write(&tty_path, b"").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("CMUX_SOCKET_PATH")
         .args([
             "show",
             png_path.to_str().unwrap(),
@@ -506,6 +509,7 @@ fn show_writes_ansi_half_blocks_for_a_static_png() {
     std::fs::write(&tty_path, b"").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("CMUX_SOCKET_PATH")
         .args([
             "show",
             png_path.to_str().unwrap(),
@@ -538,6 +542,7 @@ fn show_rejects_a_file_that_is_not_png_or_gif() {
     std::fs::write(&tty_path, b"").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("CMUX_SOCKET_PATH")
         .args([
             "show",
             text_path.to_str().unwrap(),
@@ -563,6 +568,7 @@ fn show_rejects_an_unknown_protocol_flag() {
     std::fs::write(&tty_path, b"").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("CMUX_SOCKET_PATH")
         .args([
             "show",
             png_path.to_str().unwrap(),
@@ -594,6 +600,7 @@ fn show_sends_native_kitty_animation_for_an_animation_capable_terminal() {
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
         .env("KITTY_WINDOW_ID", "1")
         .env_remove("TERM_PROGRAM")
+        .env_remove("CMUX_SOCKET_PATH")
         .args([
             "show",
             gif_path.to_str().unwrap(),
@@ -632,6 +639,7 @@ fn show_simulates_kitty_animation_when_the_terminal_lacks_the_extension() {
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
         .env_remove("KITTY_WINDOW_ID")
         .env_remove("TERM_PROGRAM")
+        .env_remove("CMUX_SOCKET_PATH")
         .args([
             "show",
             gif_path.to_str().unwrap(),
@@ -703,4 +711,256 @@ fn scene_get_for_a_missing_scene_emits_structured_not_found_json() {
 
     let _ = daemon.kill();
     let _ = daemon.wait();
+}
+
+/// End-to-end coverage for `renderer show`'s cmux native-preview path: a
+/// fake JSON-RPC-over-Unix-socket server stands in for cmux's real control
+/// socket (`CMUX_SOCKET_PATH`), so this is deterministic and doesn't depend
+/// on a live cmux instance being present (CI has none). `crates/cli/src/
+/// main.rs`'s `show::cmux_preview` module covers the request/response
+/// parsing logic directly at the unit level; these tests instead check that
+/// the real `renderer` binary wires it up correctly end to end: env-var
+/// detection, falling back to the terminal-protocol path when cmux isn't
+/// reachable, and the `--clear` surface-close flow.
+#[cfg(unix)]
+mod cmux_show {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    /// Spawns a fake cmux control-socket server bound to a tempdir path:
+    /// accepts exactly one connection, reads one newline-terminated
+    /// request, and writes back `response` (with a trailing newline added
+    /// if it doesn't already end in one). Returns the socket path and a
+    /// join handle yielding the raw request bytes it read.
+    fn fake_cmux_server(
+        response: &'static str,
+    ) -> (std::path::PathBuf, std::thread::JoinHandle<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        // Leak the tempdir so it outlives the server thread -- fine for a
+        // short-lived test process.
+        let socket_path = dir.keep().join("cmux.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut reader = BufReader::new(&mut stream);
+            let _ = reader.read_until(b'\n', &mut request);
+            let mut body = response.as_bytes().to_vec();
+            if !body.ends_with(b"\n") {
+                body.push(b'\n');
+            }
+            let _ = stream.write_all(&body);
+            request
+        });
+        (socket_path, handle)
+    }
+
+    /// A successful `file.open` round-trip: `renderer show <path>` reports
+    /// `"protocol":"cmux"` instead of any terminal-protocol name, no `--tty`
+    /// is needed (the cmux path is tried before terminal detection), and
+    /// the fake server actually received a `file.open` request naming the
+    /// image's canonicalized absolute path.
+    #[test]
+    fn show_uses_cmux_native_preview_when_the_socket_is_reachable() {
+        let (socket_path, handle) = fake_cmux_server(
+            r#"{"id":"renderer-show","ok":true,"result":{"surface_id":"11111111-1111-1111-1111-111111111111","pane_id":"22222222-2222-2222-2222-222222222222"}}"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let png_path = directory.path().join("image.png");
+        write_test_png(&png_path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+            .env("CMUX_SOCKET_PATH", &socket_path)
+            .current_dir(directory.path())
+            .args(["show", png_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("\"status\":\"displayed\""));
+        assert!(stdout.contains("\"protocol\":\"cmux\""));
+
+        let request = String::from_utf8(handle.join().unwrap()).unwrap();
+        let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+        assert_eq!(request["method"], "file.open");
+        let sent_path = request["params"]["path"].as_str().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(sent_path).unwrap(),
+            std::fs::canonicalize(&png_path).unwrap()
+        );
+
+        let state =
+            std::fs::read_to_string(directory.path().join(".renderer/cmux-preview-surface.json"))
+                .unwrap();
+        assert!(state.contains("11111111-1111-1111-1111-111111111111"));
+    }
+
+    /// When `CMUX_SOCKET_PATH` points at a socket nothing is listening on,
+    /// `show` falls back to the terminal-protocol path unchanged -- same
+    /// Kitty transmit command, same `"protocol":"kitty"` in the status
+    /// JSON, as if cmux integration didn't exist at all.
+    #[test]
+    fn show_falls_back_to_terminal_protocol_when_cmux_socket_is_unreachable() {
+        let directory = tempfile::tempdir().unwrap();
+        let png_path = directory.path().join("image.png");
+        write_test_png(&png_path);
+        let tty_path = directory.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let missing_socket = directory.path().join("no-such-cmux.sock");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+            .env("CMUX_SOCKET_PATH", &missing_socket)
+            .args([
+                "show",
+                png_path.to_str().unwrap(),
+                "--tty",
+                tty_path.to_str().unwrap(),
+                "--protocol",
+                "kitty",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("\"protocol\":\"kitty\""));
+        let written = std::fs::read(&tty_path).unwrap();
+        assert!(String::from_utf8(written).unwrap().starts_with("\x1b_Ga=T"));
+    }
+
+    /// An `ok: false` JSON-RPC response from cmux is surfaced as a hard,
+    /// structured `cmux_error` -- once cmux is confirmed reachable, a
+    /// rejected request is a real failure rather than "try something else".
+    #[test]
+    fn show_reports_a_structured_error_for_a_cmux_rpc_rejection() {
+        let (socket_path, _handle) = fake_cmux_server(
+            r#"{"id":"renderer-show","ok":false,"error":{"message":"File not found: /nope.png","code":"not_found"}}"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let png_path = directory.path().join("image.png");
+        write_test_png(&png_path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+            .env("CMUX_SOCKET_PATH", &socket_path)
+            .current_dir(directory.path())
+            .args(["show", png_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = parse_error(output.stderr);
+        assert_eq!(error["code"], "cmux_error");
+        assert!(error["message"].as_str().unwrap().contains("not_found"));
+    }
+
+    /// A malformed (non-JSON-RPC-shaped) response from cmux is also a hard
+    /// `cmux_error`, not a silent fallback.
+    #[test]
+    fn show_reports_a_structured_error_for_a_malformed_cmux_response() {
+        let (socket_path, _handle) = fake_cmux_server("this is not json");
+        let directory = tempfile::tempdir().unwrap();
+        let png_path = directory.path().join("image.png");
+        write_test_png(&png_path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+            .env("CMUX_SOCKET_PATH", &socket_path)
+            .current_dir(directory.path())
+            .args(["show", png_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = parse_error(output.stderr);
+        assert_eq!(error["code"], "cmux_error");
+    }
+
+    /// A path that doesn't exist fails with the same `io_error` code (and
+    /// "could not read" message) that the terminal-protocol path already
+    /// uses for a missing file -- cmux availability is checked first, but
+    /// canonicalization failure is still reported the ordinary way.
+    #[test]
+    fn show_reports_io_error_when_the_path_cannot_be_canonicalized_via_cmux() {
+        let (socket_path, _handle) = fake_cmux_server(
+            r#"{"id":"renderer-show","ok":true,"result":{"surface_id":"x","pane_id":"y"}}"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+            .env("CMUX_SOCKET_PATH", &socket_path)
+            .current_dir(directory.path())
+            .args(["show", "/no/such/path/definitely-missing.png"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = parse_error(output.stderr);
+        assert_eq!(error["code"], "io_error");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("could not read")
+        );
+    }
+
+    /// `show --clear` via cmux closes the most recently opened preview
+    /// surface via `surface.close` and removes the persisted state file,
+    /// reporting `{"status":"cleared","protocol":"cmux"}` -- no Kitty
+    /// delete-all command is sent.
+    #[test]
+    fn show_clear_closes_the_cmux_preview_surface_when_one_was_recorded() {
+        let (socket_path, handle) = fake_cmux_server(
+            r#"{"id":"renderer-clear","ok":true,"result":{"surface_id":"33333333-3333-3333-3333-333333333333"}}"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let state_file = directory.path().join(".renderer/cmux-preview-surface.json");
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &state_file,
+            r#"{"surface_id":"33333333-3333-3333-3333-333333333333"}"#,
+        )
+        .unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+            .env("CMUX_SOCKET_PATH", &socket_path)
+            .current_dir(directory.path())
+            .args(["show", "--clear"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("\"status\":\"cleared\""));
+        assert!(stdout.contains("\"protocol\":\"cmux\""));
+        assert!(!state_file.exists());
+
+        let request = String::from_utf8(handle.join().unwrap()).unwrap();
+        let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+        assert_eq!(request["method"], "surface.close");
+        assert_eq!(
+            request["params"]["surface_id"],
+            "33333333-3333-3333-3333-333333333333"
+        );
+    }
+
+    /// `show --clear` via cmux with no recorded surface (e.g. nothing was
+    /// ever shown, or a previous `--clear` already ran) is a graceful,
+    /// exit-0 no-op rather than an error -- and never contacts the socket
+    /// with a request, since there's nothing to close.
+    #[test]
+    fn show_clear_is_a_graceful_no_op_when_no_cmux_surface_was_recorded() {
+        let (socket_path, handle) = fake_cmux_server("irrelevant: no request is expected");
+        let directory = tempfile::tempdir().unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+            .env("CMUX_SOCKET_PATH", &socket_path)
+            .current_dir(directory.path())
+            .args(["show", "--clear"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("no cmux preview surface recorded"));
+
+        // A connection is opened (to check availability) even though no
+        // request is sent; join it so the server thread doesn't leak past
+        // the test.
+        let _ = handle.join();
+    }
 }
