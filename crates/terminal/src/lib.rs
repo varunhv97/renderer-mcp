@@ -346,7 +346,7 @@ fn show_png(
             sink.flush()?;
             Ok("iterm2")
         }
-        Protocol::Ansi => {
+        Protocol::Ansi { truecolor } => {
             let decoded = image::load_from_memory(bytes)
                 .map_err(|source| TerminalError::Image {
                     path: path.to_path_buf(),
@@ -356,7 +356,7 @@ fn show_png(
             let (columns, rows) = ansi_target_size(target);
             let (width, height) = fit_dimensions(decoded.width(), decoded.height(), columns, rows);
             let resized = image::imageops::resize(&decoded, width, height, FilterType::Triangle);
-            let (rendered, _rows) = render_ansi_frame(&resized);
+            let (rendered, _rows) = render_ansi_frame(&resized, truecolor);
             sink.write_all(&rendered)?;
             sink.flush()?;
             Ok("ansi")
@@ -396,7 +396,7 @@ fn show_gif(
                 Ok("kitty-simulated")
             }
         }
-        Protocol::Ansi => {
+        Protocol::Ansi { truecolor } => {
             let frames = decode_gif_frames(path)?;
             if frames.is_empty() {
                 return Err(TerminalError::UnsupportedImage {
@@ -409,7 +409,7 @@ fn show_gif(
             for (image, delay) in &frames {
                 let (width, height) = fit_dimensions(image.width(), image.height(), columns, rows);
                 let resized = image::imageops::resize(image, width, height, FilterType::Triangle);
-                let (rendered, rows_used) = render_ansi_frame(&resized);
+                let (rendered, rows_used) = render_ansi_frame(&resized, truecolor);
                 row_count = rows_used;
                 rendered_frames.push((rendered, *delay));
             }
@@ -423,9 +423,22 @@ fn show_gif(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
-    Kitty { animation_capable: bool },
+    Kitty {
+        animation_capable: bool,
+    },
     Iterm2,
-    Ansi,
+    /// `truecolor`: whether to emit 24-bit RGB escape codes
+    /// (`\x1b[38;2;r;g;bm`) or, when the terminal hasn't declared support
+    /// for those, quantized 256-color-palette codes (`\x1b[38;5;Nm`)
+    /// instead -- see `ansi_truecolor_supported` and
+    /// `quantize_to_ansi256`. Confirmed live this matters: Apple's
+    /// Terminal.app (`TERM=xterm-256color`, no `COLORTERM`) doesn't
+    /// understand the 24-bit form at all, and densely repeating it across
+    /// a whole image produced visibly garbled/incorrect output rather than
+    /// a clean "unsupported, ignored" no-op.
+    Ansi {
+        truecolor: bool,
+    },
 }
 
 fn resolve_protocol(value: &str) -> Result<Protocol, TerminalError> {
@@ -435,11 +448,33 @@ fn resolve_protocol(value: &str) -> Result<Protocol, TerminalError> {
             animation_capable: kitty_animation_capable(&env_lookup),
         }),
         "iterm2" => Ok(Protocol::Iterm2),
-        "ansi" => Ok(Protocol::Ansi),
+        "ansi" => Ok(Protocol::Ansi {
+            truecolor: ansi_truecolor_supported(&env_lookup),
+        }),
         other => Err(TerminalError::InvalidProtocol {
             value: other.to_string(),
         }),
     }
+}
+
+/// Whether the terminal has declared support for 24-bit RGB color codes,
+/// per the de facto `COLORTERM=truecolor`/`COLORTERM=24bit` convention
+/// (there is no ANSI-standardized way to query this). Terminals reached
+/// via the Kitty-protocol/iTerm2 paths above are known truecolor-capable
+/// by their own dedicated detection and never consult this; it exists
+/// specifically for whatever's left once those don't match -- Terminal.app
+/// among them, confirmed live to answer `false` here (empty `COLORTERM`).
+/// Defaulting to `false` (256-color) for anything that doesn't explicitly
+/// claim truecolor support is the safe choice: a 256-color approximation
+/// still looks correct on a genuinely truecolor terminal that simply
+/// forgot to set the variable, while unconditionally assuming truecolor
+/// support produces visibly broken output -- confirmed live -- on a
+/// terminal that actually lacks it.
+fn ansi_truecolor_supported(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    matches!(
+        get("COLORTERM").as_deref(),
+        Some("truecolor") | Some("24bit")
+    )
 }
 
 fn env_lookup(name: &str) -> Option<String> {
@@ -478,7 +513,9 @@ fn detect_protocol_auto(get: &dyn Fn(&str) -> Option<String>) -> Protocol {
     } else if get("TERM_PROGRAM").as_deref() == Some("iTerm.app") {
         Protocol::Iterm2
     } else {
-        Protocol::Ansi
+        Protocol::Ansi {
+            truecolor: ansi_truecolor_supported(get),
+        }
     }
 }
 
@@ -812,8 +849,11 @@ fn composite_over_background(pixel: Rgba<u8>) -> (u8, u8, u8) {
 /// reset at the end of each row. An odd final source row reuses the top
 /// pixel as its own bottom half. Returns the encoded bytes and the number
 /// of terminal rows they occupy (for cursor-repositioning during
-/// animation).
-fn render_ansi_frame(image: &RgbaImage) -> (Vec<u8>, usize) {
+/// animation). `truecolor` selects 24-bit RGB codes (`\x1b[38;2;r;g;bm`)
+/// or, for a terminal that doesn't support those (see
+/// `ansi_truecolor_supported`), quantized 256-color-palette codes
+/// (`\x1b[38;5;Nm`) via `quantize_to_ansi256` instead.
+fn render_ansi_frame(image: &RgbaImage, truecolor: bool) -> (Vec<u8>, usize) {
     let width = image.width();
     let height = image.height();
     let rows = height.div_ceil(2) as usize;
@@ -828,13 +868,77 @@ fn render_ansi_frame(image: &RgbaImage) -> (Vec<u8>, usize) {
             } else {
                 (tr, tg, tb)
             };
-            out.extend_from_slice(
-                format!("\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg};{bb}m\u{2580}").as_bytes(),
-            );
+            let cell = if truecolor {
+                format!("\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg};{bb}m\u{2580}")
+            } else {
+                let fg = quantize_to_ansi256(tr, tg, tb);
+                let bg = quantize_to_ansi256(br, bg, bb);
+                format!("\x1b[38;5;{fg}m\x1b[48;5;{bg}m\u{2580}")
+            };
+            out.extend_from_slice(cell.as_bytes());
         }
         out.extend_from_slice(b"\x1b[0m\n");
     }
     (out, rows)
+}
+
+/// Quantizes a 24-bit RGB color to the nearest xterm 256-color palette
+/// index (0-255), for terminals that don't support direct 24-bit color.
+/// Uses the standard xterm-256color palette layout: indices 16-231 are a
+/// 6x6x6 RGB cube (each channel independently quantized to the nearest of
+/// six evenly-spaced levels), and 232-255 are a 24-step grayscale ramp;
+/// picks whichever of the two is closer to the input color by squared
+/// Euclidean distance (a near-gray color quantizes more accurately via the
+/// dedicated ramp than via the coarser color cube's own diagonal). The 16
+/// basic named colors (indices 0-15) are deliberately not used as
+/// quantization targets: their actual displayed RGB values vary by
+/// terminal theme, so there's nothing reliable to quantize against.
+fn quantize_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    const CUBE_LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
+    let nearest_level = |value: u8| -> usize {
+        CUBE_LEVELS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, level)| (*level - i32::from(value)).abs())
+            .map(|(index, _)| index)
+            .expect("CUBE_LEVELS is non-empty")
+    };
+    let squared_distance = |a: i32, b: i32, c: i32, d: i32, e: i32, f: i32| -> i32 {
+        (a - d) * (a - d) + (b - e) * (b - e) + (c - f) * (c - f)
+    };
+
+    let (ri, gi, bi) = (nearest_level(r), nearest_level(g), nearest_level(b));
+    let cube_index = 16 + 36 * ri + 6 * gi + bi;
+    let cube_distance = squared_distance(
+        i32::from(r),
+        i32::from(g),
+        i32::from(b),
+        CUBE_LEVELS[ri],
+        CUBE_LEVELS[gi],
+        CUBE_LEVELS[bi],
+    );
+
+    // 24-step grayscale ramp: index 232 is level 8, index 255 is level 238,
+    // step 10 -- deliberately excludes pure 0/255 (the color cube's own
+    // corners already cover those).
+    let gray_level = (i32::from(r) + i32::from(g) + i32::from(b)) / 3;
+    let gray_step = ((gray_level - 8) / 10).clamp(0, 23);
+    let gray_value = 8 + gray_step * 10;
+    let gray_index = 232 + gray_step;
+    let gray_distance = squared_distance(
+        i32::from(r),
+        i32::from(g),
+        i32::from(b),
+        gray_value,
+        gray_value,
+        gray_value,
+    );
+
+    if gray_distance < cube_distance {
+        gray_index as u8
+    } else {
+        cube_index as u8
+    }
 }
 
 /// Fits `source_width`x`source_height` into the given terminal grid,
@@ -1674,7 +1778,7 @@ mod tests {
         let mut image = RgbaImage::new(1, 2);
         image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
         image.put_pixel(0, 1, Rgba([0, 255, 0, 255]));
-        let (rendered, rows) = render_ansi_frame(&image);
+        let (rendered, rows) = render_ansi_frame(&image, true);
         assert_eq!(rows, 1);
         assert_eq!(
             String::from_utf8(rendered).unwrap(),
@@ -1686,12 +1790,82 @@ mod tests {
     fn render_ansi_frame_reuses_the_top_pixel_for_an_odd_final_row() {
         let mut image = RgbaImage::new(1, 1);
         image.put_pixel(0, 0, Rgba([10, 20, 30, 255]));
-        let (rendered, rows) = render_ansi_frame(&image);
+        let (rendered, rows) = render_ansi_frame(&image, true);
         assert_eq!(rows, 1);
         assert_eq!(
             String::from_utf8(rendered).unwrap(),
             "\x1b[38;2;10;20;30m\x1b[48;2;10;20;30m\u{2580}\x1b[0m\n"
         );
+    }
+
+    #[test]
+    fn render_ansi_frame_emits_256_color_codes_when_truecolor_is_unsupported() {
+        let mut image = RgbaImage::new(1, 2);
+        image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        image.put_pixel(0, 1, Rgba([0, 0, 0, 255]));
+        let (rendered, rows) = render_ansi_frame(&image, false);
+        assert_eq!(rows, 1);
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(!text.contains(";2;"), "should not use 24-bit color codes");
+        assert!(text.contains("\x1b[38;5;"));
+        assert!(text.contains("\x1b[48;5;"));
+        assert!(text.ends_with("\x1b[0m\n"));
+    }
+
+    #[test]
+    fn quantize_to_ansi256_maps_pure_colors_to_their_known_cube_corners() {
+        // The 6x6x6 cube's eight corners have well-known fixed indices,
+        // independent of the distance-vs-grayscale-ramp logic (pure black
+        // and white are handled by the grayscale-ramp tiebreak below).
+        assert_eq!(quantize_to_ansi256(255, 0, 0), 196); // pure red
+        assert_eq!(quantize_to_ansi256(0, 255, 0), 46); // pure green
+        assert_eq!(quantize_to_ansi256(0, 0, 255), 21); // pure blue
+    }
+
+    #[test]
+    fn quantize_to_ansi256_prefers_the_grayscale_ramp_for_near_gray_colors() {
+        // A genuinely neutral gray should land in the dedicated 24-step
+        // ramp (232-255), not the coarser 6-level-per-channel color cube.
+        let index = quantize_to_ansi256(128, 128, 128);
+        assert!(
+            (232..=255).contains(&index),
+            "expected a grayscale-ramp index, got {index}"
+        );
+    }
+
+    #[test]
+    fn quantize_to_ansi256_is_deterministic_and_always_in_range() {
+        for r in [0u8, 17, 64, 128, 200, 255] {
+            for g in [0u8, 32, 96, 160, 224, 255] {
+                for b in [0u8, 48, 112, 176, 240, 255] {
+                    let first = quantize_to_ansi256(r, g, b);
+                    let second = quantize_to_ansi256(r, g, b);
+                    assert_eq!(first, second);
+                    // 0-15 (the theme-dependent basic colors) are never
+                    // produced by this function -- see its doc comment.
+                    assert!((16..=255).contains(&first));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ansi_truecolor_supported_requires_an_explicit_colorterm_claim() {
+        assert!(ansi_truecolor_supported(&|name| match name {
+            "COLORTERM" => Some("truecolor".to_string()),
+            _ => None,
+        }));
+        assert!(ansi_truecolor_supported(&|name| match name {
+            "COLORTERM" => Some("24bit".to_string()),
+            _ => None,
+        }));
+        // Confirmed live: Apple's Terminal.app sets TERM=xterm-256color
+        // and leaves COLORTERM unset -- this must resolve to `false`.
+        assert!(!ansi_truecolor_supported(&|name| match name {
+            "TERM" => Some("xterm-256color".to_string()),
+            _ => None,
+        }));
+        assert!(!ansi_truecolor_supported(&|_| None));
     }
 
     #[test]
@@ -1791,7 +1965,14 @@ mod tests {
             detect_protocol_auto(&lookup(&[("TERM_PROGRAM", "iTerm.app")])),
             Protocol::Iterm2
         );
-        assert_eq!(detect_protocol_auto(&lookup(&[])), Protocol::Ansi);
+        assert_eq!(
+            detect_protocol_auto(&lookup(&[])),
+            Protocol::Ansi { truecolor: false }
+        );
+        assert_eq!(
+            detect_protocol_auto(&lookup(&[("COLORTERM", "truecolor")])),
+            Protocol::Ansi { truecolor: true }
+        );
     }
 
     #[test]
@@ -1803,7 +1984,12 @@ mod tests {
     #[test]
     fn resolve_protocol_honors_explicit_choices() {
         assert_eq!(resolve_protocol("iterm2").unwrap(), Protocol::Iterm2);
-        assert_eq!(resolve_protocol("ansi").unwrap(), Protocol::Ansi);
+        // `truecolor` depends on this test process's real COLORTERM, same
+        // reason `kitty` below only checks the variant.
+        assert!(matches!(
+            resolve_protocol("ansi").unwrap(),
+            Protocol::Ansi { .. }
+        ));
         assert!(matches!(
             resolve_protocol("kitty").unwrap(),
             Protocol::Kitty { .. }

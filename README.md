@@ -197,7 +197,23 @@ overridden:
 | --- | --- |
 | `KITTY_WINDOW_ID`, `TERM=xterm-kitty`, `TERM_PROGRAM=ghostty`, `GHOSTTY_RESOURCES_DIR`, `CMUX_WORKSPACE_ID`/`CMUX_SURFACE_ID` (cmux is Ghostty-based), or `TERM_PROGRAM=WezTerm` | Kitty graphics protocol |
 | `TERM_PROGRAM=iTerm.app` | iTerm2 OSC 1337 inline images |
-| anything else | ANSI 24-bit half-block fallback (e.g. Terminal.app) |
+| anything else | ANSI half-block fallback (e.g. Terminal.app) |
+
+The ANSI fallback itself has two color modes, chosen by whether the terminal
+declares 24-bit color support via `COLORTERM=truecolor`/`COLORTERM=24bit` (the
+de facto standard for this -- there's no ANSI-standardized way to query it).
+With that claim, half-blocks use real 24-bit RGB escape codes
+(`\x1b[38;2;r;g;bm`); without it, each pixel's color is quantized to the
+nearest xterm 256-color palette index (`\x1b[38;5;Nm`) instead. This matters:
+confirmed live, Apple's Terminal.app reports `TERM=xterm-256color` with no
+`COLORTERM` at all and does not understand the 24-bit form -- sending it
+anyway didn't just fail to show colors, it visibly garbled the whole image,
+since a dense grid of unrecognized escape sequences gets misparsed rather
+than cleanly ignored. Defaulting to the 256-color form for anything that
+doesn't explicitly claim truecolor is the safe choice: it still looks
+correct on a real truecolor terminal that simply forgot to set the variable,
+whereas assuming truecolor unconditionally breaks visibly on one that
+actually lacks it.
 
 For an animated GIF, WezTerm and plain Kitty use the Kitty protocol's native
 animation extension (the terminal itself handles frame timing and looping).

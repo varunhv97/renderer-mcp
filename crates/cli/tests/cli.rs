@@ -499,7 +499,8 @@ fn show_writes_an_iterm2_osc_1337_command_for_a_static_png() {
 }
 
 /// A static PNG through `--protocol ansi` produces true-color half-block
-/// escape sequences (no graphics-protocol control string at all).
+/// escape sequences (no graphics-protocol control string at all), when the
+/// terminal has explicitly declared truecolor support via `COLORTERM`.
 #[test]
 fn show_writes_ansi_half_blocks_for_a_static_png() {
     let directory = tempfile::tempdir().unwrap();
@@ -510,6 +511,7 @@ fn show_writes_ansi_half_blocks_for_a_static_png() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
         .env_remove("CMUX_SOCKET_PATH")
+        .env("COLORTERM", "truecolor")
         .args([
             "show",
             png_path.to_str().unwrap(),
@@ -528,6 +530,44 @@ fn show_writes_ansi_half_blocks_for_a_static_png() {
     assert!(text.contains("\x1b[48;2;"));
     assert!(text.contains('\u{2580}'));
     assert!(!text.contains("\x1b_G"));
+}
+
+/// Without a `COLORTERM=truecolor`/`24bit` claim (e.g. Apple's
+/// Terminal.app, confirmed live: `TERM=xterm-256color`, no `COLORTERM` at
+/// all), `--protocol ansi` must fall back to 256-color-palette escape
+/// codes rather than unconditionally emitting 24-bit codes a real terminal
+/// in that state can't parse -- confirmed live to produce visibly garbled
+/// output instead of a clean "unsupported" no-op.
+#[test]
+fn show_writes_256_color_half_blocks_when_colorterm_does_not_claim_truecolor() {
+    let directory = tempfile::tempdir().unwrap();
+    let png_path = directory.path().join("image.png");
+    write_test_png(&png_path);
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("CMUX_SOCKET_PATH")
+        .env_remove("COLORTERM")
+        .env("TERM", "xterm-256color")
+        .args([
+            "show",
+            png_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+            "--protocol",
+            "ansi",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read(&tty_path).unwrap();
+    let text = String::from_utf8(written).unwrap();
+    assert!(!text.contains(";2;"), "should not use 24-bit color codes");
+    assert!(text.contains("\x1b[38;5;"));
+    assert!(text.contains("\x1b[48;5;"));
+    assert!(text.contains('\u{2580}'));
 }
 
 /// A file that isn't a PNG or GIF is rejected with the structured
