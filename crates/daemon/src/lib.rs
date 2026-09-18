@@ -1,4 +1,18 @@
 //! Persistent local scene state and its loopback-only daemon protocol.
+//!
+//! This crate is the stateful named-scene server the `cli` and `mcp` crates
+//! both talk to over a line-delimited JSON protocol on a loopback TCP
+//! socket ([`serve`] / [`DaemonClient`]): it holds an in-memory,
+//! revisioned [`SceneV1`] per `scene_id` (see [`SceneStore`]) so a caller
+//! can create a scene once and then `get`/`replace`/`patch`/`render` it by
+//! name across many separate requests, instead of resending the whole
+//! document every time. It also owns the one [`GpuRenderer`] used for both
+//! named-scene and inline (one-shot, unstored) renders, and can be driven
+//! in-process (`RendererDaemon`, used by `cli`'s `render`/`show` commands
+//! and by `mcp`'s `render_scene` tool) without going over TCP at all.
+//!
+//! [`SceneV1`]: renderer_schema::SceneV1
+//! [`GpuRenderer`]: renderer_core::GpuRenderer
 
 use renderer_core::{GpuRenderer, RenderError, RenderedImage};
 use renderer_schema::{PatchOperationV1, ScenePatchV1, SceneV1};
@@ -14,22 +28,44 @@ use std::{
 };
 use thiserror::Error;
 
+/// The only value [`DaemonEnvelope::version`] accepts, on both the request
+/// and response side. Checked exactly (see [`read_request`] and
+/// [`DaemonClient::call`]) rather than negotiated, so a version mismatch
+/// fails fast with a clear protocol error instead of a confusing downstream
+/// deserialization failure.
 pub const DAEMON_PROTOCOL_VERSION: &str = "renderer.daemon.v1";
+/// Hard cap on one request or response's serialized size, enforced while
+/// reading ([`read_request`], [`DaemonClient::call`]) and, for responses,
+/// pre-checked before a mutation commits (see
+/// [`ensure_snapshot_fits_response`]) so a caller never gets back a scene
+/// it can't parse.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_METRICS_DIR: &str = ".renderer/metrics";
 
+/// One GPU renderer plus the in-memory named-scene store, either driven
+/// in-process or wrapped by [`serve`] for TCP access. A single
+/// `GpuRenderer` is shared across every scene (named or inline) rather than
+/// one per scene, since GPU device/pipeline setup is the expensive part.
 #[derive(Debug)]
 pub struct RendererDaemon {
     renderer: GpuRenderer,
     scenes: SceneStore,
 }
 
+/// Named scenes held by one running daemon, keyed by caller-chosen
+/// `scene_id`. A `BTreeMap` (not a `HashMap`) mainly for deterministic
+/// iteration/debugging; lookups aren't hot enough for the difference to
+/// matter.
 #[derive(Clone, Debug, Default)]
 struct SceneStore {
     scenes: BTreeMap<String, StoredScene>,
 }
 
+/// A stored scene's current state: the document itself, a revision counter
+/// incremented on every successful `replace`/`patch` (for optimistic
+/// concurrency -- see `check_revision`), and the asset root image nodes in
+/// it resolve `source` paths against.
 #[derive(Clone, Debug)]
 struct StoredScene {
     revision: u64,
@@ -37,6 +73,8 @@ struct StoredScene {
     asset_root: Option<PathBuf>,
 }
 
+/// A named scene's document plus the `scene_id`/`revision` it was fetched
+/// under -- the payload of `get_scene` and every mutating call's response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SceneSnapshot {
     pub scene_id: String,
@@ -44,6 +82,10 @@ pub struct SceneSnapshot {
     pub scene: SceneV1,
 }
 
+/// Metadata about one completed render, returned instead of the raw image
+/// bytes: callers read the file at the output path they gave (or, for MCP,
+/// this daemon crate isn't the one that base64-encodes it -- see
+/// `renderer_mcp::inline_render_response`).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RenderResult {
     pub width: u32,
@@ -65,6 +107,10 @@ impl From<RenderedImage> for RenderResult {
     }
 }
 
+/// Every failure this crate can report, whether raised locally (in-process
+/// or server-side over TCP) or reconstructed client-side from a remote
+/// error response ([`DaemonError::Remote`]). One variant per distinguishable
+/// failure, each mapped to a stable wire code by [`DaemonError::code`].
 #[derive(Debug, Error)]
 pub enum DaemonError {
     #[error("GPU initialization failed: {0}")]
@@ -330,6 +376,11 @@ impl SceneStore {
     }
 }
 
+/// Rejects a create/replace/patch before committing it if the resulting
+/// scene couldn't later be returned by `get_scene`: this serializes the
+/// exact [`DaemonResponse`] shape a `get_scene` reply would use (not just
+/// the raw scene) so the size check matches [`MAX_REQUEST_BYTES`] exactly,
+/// including envelope overhead, rather than approximating it.
 fn ensure_snapshot_fits_response(
     scene_id: &str,
     revision: u64,
@@ -421,6 +472,9 @@ fn apply_operation(
     Ok(())
 }
 
+/// One daemon RPC, tagged by `method` in JSON. Carried inside a
+/// [`DaemonEnvelope`] (which adds the protocol version) on the wire; sent
+/// directly when calling [`RendererDaemon`]'s methods in-process.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(
     tag = "method",
@@ -461,6 +515,10 @@ pub enum DaemonRequest {
     },
 }
 
+/// The wire envelope wrapping every request: `version` must equal
+/// [`DAEMON_PROTOCOL_VERSION`] (checked in [`read_request`]) so a client and
+/// server built from different schema revisions fail fast with a clear
+/// protocol error instead of silently misinterpreting fields.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonEnvelope {
@@ -469,6 +527,10 @@ pub struct DaemonEnvelope {
     pub request: DaemonRequest,
 }
 
+/// The success payload of a [`DaemonResponse`], tagged by `kind` in JSON.
+/// `Rendered` is reused for both `render_scene` and `render_gif_scene`,
+/// distinguished by the caller already knowing which request it sent (and,
+/// for MCP, by [`RenderResult`]'s `frame_count`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DaemonResult {
@@ -486,6 +548,9 @@ pub enum DaemonResult {
     Destroyed,
 }
 
+/// The wire envelope wrapping every response: exactly one of `result`/
+/// `error` is populated (never both, never neither) -- see [`dispatch`] and
+/// [`error_response`], the only two places that construct one.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DaemonResponse {
     pub version: String,
@@ -495,6 +560,10 @@ pub struct DaemonResponse {
     pub error: Option<DaemonProtocolError>,
 }
 
+/// A [`DaemonResponse`]'s error case: a stable `code` (see
+/// [`DaemonError::code`]) plus a human-readable `message`. `code` is what a
+/// client should match on; `message` is for display only and isn't
+/// guaranteed stable across versions.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DaemonProtocolError {
     pub code: String,
@@ -740,6 +809,9 @@ fn error_response(error: DaemonError) -> DaemonResponse {
     }
 }
 
+/// A TCP client for a running [`serve`]d daemon: one request/response round
+/// trip per [`DaemonClient::call`], each on its own freshly connected
+/// stream (no persistent connection/session to manage).
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
     endpoint: SocketAddr,
@@ -799,6 +871,11 @@ impl DaemonClient {
     }
 }
 
+/// The daemon holds unauthenticated, unencrypted scene state and accepts
+/// requests with no access control beyond "can reach this socket" -- so
+/// both [`serve_with_metrics_dir`] (binding) and [`DaemonClient::new`]
+/// (connecting) refuse anything but a loopback address, rather than trust
+/// callers to only ever pass one.
 fn ensure_loopback(endpoint: SocketAddr) -> Result<(), DaemonError> {
     if endpoint.ip().is_loopback() {
         Ok(())

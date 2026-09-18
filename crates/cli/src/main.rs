@@ -1,3 +1,15 @@
+//! `renderer`: the command-line entry point to RendererCli.
+//!
+//! Bundles four things behind one binary: one-shot local rendering
+//! (`render`/`inspect`), a loopback-only named-scene daemon
+//! (`daemon serve`, implemented in `renderer_daemon`) plus a client for it
+//! (`scene ...`), and inline terminal image preview (`show`, implemented in
+//! `renderer_terminal` and shared with the `mcp` crate's `show_image`
+//! tool). Every command prints machine-readable output -- JSON on stdout
+//! for success, a `{"code","message"}` JSON object on stderr for failure
+//! (see [`report_error`]) -- since this CLI is driven by coding agents at
+//! least as often as by a human.
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use renderer_daemon::{

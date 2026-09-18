@@ -1,10 +1,24 @@
 //! Versioned, transport-neutral scene contracts for RendererCli.
+//!
+//! `SceneV1` is the one scene representation shared by every other crate in
+//! this workspace: `daemon` stores and renders it, `cli` reads it from JSON
+//! files, and `mcp` describes it to LLM clients as a JSON Schema. Keeping
+//! the type and its validation rules here, instead of duplicated per crate,
+//! is what keeps those surfaces in lockstep. `SceneV1::validate` is the
+//! single gate untrusted scene input (from a file, a daemon request, or an
+//! MCP tool call) must pass through before it reaches the renderer.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use thiserror::Error;
 
+/// The only value `SceneV1::version` accepts today. An exact string match,
+/// not a semver comparison -- a future incompatible schema change gets its
+/// own `renderer.scene.v2` constant and `SceneV2` type rather than trying
+/// to version this one in place.
 pub const SCENE_VERSION_V1: &str = "renderer.scene.v1";
+// The constants below bound resource use so an untrusted scene or patch
+// document can't force the renderer/daemon to do unbounded work.
 pub const MAX_CANVAS_DIMENSION: u32 = 4_096;
 pub const MAX_NODES: usize = 10_000;
 pub const MAX_PATH_POINTS: usize = 4_096;
@@ -16,8 +30,14 @@ pub const MAX_ANIMATION_PIXELS: u64 = 64 * 1024 * 1024;
 /// Maximum byte length of a user-supplied post-process effect shader.
 pub const MAX_EFFECT_SHADER_BYTES: usize = 64 * 1024;
 
+/// RGBA, each channel a finite float from 0.0 through 1.0 (see
+/// `validate_color`); values outside that range fail scene validation.
 pub type Color = [f32; 4];
 
+/// A complete, renderable scene: a canvas, a flat list of nodes (no
+/// grouping/hierarchy), and an optional animation timeline and post-process
+/// effect. This is the unit of storage in the daemon's named-scene store and
+/// the document CLI/MCP callers author or generate.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneV1 {
@@ -32,6 +52,11 @@ pub struct SceneV1 {
 }
 
 impl SceneV1 {
+    /// Checks every structural and resource-limit invariant this scene must
+    /// satisfy before it can be handed to the renderer: version, canvas
+    /// bounds, node count/uniqueness, and (if present) timeline/effect
+    /// validity. The renderer itself does not re-validate, so every caller
+    /// of untrusted scene input must run it through here first.
     pub fn validate(&self) -> Result<(), SceneValidationError> {
         if self.version != SCENE_VERSION_V1 {
             return Err(SceneValidationError::UnsupportedVersion(
@@ -94,6 +119,7 @@ impl EffectV1 {
     }
 }
 
+/// The scene's output surface: pixel dimensions and background color.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanvasV1 {
@@ -119,6 +145,9 @@ impl CanvasV1 {
     }
 }
 
+/// One visual element placed in a scene, identified by a scene-unique `id`
+/// and dispatching on `kind` (flattened from [`NodeKindV1`]) to one of six
+/// shape variants.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NodeV1 {
     pub id: String,
@@ -140,6 +169,11 @@ impl NodeV1 {
     }
 }
 
+/// The six supported node shapes, discriminated by a `kind` JSON tag. Each
+/// variant carries exactly the fields that shape needs (no shared struct),
+/// so adding a shape means extending this match everywhere it's exhaustively
+/// matched -- `validate` below, and the renderer's draw dispatch -- rather
+/// than risking a silently-unhandled default case.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NodeKindV1 {
@@ -239,6 +273,7 @@ impl NodeKindV1 {
     }
 }
 
+/// One vertex of a `Path` node's polygon.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointV1 {
@@ -246,6 +281,12 @@ pub struct PointV1 {
     pub y: f32,
 }
 
+/// Optional per-scene animation: a fixed frame rate and duration plus a list
+/// of keyframes. `fps`/`duration_ms` are validated together against
+/// [`MAX_ANIMATION_FRAMES`] and [`MAX_ANIMATION_PIXELS`] so a scene can't
+/// request more raster work than the renderer is willing to do in one
+/// export; the renderer linearly interpolates each animated property
+/// between the keyframes bracketing a given frame's timestamp.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimelineV1 {
@@ -298,6 +339,8 @@ impl TimelineV1 {
     }
 }
 
+/// One point in time where a `target` node's animated property takes a
+/// specific value; `target` must name a node ID present in the same scene.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyframeV1 {
@@ -306,6 +349,10 @@ pub struct KeyframeV1 {
     pub property: AnimatedPropertyV1,
 }
 
+/// The node property a [`KeyframeV1`] animates, tagged by `kind` in JSON
+/// (`{"kind": "opacity", "value": ...}`). `Translate` sets the node's
+/// absolute `translate` offset at that keyframe -- it is not an additive
+/// delta on top of other keyframes.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
@@ -333,6 +380,10 @@ impl ScenePatchV1 {
     }
 }
 
+/// One operation within a [`ScenePatchV1`], tagged by `op` in JSON. The
+/// daemon applies these against a clone of the stored scene and only
+/// commits the result if every operation succeeds and the whole scene
+/// re-validates -- see `renderer_daemon::apply_operation`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PatchOperationV1 {
@@ -343,6 +394,11 @@ pub enum PatchOperationV1 {
     ClearTimeline,
 }
 
+/// Every way a [`SceneV1`] or [`ScenePatchV1`] can fail [`SceneV1::validate`]
+/// / [`ScenePatchV1::validate`]. One variant per distinguishable failure
+/// (rather than an opaque string) so callers -- notably `renderer_daemon`,
+/// which wraps this in `DaemonError::InvalidScene` -- can report a stable
+/// error without string-matching a message.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum SceneValidationError {
     #[error("unsupported scene version: {0}")]

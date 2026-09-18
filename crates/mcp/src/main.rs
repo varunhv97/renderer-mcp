@@ -1,4 +1,17 @@
 //! MCP stdio server backed by one persistent local GPU daemon.
+//!
+//! Exposes RendererCli to LLM/agent clients over the Model Context
+//! Protocol: `render_scene` renders directly (in-process, via
+//! `renderer_daemon::RendererDaemon`, lazily created on first use), while
+//! the named-scene tools (`create_scene`, `patch_scene`, ...) instead
+//! require `RENDERER_DAEMON_ENDPOINT` and talk to a separately-running
+//! `renderer daemon serve` over TCP via `renderer_daemon::DaemonClient` --
+//! that split is why only the latter path can fail with "endpoint
+//! required" rather than starting its own daemon. Tool JSON Schemas below
+//! are kept field-for-field in sync with `renderer_schema`'s types by hand
+//! (see `scene_schema` and friends), since MCP has no way to derive one
+//! from the Rust types directly. `show_image` instead delegates entirely
+//! to `renderer_terminal`, the same crate behind the CLI's `renderer show`.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageFormat, ImageReader};
@@ -27,6 +40,10 @@ fn main() {
             Ok(value) => value,
             Err(_) => continue,
         };
+        // JSON-RPC notifications (no "id") expect no reply -- e.g. the
+        // "notifications/initialized" message MCP clients send right after
+        // `initialize` -- so skip anything without one rather than sending
+        // a response nobody is waiting for.
         let Some(id) = request.get("id").cloned() else {
             continue;
         };
