@@ -234,8 +234,18 @@ impl GpuRenderer {
         // comment for the full rationale.
         let mut cache = AssetCache::default();
         {
-            let mut encoder =
-                GifEncoder::new(File::create(output).map_err(RenderError::OutputDirectory)?);
+            // Speed 1 (the crate's default) explicitly prioritizes NeuQuant
+            // color-quantization quality "at any cost"; with MSAA-anti-aliased
+            // edges introducing far more distinct colors per frame than the
+            // old hard edges did, that cost became real (~2x slower GIF
+            // encoding on a moderately complex scene, measured locally).
+            // Speed 10 recovers most of that without a visible quality
+            // difference (checked side-by-side on several test scenes);
+            // pushing further to speed 20 saved only marginally more time.
+            let mut encoder = GifEncoder::new_with_speed(
+                File::create(output).map_err(RenderError::OutputDirectory)?,
+                10,
+            );
             encoder
                 .set_repeat(Repeat::Infinite)
                 .map_err(RenderError::Gif)?;
