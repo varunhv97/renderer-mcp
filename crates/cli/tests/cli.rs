@@ -4,6 +4,18 @@ use std::{
     time::Duration,
 };
 
+/// Parses a CLI failure's stderr as the stable JSON error envelope the
+/// UI/UX specification requires -- exactly one JSON object with a `code`
+/// and a `message` field, and nothing else on the stream.
+fn parse_error(stderr: Vec<u8>) -> serde_json::Value {
+    let text = String::from_utf8(stderr).unwrap();
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|error| panic!("stderr was not a single JSON object: {error}\n{text}"));
+    assert!(value["code"].is_string(), "missing code in {value}");
+    assert!(value["message"].is_string(), "missing message in {value}");
+    value
+}
+
 #[test]
 fn reports_status_and_inspects_a_saved_image() {
     let binary = env!("CARGO_BIN_EXE_renderer");
@@ -38,10 +50,13 @@ fn rejects_invalid_render_input_without_needing_a_gpu() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    let error = parse_error(output.stderr);
+    assert_eq!(error["code"], "invalid_json");
     assert!(
-        String::from_utf8(output.stderr)
+        error["message"]
+            .as_str()
             .unwrap()
-            .contains("scene is not valid JSON")
+            .contains("not valid JSON")
     );
 }
 
@@ -62,8 +77,11 @@ fn renders_png_and_gif_when_a_gpu_is_available() {
         .output()
         .unwrap();
     if !output.status.success() {
+        let error = parse_error(output.stderr);
+        assert_eq!(error["code"], "internal_error");
         assert!(
-            String::from_utf8(output.stderr)
+            error["message"]
+                .as_str()
                 .unwrap()
                 .contains("no compatible GPU adapter")
         );
@@ -97,8 +115,11 @@ fn inspect_reports_a_helpful_error_for_a_missing_file() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    let error = parse_error(output.stderr);
+    assert_eq!(error["code"], "io_error");
     assert!(
-        String::from_utf8(output.stderr)
+        error["message"]
+            .as_str()
             .unwrap()
             .contains("could not inspect")
     );
@@ -111,11 +132,9 @@ fn scene_commands_reject_non_loopback_endpoints() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("loopback")
-    );
+    let error = parse_error(output.stderr);
+    assert_eq!(error["code"], "internal_error");
+    assert!(error["message"].as_str().unwrap().contains("loopback"));
 }
 
 /// Picks a loopback port that is very likely to be free by briefly binding to
@@ -199,8 +218,11 @@ fn scene_subcommands_round_trip_through_a_running_daemon() {
         scene_path.to_str().unwrap(),
     ]);
     assert!(!duplicate.status.success());
+    let error = parse_error(duplicate.stderr);
+    assert_eq!(error["code"], "already_exists");
     assert!(
-        String::from_utf8(duplicate.stderr)
+        error["message"]
+            .as_str()
             .unwrap()
             .contains("already exists")
     );
@@ -215,8 +237,11 @@ fn scene_subcommands_round_trip_through_a_running_daemon() {
 
     let missing = renderer(&["scene", "--endpoint", &addr, "get", "missing"]);
     assert!(!missing.status.success());
+    let error = parse_error(missing.stderr);
+    assert_eq!(error["code"], "not_found");
     assert!(
-        String::from_utf8(missing.stderr)
+        error["message"]
+            .as_str()
             .unwrap()
             .contains("does not exist")
     );
@@ -233,8 +258,11 @@ fn scene_subcommands_round_trip_through_a_running_daemon() {
         "99",
     ]);
     assert!(!conflicting_replace.status.success());
+    let error = parse_error(conflicting_replace.stderr);
+    assert_eq!(error["code"], "revision_conflict");
     assert!(
-        String::from_utf8(conflicting_replace.stderr)
+        error["message"]
+            .as_str()
             .unwrap()
             .contains("revision conflict")
     );
@@ -291,10 +319,13 @@ fn scene_subcommands_round_trip_through_a_running_daemon() {
         bad_patch_path.to_str().unwrap(),
     ]);
     assert!(!bad_patch.status.success());
+    let error = parse_error(bad_patch.stderr);
+    assert_eq!(error["code"], "invalid_json");
     assert!(
-        String::from_utf8(bad_patch.stderr)
+        error["message"]
+            .as_str()
             .unwrap()
-            .contains("scene is not valid JSON")
+            .contains("not valid JSON")
     );
 
     let rendered_path = directory.path().join("demo.png");
@@ -337,11 +368,61 @@ fn scene_subcommands_round_trip_through_a_running_daemon() {
         "/no/such/scene.json",
     ]);
     assert!(!missing_input.status.success());
+    let error = parse_error(missing_input.stderr);
+    assert_eq!(error["code"], "io_error");
     assert!(
-        String::from_utf8(missing_input.stderr)
+        error["message"]
+            .as_str()
             .unwrap()
             .contains("could not read")
     );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+/// Runs `scene get` for a scene ID that doesn't exist against a real,
+/// foreground daemon and checks that stderr is exactly one JSON object
+/// carrying the `not_found` code -- the concrete failure called out in the
+/// bug report this behavior fixes.
+#[test]
+fn scene_get_for_a_missing_scene_emits_structured_not_found_json() {
+    let endpoint = pick_endpoint();
+    let addr = endpoint.to_string();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .args(["daemon", "serve", "--endpoint", &addr])
+        .spawn()
+        .unwrap();
+
+    let mut ready = false;
+    for _ in 0..50 {
+        if let Ok(Some(_)) = daemon.try_wait() {
+            break;
+        }
+        if renderer(&["scene", "--endpoint", &addr, "health"])
+            .status
+            .success()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        return;
+    }
+
+    let output = renderer(&["scene", "--endpoint", &addr, "get", "missing-scene"]);
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty on failure"
+    );
+    let error = parse_error(output.stderr);
+    assert_eq!(error["code"], "not_found");
+    assert!(error["message"].as_str().unwrap().contains("missing-scene"));
 
     let _ = daemon.kill();
     let _ = daemon.wait();

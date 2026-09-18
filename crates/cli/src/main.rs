@@ -1,6 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use renderer_daemon::{DaemonClient, DaemonRequest, DaemonResult, RenderResult, serve};
+use renderer_daemon::{
+    DaemonClient, DaemonError, DaemonRequest, DaemonResult, RenderResult, serve,
+};
 use renderer_schema::{ScenePatchV1, SceneV1};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -99,7 +101,59 @@ struct InspectResult {
     sha256: String,
 }
 
-fn main() -> Result<()> {
+/// A stable, machine-readable error origin local to the CLI crate: file I/O
+/// and JSON parsing for `read_json`, plus `inspect`'s image decoding and
+/// hashing. Anything that can instead be represented as a `DaemonError`
+/// should be, so this only needs to cover errors that never touch the
+/// daemon layer.
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    #[error("could not read {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{} is not valid JSON: {source}", path.display())]
+    InvalidJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("could not inspect {}: {source}", path.display())]
+    Image {
+        path: PathBuf,
+        #[source]
+        source: image::ImageError,
+    },
+}
+
+impl CliError {
+    fn code(&self) -> &'static str {
+        match self {
+            CliError::Read { .. } | CliError::Image { .. } => "io_error",
+            CliError::InvalidJson { .. } => "invalid_json",
+        }
+    }
+}
+
+/// One JSON object written to stderr for any command failure, per the UI/UX
+/// specification: a stable `code` plus a human-readable `message` carrying
+/// whatever path/scene ID/operation-index context the error had.
+#[derive(Serialize)]
+struct ErrorEnvelope {
+    code: String,
+    message: String,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        report_error(&error);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Render { input, output } => render_direct(input, output),
         Command::Inspect { input } => inspect(input),
@@ -110,6 +164,41 @@ fn main() -> Result<()> {
         Command::Status => print_json(
             serde_json::json!({ "api_version": "renderer.scene.v1", "transport": "local" }),
         ),
+    }
+}
+
+/// Prints the stable JSON error envelope required by the UI/UX
+/// specification: `{"code": ..., "message": ...}` on stderr, nothing else.
+/// `code` is recovered by downcasting to whichever concrete error type
+/// produced this failure -- `DaemonError` for anything that round-tripped
+/// through the daemon client (or the in-process daemon), `CliError` for
+/// failures local to this crate, and `internal_error` for anything else.
+fn report_error(error: &anyhow::Error) {
+    let envelope = ErrorEnvelope {
+        code: error_code(error),
+        message: error.to_string(),
+    };
+    match serde_json::to_string(&envelope) {
+        Ok(json) => eprintln!("{json}"),
+        Err(_) => {
+            eprintln!(r#"{{"code":"internal_error","message":"failed to format error"}}"#);
+        }
+    }
+}
+
+/// Recovers a stable code from an arbitrary top-level error by downcasting
+/// to whichever concrete error type actually produced it. `DaemonError` is
+/// checked first since it covers most command failures (anything that
+/// touched `RendererDaemon`/`DaemonClient`); `CliError` covers the handful
+/// of failures local to this crate; anything else (e.g. a `serde_json`
+/// serialization failure on the success path) falls back to a generic code.
+fn error_code(error: &anyhow::Error) -> String {
+    if let Some(daemon_error) = error.downcast_ref::<DaemonError>() {
+        daemon_error.code()
+    } else if let Some(cli_error) = error.downcast_ref::<CliError>() {
+        cli_error.code().to_string()
+    } else {
+        "internal_error".to_string()
     }
 }
 
@@ -127,9 +216,15 @@ fn render_direct(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
 }
 
 fn inspect(input: PathBuf) -> Result<()> {
-    let (width, height) = image::image_dimensions(&input)
-        .with_context(|| format!("could not inspect {}", input.display()))?;
-    let sha256 = format!("{:x}", Sha256::digest(fs::read(&input)?));
+    let (width, height) = image::image_dimensions(&input).map_err(|source| CliError::Image {
+        path: input.clone(),
+        source,
+    })?;
+    let bytes = fs::read(&input).map_err(|source| CliError::Read {
+        path: input.clone(),
+        source,
+    })?;
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
     println!(
         "{}",
         serde_json::to_string_pretty(&InspectResult {
@@ -191,12 +286,15 @@ fn asset_root_for(input: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<T> {
-    serde_json::from_str(
-        &fs::read_to_string(input)
-            .with_context(|| format!("could not read {}", input.display()))?,
-    )
-    .context("scene is not valid JSON")
+fn read_json<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<T, CliError> {
+    let contents = fs::read_to_string(input).map_err(|source| CliError::Read {
+        path: input.clone(),
+        source,
+    })?;
+    serde_json::from_str(&contents).map_err(|source| CliError::InvalidJson {
+        path: input.clone(),
+        source,
+    })
 }
 
 fn print_daemon_result(result: DaemonResult) -> Result<()> {
@@ -265,22 +363,63 @@ mod tests {
     #[test]
     fn read_json_reports_missing_files_and_invalid_json() {
         let missing = read_json::<SceneV1>(&PathBuf::from("/no/such/scene.json"));
-        assert!(
-            missing
-                .expect_err("missing file must fail")
-                .to_string()
-                .contains("could not read")
-        );
+        let error = missing.expect_err("missing file must fail");
+        assert_eq!(error.code(), "io_error");
+        assert!(error.to_string().contains("could not read"));
 
         let directory = tempfile::tempdir().unwrap();
         let bad = directory.path().join("bad.json");
         fs::write(&bad, "not json").unwrap();
         let invalid = read_json::<SceneV1>(&bad);
+        let error = invalid.expect_err("invalid json must fail");
+        assert_eq!(error.code(), "invalid_json");
+        assert!(error.to_string().contains("is not valid JSON"));
+    }
+
+    #[test]
+    fn cli_error_image_variant_reports_io_error() {
+        let error = CliError::Image {
+            path: PathBuf::from("missing.png"),
+            source: image::ImageError::IoError(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        };
+        assert_eq!(error.code(), "io_error");
+        assert!(error.to_string().contains("could not inspect"));
+    }
+
+    #[test]
+    fn error_code_downcasts_daemon_and_cli_errors_with_internal_fallback() {
+        let daemon_error: anyhow::Error = DaemonError::SceneNotFound("missing-scene".into()).into();
+        assert_eq!(error_code(&daemon_error), "not_found");
+
+        let cli_error: anyhow::Error = CliError::Read {
+            path: PathBuf::from("scene.json"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }
+        .into();
+        assert_eq!(error_code(&cli_error), "io_error");
+
+        let other = anyhow::anyhow!("some other failure");
+        assert_eq!(error_code(&other), "internal_error");
+    }
+
+    #[test]
+    fn report_error_prints_a_single_json_object() {
+        // report_error itself only writes to stderr, so this exercises the
+        // envelope construction and serialization path it depends on
+        // directly rather than capturing process stderr.
+        let daemon_error: anyhow::Error = DaemonError::SceneNotFound("missing-scene".into()).into();
+        let envelope = ErrorEnvelope {
+            code: error_code(&daemon_error),
+            message: daemon_error.to_string(),
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["code"], "not_found");
         assert!(
-            invalid
-                .expect_err("invalid json must fail")
-                .to_string()
-                .contains("scene is not valid JSON")
+            parsed["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing-scene")
         );
     }
 

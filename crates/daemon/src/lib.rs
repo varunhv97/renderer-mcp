@@ -93,6 +93,38 @@ pub enum DaemonError {
     Protocol(String),
     #[error("daemon connection failed: {0}")]
     Connection(#[source] std::io::Error),
+    #[error("{message}")]
+    Remote { code: String, message: String },
+}
+
+impl DaemonError {
+    /// Stable, machine-readable code identifying this error's kind.
+    ///
+    /// This is the single source of truth for the mapping from error kind to
+    /// wire-level code: [`error_response`] calls this method rather than
+    /// duplicating the mapping, so a server-side error and a client-side
+    /// error of the same kind always report the same code. For
+    /// [`DaemonError::Remote`], this returns the code exactly as reported by
+    /// the daemon that produced it, rather than recomputing one locally.
+    pub fn code(&self) -> String {
+        match self {
+            DaemonError::RevisionConflict { .. } => "revision_conflict".to_string(),
+            DaemonError::SceneNotFound(_) | DaemonError::NodeNotFound { .. } => {
+                "not_found".to_string()
+            }
+            DaemonError::SceneAlreadyExists(_) => "already_exists".to_string(),
+            DaemonError::InvalidScene(_)
+            | DaemonError::EmptySceneId
+            | DaemonError::SceneResponseTooLarge => "invalid_scene".to_string(),
+            DaemonError::Protocol(_) => "invalid_request".to_string(),
+            DaemonError::Remote { code, .. } => code.clone(),
+            DaemonError::Renderer(_)
+            | DaemonError::AssetRootRequired
+            | DaemonError::NonLoopbackEndpoint(_)
+            | DaemonError::Bind(_)
+            | DaemonError::Connection(_) => "internal_error".to_string(),
+        }
+    }
 }
 
 impl RendererDaemon {
@@ -699,23 +731,12 @@ fn dispatch(daemon: &mut RendererDaemon, request: DaemonRequest) -> DaemonRespon
 }
 
 fn error_response(error: DaemonError) -> DaemonResponse {
-    let code = match error {
-        DaemonError::RevisionConflict { .. } => "revision_conflict",
-        DaemonError::SceneNotFound(_) | DaemonError::NodeNotFound { .. } => "not_found",
-        DaemonError::SceneAlreadyExists(_) => "already_exists",
-        DaemonError::InvalidScene(_)
-        | DaemonError::EmptySceneId
-        | DaemonError::SceneResponseTooLarge => "invalid_scene",
-        DaemonError::Protocol(_) => "invalid_request",
-        _ => "internal_error",
-    };
+    let code = error.code();
+    let message = error.to_string();
     DaemonResponse {
         version: DAEMON_PROTOCOL_VERSION.into(),
         result: None,
-        error: Some(DaemonProtocolError {
-            code: code.into(),
-            message: error.to_string(),
-        }),
+        error: Some(DaemonProtocolError { code, message }),
     }
 }
 
@@ -768,11 +789,12 @@ impl DaemonClient {
                 "unsupported daemon response version".into(),
             ));
         }
-        response.result.ok_or_else(|| {
-            DaemonError::Protocol(response.error.map_or_else(
-                || "daemon returned no result".into(),
-                |error| format!("{}: {}", error.code, error.message),
-            ))
+        response.result.ok_or_else(|| match response.error {
+            Some(error) => DaemonError::Remote {
+                code: error.code,
+                message: error.message,
+            },
+            None => DaemonError::Protocol("daemon returned no result".into()),
         })
     }
 }
@@ -1412,7 +1434,79 @@ mod tests {
         let client = DaemonClient::new(endpoint).unwrap();
         assert!(matches!(
             client.call(DaemonRequest::Health),
-            Err(DaemonError::Protocol(message)) if message == "not_found: missing"
+            Err(DaemonError::Remote { code, message })
+                if code == "not_found" && message == "missing"
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn code_matches_error_response_for_every_local_variant_and_remote_passes_through() {
+        let cases: Vec<(DaemonError, &str)> = vec![
+            (
+                DaemonError::RevisionConflict {
+                    expected: 1,
+                    actual: 2,
+                },
+                "revision_conflict",
+            ),
+            (DaemonError::SceneNotFound("s".into()), "not_found"),
+            (
+                DaemonError::NodeNotFound {
+                    index: 0,
+                    id: "n".into(),
+                },
+                "not_found",
+            ),
+            (
+                DaemonError::SceneAlreadyExists("s".into()),
+                "already_exists",
+            ),
+            (
+                DaemonError::InvalidScene(SceneValidationError::EmptyNodeId),
+                "invalid_scene",
+            ),
+            (DaemonError::EmptySceneId, "invalid_scene"),
+            (DaemonError::SceneResponseTooLarge, "invalid_scene"),
+            (DaemonError::Protocol("bad".into()), "invalid_request"),
+            (DaemonError::AssetRootRequired, "internal_error"),
+        ];
+        for (error, expected_code) in cases {
+            assert_eq!(error.code(), expected_code);
+        }
+        assert_eq!(
+            DaemonError::Remote {
+                code: "custom_code".into(),
+                message: "m".into(),
+            }
+            .code(),
+            "custom_code"
+        );
+    }
+
+    #[test]
+    fn client_call_surfaces_remote_errors_with_their_code_and_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let _ = BufReader::new(&stream)
+                .take(MAX_REQUEST_BYTES as u64)
+                .read_until(b'\n', &mut request);
+            let _ = stream.write_all(
+                br#"{"version":"renderer.daemon.v1","result":null,"error":{"code":"revision_conflict","message":"scene revision conflict: expected 1, current 2"}}"#,
+            );
+            let _ = stream.write_all(b"\n");
+        });
+        let client = DaemonClient::new(endpoint).unwrap();
+        let error = client.call(DaemonRequest::Health).unwrap_err();
+        assert_eq!(error.code(), "revision_conflict");
+        assert!(matches!(
+            error,
+            DaemonError::Remote { code, message }
+                if code == "revision_conflict"
+                    && message == "scene revision conflict: expected 1, current 2"
         ));
         server.join().unwrap();
     }
