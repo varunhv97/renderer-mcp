@@ -7,8 +7,10 @@ scene or drawing-command document, receive a saved image plus structured
 metadata, and can keep a named scene alive during a local daemon session.
 Scenes compose vector shapes, local raster and SVG images, and embedded-font
 text into one ordered GPU pass; PNG and keyframed GIF export both work from
-the same scene document. Image nodes accept local PNG, JPEG, GIF, WebP, or
-SVG assets; SVG assets are rasterized directly at each node's declared size
+the same scene document. Vector shapes (rects, ellipses, lines, paths) are
+anti-aliased via 4x MSAA, matching the anti-aliased edges text and SVG
+content already had. Image nodes accept local PNG, JPEG, GIF, WebP, or SVG
+assets; SVG assets are rasterized directly at each node's declared size
 rather than decoded and rescaled.
 
 ## Development

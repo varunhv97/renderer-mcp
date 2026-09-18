@@ -14,6 +14,7 @@ fn main() {
         "golden_alpha_blend.scene.json",
         "golden_order_image_first.scene.json",
         "golden_order_vector_first.scene.json",
+        "golden_effect_invert.scene.json",
     ] {
         let raw = std::fs::read_to_string(asset_root.join(scene_file)).unwrap();
         let scene: SceneV1 = serde_json::from_str(&raw).unwrap();

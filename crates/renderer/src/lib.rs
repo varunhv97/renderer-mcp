@@ -23,6 +23,15 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 const ELLIPSE_SEGMENTS: usize = 32;
+/// MSAA sample count used to anti-alias vector primitives (rect/ellipse/
+/// line/path). 4x is the standard, broadly-supported choice for
+/// `Rgba8UnormSrgb` render targets on desktop GPUs (Metal/Vulkan/DX12) and is
+/// what this renderer's node-composition pass uses; see
+/// `GpuRenderer::new_async` for an adapter-capability check confirming this
+/// value is supported before it is relied on. The effect pass intentionally
+/// stays single-sampled (see `build_effect_pipeline`): it introduces no new
+/// geometric edges, so multisampling it would add cost with no benefit.
+const MSAA_SAMPLE_COUNT: u32 = 4;
 const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ASSET_PIXELS: u64 = 16_000_000;
 const MAX_IMAGE_RASTER_PIXELS: u64 = 4_000_000;
@@ -118,6 +127,24 @@ impl GpuRenderer {
                 .await
                 .ok_or(RenderError::NoAdapter)?
         };
+        // `MSAA_SAMPLE_COUNT`x MSAA on `Rgba8UnormSrgb` (the format used for
+        // every render target in `render_composed_rgba_with_cache`) is what
+        // anti-aliases vector primitives; confirm the chosen adapter actually
+        // supports it rather than silently relying on it. Every adapter this
+        // renderer has been exercised against (Metal/Vulkan/DX12 desktop
+        // GPUs) supports 4x here, so this is a debug-only sanity check, not a
+        // hard runtime requirement -- a future portable/software adapter
+        // that lacks it would otherwise fail obscurely deep inside
+        // `create_texture`/`create_render_pipeline` instead of here.
+        debug_assert!(
+            adapter
+                .get_texture_format_features(wgpu::TextureFormat::Rgba8UnormSrgb)
+                .flags
+                .sample_count_supported(MSAA_SAMPLE_COUNT),
+            "adapter {:?} does not support {}x MSAA for Rgba8UnormSrgb",
+            adapter.get_info().name,
+            MSAA_SAMPLE_COUNT,
+        );
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -312,6 +339,30 @@ impl GpuRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Multisampled intermediate the node-composition pass below actually
+        // draws into; it is resolved into `view` (the single-sampled
+        // `texture` above) at the end of that pass, which is what performs
+        // the anti-aliasing (see `MSAA_SAMPLE_COUNT`'s doc comment). A
+        // multisampled texture can only ever be a resolve source, so its
+        // usage is restricted to `RENDER_ATTACHMENT` -- it can't be
+        // `COPY_SRC` or `TEXTURE_BINDING` -- and it's never read back or
+        // sampled directly; `texture`/`view` keep meaning exactly what they
+        // meant before this texture existed.
+        let msaa_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("renderer-cli msaa target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let primitive_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -396,11 +447,14 @@ impl GpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("renderer-cli pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &msaa_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(to_wgpu_color(scene.canvas.background)),
-                        store: wgpu::StoreOp::Store,
+                        // The multisampled contents themselves are never
+                        // read -- only the resolve into `view` matters --
+                        // so they don't need to be stored.
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -644,7 +698,11 @@ fn create_pipelines(
         }),
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: MSAA_SAMPLE_COUNT,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         multiview: None,
     });
     let texture_bind_group_layout =
@@ -693,7 +751,11 @@ fn create_pipelines(
         }),
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: MSAA_SAMPLE_COUNT,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         multiview: None,
     });
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2273,6 +2335,100 @@ mod tests {
         }
     }
 
+    /// Direct anti-aliasing regression test: renders a diagonal (non-axis-
+    /// aligned) line and asserts at least one pixel along its edge lands
+    /// strictly between the background color and the line color.
+    ///
+    /// Before MSAA was added, this renderer's vector primitives (rect/
+    /// ellipse/line/path) had no anti-aliasing at all: decoding a real
+    /// rendered PNG's raw pixel bytes showed a diagonal line's edge
+    /// transitioning directly from `(255,255,255,255)` to `(89,89,89,255)`
+    /// with no intermediate blended pixel anywhere along a clearly diagonal
+    /// edge -- a hard, stair-stepped edge. A binary hard edge can still pass
+    /// a tolerance-based golden-image comparison (edges just shift by a
+    /// pixel or two), so that alone would not catch a regression back to
+    /// hard edges. This test instead checks the actual pixel values along a
+    /// known diagonal edge for real intermediate coverage-weighted color,
+    /// which only MSAA (or another anti-aliasing scheme) can produce.
+    #[test]
+    fn anti_aliases_diagonal_primitive_edges_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "diagonal".into(),
+                kind: NodeKindV1::Line {
+                    x1: 6.0,
+                    y1: 6.0,
+                    x2: 58.0,
+                    y2: 58.0,
+                    thickness: 6.0,
+                    color: [0.2, 0.2, 0.2, 1.0],
+                },
+            }],
+            timeline: None,
+            effect: None,
+        };
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer.render_rgba(&scene).unwrap();
+        assert!(warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+        // A corner far from the diagonal stroke (solid background) and a
+        // point on the line's centerline far from both of its ends (solid
+        // line interior) give the two real, GPU-rendered "pure" colors to
+        // compare edge pixels against -- more robust than hardcoding
+        // expected sRGB-encoded byte values here.
+        let background_pixel = pixel_at(0, 0);
+        let line_pixel = pixel_at(32, 32);
+        assert_ne!(
+            background_pixel, line_pixel,
+            "sanity check: the sampled background and line-interior points must differ"
+        );
+
+        let mut found_blended_pixel = false;
+        'scan: for y in 0..scene.canvas.height as usize {
+            for x in 0..width {
+                let pixel = pixel_at(x, y);
+                let strictly_between = (0..3).all(|channel| {
+                    let low = background_pixel[channel].min(line_pixel[channel]);
+                    let high = background_pixel[channel].max(line_pixel[channel]);
+                    pixel[channel] > low && pixel[channel] < high
+                });
+                if strictly_between {
+                    found_blended_pixel = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(
+            found_blended_pixel,
+            "expected at least one pixel strictly between the background color {background_pixel:?} \
+             and the line color {line_pixel:?} along the diagonal edge, proving real \
+             coverage-weighted MSAA blending occurred instead of a hard binary edge"
+        );
+    }
+
     #[test]
     fn applies_a_full_canvas_effect_shader_on_an_available_gpu() {
         let renderer = match GpuRenderer::new() {
@@ -2359,17 +2515,21 @@ mod tests {
 
     /// Golden-image tolerance for `renders_golden_scenes_within_tolerance_on_an_available_gpu`.
     ///
-    /// The renderer draws hard-edged triangles with no MSAA, so shape edges
-    /// are exact given identical input; the only sources of legitimate,
-    /// non-bug pixel drift across GPUs/drivers are: (1) fontdue's
-    /// anti-aliased glyph coverage combined with sRGB-aware alpha blending on
-    /// `Rgba8UnormSrgb`, where different GPUs may round the linear<->sRGB
-    /// conversion by a few least-significant bits, and (2) bilinear texture
-    /// sampling when an image is uploaded below its target size (as in these
-    /// fixtures) and stretched by the GPU sampler, whose interpolation
-    /// weights can differ minutely by hardware. Neither should ever move a
-    /// pixel by more than a handful of 8-bit levels, and neither should
-    /// affect more than a thin sliver of pixels along glyph/image edges.
+    /// The renderer anti-aliases vector primitives via `MSAA_SAMPLE_COUNT`x
+    /// MSAA (see that constant's doc comment), so shape edges are
+    /// coverage-weighted blends rather than exact given identical input; the
+    /// sources of legitimate, non-bug pixel drift across GPUs/drivers are:
+    /// (1) the MSAA resolve itself, where different GPUs/drivers can place
+    /// sample points or weight coverage minutely differently along a shape
+    /// edge, (2) fontdue's anti-aliased glyph coverage combined with
+    /// sRGB-aware alpha blending on `Rgba8UnormSrgb`, where different GPUs
+    /// may round the linear<->sRGB conversion by a few least-significant
+    /// bits, and (3) bilinear texture sampling when an image is uploaded
+    /// below its target size (as in these fixtures) and stretched by the GPU
+    /// sampler, whose interpolation weights can differ minutely by hardware.
+    /// None of these should ever move a pixel by more than a handful of
+    /// 8-bit levels, and none should affect more than a thin sliver of
+    /// pixels along shape/glyph/image edges.
     ///
     /// A genuine regression (wrong placement, dropped alpha blending, wrong
     /// composition order) shifts whole regions of the image by large amounts
