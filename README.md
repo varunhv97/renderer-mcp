@@ -9,9 +9,14 @@ Scenes compose vector shapes, local raster and SVG images, and embedded-font
 text into one ordered GPU pass; PNG and keyframed GIF export both work from
 the same scene document. Nodes can be keyframe-animated by opacity, color, or
 position (an additive `translate` offset applied on top of the node's own
-coordinates, uniform across every node kind). Vector shapes (rects, ellipses,
-lines, paths) are anti-aliased via 4x MSAA plus 2x supersampling (the whole
-scene renders at
+coordinates, uniform across every node kind). Rects support an optional
+`corner_radius` for rounded corners, and every shape's `color` field accepts
+either a plain solid RGBA array (unchanged from before) or a gradient object
+(`{"kind": "linear_gradient", ...}` or `{"kind": "radial_gradient", ...}`);
+rects and ellipses render a true per-pixel gradient, while lines, paths, and
+text resolve a gradient fill to one flat color. Vector shapes (rects,
+ellipses, lines, paths) are anti-aliased via 4x MSAA plus 2x supersampling
+(the whole scene renders at
 2x linear resolution and is downsampled with a Lanczos3 filter before
 output), matching the anti-aliased edges text and SVG content already had.
 Image nodes accept local PNG, JPEG, GIF, WebP, or SVG assets; SVG assets are

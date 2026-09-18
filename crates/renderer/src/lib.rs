@@ -8,7 +8,9 @@ use image::{
     Delay, Frame, RgbaImage,
     codecs::gif::{GifEncoder, Repeat},
 };
-use renderer_schema::{Color, KeyframeV1, MAX_CANVAS_DIMENSION, NodeKindV1, SceneV1};
+use renderer_schema::{
+    Color, FillV1, GradientV1, KeyframeV1, MAX_CANVAS_DIMENSION, NodeKindV1, SceneV1,
+};
 use resvg::{tiny_skia, usvg};
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,6 +25,13 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 const ELLIPSE_SEGMENTS: usize = 32;
+/// Arc tessellation resolution for one rounded rect corner (a 90-degree
+/// sweep), reusing `ELLIPSE_SEGMENTS`' angular resolution: `ELLIPSE_SEGMENTS`
+/// segments cover a full 360-degree ellipse, so `ELLIPSE_SEGMENTS / 4`
+/// segments cover one 90-degree corner at the same degrees-per-segment
+/// density (`add_rect`'s tessellation technique otherwise mirrors
+/// `add_ellipse`'s triangle-fan-from-center approach directly).
+const RECT_CORNER_SEGMENTS: usize = ELLIPSE_SEGMENTS / 4;
 /// MSAA sample count used to anti-alias vector primitives (rect/ellipse/
 /// line/path). 4x is the standard, broadly-supported choice for
 /// `Rgba8UnormSrgb` render targets on desktop GPUs (Metal/Vulkan/DX12) and is
@@ -1698,7 +1707,9 @@ struct AnalyticVertex {
     /// Rect: `(half_width, half_height)`. Line: segment start `a`. Unused
     /// (zeroed) for Ellipse.
     param0: [f32; 2],
-    /// Line: segment end `b`. Unused (zeroed) for Rect and Ellipse.
+    /// Rect: `.x` is the corner radius (`.y` unused padding) -- see
+    /// `rect_sdf` in `ANALYTIC_SHADER`. Line: segment end `b`. Unused
+    /// (zeroed) for Ellipse.
     param1: [f32; 2],
     /// Line: `.x` is the half-thickness; `.y` is unused padding. Unused
     /// (zeroed) for Rect and Ellipse.
@@ -1751,17 +1762,106 @@ fn analytic_clip_position(x: f32, y: f32, scene: &SceneV1) -> [f32; 2] {
     ]
 }
 
+/// Resolves the actual RGBA color one vertex at scene-pixel position
+/// `(px, py)` should carry for a shape's `fill`, given that shape's bounding
+/// center and half-extent (half-width/half-height for a `Rect`, `rx`/`ry`
+/// for an `Ellipse`).
+///
+/// For a solid fill every vertex gets the same color -- exactly today's
+/// existing flat-fill behavior, preserved unchanged. For a gradient, each
+/// vertex gets its *own* color computed from its own position, and the GPU
+/// rasterizer linearly interpolates between a triangle's vertex colors
+/// across its interior automatically -- this project's existing flat-color
+/// rendering already relies on this same hardware behavior (every vertex of
+/// one shape simply happens to receive the same color today). That means a
+/// gradient needs no fragment-shader changes in either the default (MSAA,
+/// `Vertex`/`PRIMITIVE_SHADER`) or analytic-AA (`AnalyticVertex`/
+/// `ANALYTIC_SHADER`) pipeline: both call this same function per emitted
+/// vertex and let interpolation do the rest. (Confirmed empirically, not
+/// just assumed: a rect built with deliberately different literal per-corner
+/// colors was rendered and its raw RGBA output showed a smooth blend across
+/// the shape rather than a flat or hard-cut result.)
+///
+/// Linear gradients project `(px, py) - center` onto the unit direction
+/// vector derived from `angle_degrees` (`0` = `+x`; increasing values rotate
+/// clockwise in this schema's y-down scene-pixel space), normalized by the
+/// shape's bounding half-extent projected onto that same direction, then
+/// clamp to `[0, 1]` and mix `from`/`to` by that fraction.
+///
+/// Radial gradients normalize `(px, py)`'s offset from `center` by an
+/// elliptical metric using `half_extent` as the two radii (so the gradient
+/// reaches `edge` exactly at the ellipse inscribed in the shape's bounding
+/// box -- for a `Rect` this means straight edge midpoints reach `edge`
+/// exactly while corners clamp to `edge` slightly before the true corner),
+/// then mix `center`/`edge` by that fraction.
+fn fill_vertex_color(
+    fill: &FillV1,
+    px: f32,
+    py: f32,
+    center: [f32; 2],
+    half_extent: [f32; 2],
+) -> Color {
+    match fill {
+        FillV1::Solid(color) => *color,
+        FillV1::Gradient(GradientV1::LinearGradient {
+            from,
+            to,
+            angle_degrees,
+        }) => {
+            let angle = angle_degrees.to_radians();
+            let direction = [angle.cos(), angle.sin()];
+            let relative = [px - center[0], py - center[1]];
+            let projected = relative[0] * direction[0] + relative[1] * direction[1];
+            let extent = (half_extent[0] * direction[0].abs()
+                + half_extent[1] * direction[1].abs())
+            .max(1e-6);
+            let fraction = ((projected / extent) + 1.0) / 2.0;
+            lerp_color(*from, *to, fraction.clamp(0.0, 1.0))
+        }
+        FillV1::Gradient(GradientV1::RadialGradient {
+            center: stop_center,
+            edge,
+        }) => {
+            let rx = half_extent[0].max(1e-6);
+            let ry = half_extent[1].max(1e-6);
+            let dx = (px - center[0]) / rx;
+            let dy = (py - center[1]) / ry;
+            let fraction = (dx * dx + dy * dy).sqrt();
+            lerp_color(*stop_center, *edge, fraction.clamp(0.0, 1.0))
+        }
+    }
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
 /// Emits an analytic-AA rect: a single quad expanded by `ANALYTIC_AA_MARGIN`
 /// on every side, carrying the *true* (unexpanded) half-extent in `param0`
-/// so `rect_sdf` in `ANALYTIC_SHADER` measures distance to the actual
-/// declared rect boundary.
+/// and the *true* corner radius in `param1.x` so `rect_sdf` in
+/// `ANALYTIC_SHADER` measures distance to the actual declared (and possibly
+/// rounded) rect boundary. Each vertex's color is resolved individually via
+/// `fill_vertex_color`, so a gradient `fill` renders correctly here exactly
+/// as it does in the default (MSAA) pipeline's `add_rect` -- see that
+/// function's sibling doc comment on `fill_vertex_color` above.
+// Every parameter here is a genuinely distinct, independently-meaningful
+// piece of geometry/styling/rendering context (not accidental duplication);
+// bundling them into a params struct for this one internal helper would
+// only add indirection, not clarity.
+#[allow(clippy::too_many_arguments)]
 fn add_rect_analytic(
     vertices: &mut Vec<AnalyticVertex>,
     x: f32,
     y: f32,
     width: f32,
     height: f32,
-    color: Color,
+    corner_radius: f32,
+    fill: &FillV1,
     scene: &SceneV1,
 ) {
     let half_size = [width / 2.0, height / 2.0];
@@ -1769,11 +1869,11 @@ fn add_rect_analytic(
     let margin = ANALYTIC_AA_MARGIN;
     let make = |px: f32, py: f32| AnalyticVertex {
         clip_position: analytic_clip_position(px, py, scene),
-        color,
+        color: fill_vertex_color(fill, px, py, center, half_size),
         shape_kind: ANALYTIC_SHAPE_RECT,
         local: [px - center[0], py - center[1]],
         param0: half_size,
-        param1: [0.0; 2],
+        param1: [corner_radius, 0.0],
         param2: [0.0; 2],
     };
     let a = make(x - margin, y - margin);
@@ -1788,21 +1888,26 @@ fn add_rect_analytic(
 /// `ANALYTIC_AA_MARGIN` (so the rasterizer shades a ring of pixels just
 /// outside the true boundary) while `local` -- and therefore `ellipse_sdf`
 /// in `ANALYTIC_SHADER` -- is always computed against the *true*,
-/// unexpanded `rx`/`ry`.
+/// unexpanded `rx`/`ry`. Each vertex's color is resolved individually via
+/// `fill_vertex_color` (using the *true*, unexpanded `rx`/`ry` as its
+/// half-extent, matching `add_ellipse`), so a gradient `fill` renders
+/// correctly here exactly as it does in the default (MSAA) pipeline.
 fn add_ellipse_analytic(
     vertices: &mut Vec<AnalyticVertex>,
     cx: f32,
     cy: f32,
     rx: f32,
     ry: f32,
-    color: Color,
+    fill: &FillV1,
     scene: &SceneV1,
 ) {
     let geo_rx = rx + ANALYTIC_AA_MARGIN;
     let geo_ry = ry + ANALYTIC_AA_MARGIN;
+    let center = [cx, cy];
+    let half_extent = [rx, ry];
     let make = |px: f32, py: f32| AnalyticVertex {
         clip_position: analytic_clip_position(px, py, scene),
-        color,
+        color: fill_vertex_color(fill, px, py, center, half_extent),
         shape_kind: ANALYTIC_SHAPE_ELLIPSE,
         local: [(px - cx) / rx, (py - cy) / ry],
         param0: [0.0; 2],
@@ -1998,22 +2103,23 @@ fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1,
             y,
             width,
             height,
-            color,
+            corner_radius,
+            fill,
         } => {
             let x = *x + dx;
             let y = *y + dy;
-            add_rect(vertices, x, y, *width, *height, *color, scene);
+            add_rect(vertices, x, y, *width, *height, *corner_radius, fill, scene);
         }
         NodeKindV1::Ellipse {
             cx,
             cy,
             rx,
             ry,
-            color,
+            fill,
         } => {
             let cx = *cx + dx;
             let cy = *cy + dy;
-            add_ellipse(vertices, cx, cy, *rx, *ry, *color, scene);
+            add_ellipse(vertices, cx, cy, *rx, *ry, fill, scene);
         }
         NodeKindV1::Line {
             x1,
@@ -2021,13 +2127,20 @@ fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1,
             x2,
             y2,
             thickness,
-            color,
+            fill,
         } => {
             let start = [*x1 + dx, *y1 + dy];
             let end = [*x2 + dx, *y2 + dy];
-            add_line(vertices, start, end, *thickness, *color, scene);
+            add_line(
+                vertices,
+                start,
+                end,
+                *thickness,
+                fill.resolve_solid(),
+                scene,
+            );
         }
-        NodeKindV1::Path { points, color } => {
+        NodeKindV1::Path { points, fill } => {
             let translated: Vec<_> = points
                 .iter()
                 .map(|point| renderer_schema::PointV1 {
@@ -2035,7 +2148,7 @@ fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1,
                     y: point.y + dy,
                 })
                 .collect();
-            add_path(vertices, &translated, *color, scene);
+            add_path(vertices, &translated, fill.resolve_solid(), scene);
         }
         NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {}
     }
@@ -2069,10 +2182,14 @@ fn composition_plan(
                 y,
                 text,
                 size,
-                color,
+                fill,
             } => {
                 let x = *x + node.translate[0];
                 let y = *y + node.translate[1];
+                // Text does not implement true gradient rendering (see
+                // `FillV1::resolve_solid`'s doc comment); a gradient fill
+                // resolves to a flat representative color here.
+                let color = fill.resolve_solid();
                 validate_text_raster(node.id.as_str(), text, *size, scene)?;
                 let mut cursor_x = x;
                 let mut previous = None;
@@ -2129,7 +2246,7 @@ fn composition_plan(
                         y + (*size - metrics.height as f32 - metrics.ymin as f32),
                         metrics.width as f32,
                         metrics.height as f32,
-                        *color,
+                        color,
                         scene,
                     );
                     plan.commands.push(DrawCommand::Textured {
@@ -2329,10 +2446,14 @@ fn composition_plan_analytic(
                 y,
                 text,
                 size,
-                color,
+                fill,
             } => {
                 let x = *x + node.translate[0];
                 let y = *y + node.translate[1];
+                // Text does not implement true gradient rendering (see
+                // `FillV1::resolve_solid`'s doc comment); a gradient fill
+                // resolves to a flat representative color here.
+                let color = fill.resolve_solid();
                 validate_text_raster(node.id.as_str(), text, *size, scene)?;
                 let mut cursor_x = x;
                 let mut previous = None;
@@ -2386,7 +2507,7 @@ fn composition_plan_analytic(
                         y + (*size - metrics.height as f32 - metrics.ymin as f32),
                         metrics.width as f32,
                         metrics.height as f32,
-                        *color,
+                        color,
                         scene,
                     );
                     plan.commands.push(AnalyticDrawCommand::Textured {
@@ -2478,7 +2599,7 @@ fn composition_plan_analytic(
                     vertices: start..start + 6,
                 });
             }
-            NodeKindV1::Path { points, color } => {
+            NodeKindV1::Path { points, fill } => {
                 let translated: Vec<_> = points
                     .iter()
                     .map(|point| renderer_schema::PointV1 {
@@ -2487,7 +2608,12 @@ fn composition_plan_analytic(
                     })
                     .collect();
                 let start = plan.path_vertices.len() as u32;
-                add_path(&mut plan.path_vertices, &translated, *color, scene);
+                add_path(
+                    &mut plan.path_vertices,
+                    &translated,
+                    fill.resolve_solid(),
+                    scene,
+                );
                 let end = plan.path_vertices.len() as u32;
                 if start != end {
                     if let Some(AnalyticDrawCommand::Path(range)) = plan.commands.last_mut() {
@@ -2502,7 +2628,8 @@ fn composition_plan_analytic(
                 y,
                 width,
                 height,
-                color,
+                corner_radius,
+                fill,
             } => {
                 let x = *x + node.translate[0];
                 let y = *y + node.translate[1];
@@ -2513,7 +2640,8 @@ fn composition_plan_analytic(
                     y,
                     *width,
                     *height,
-                    *color,
+                    *corner_radius,
+                    fill,
                     scene,
                 );
                 push_analytic_range(
@@ -2527,12 +2655,12 @@ fn composition_plan_analytic(
                 cy,
                 rx,
                 ry,
-                color,
+                fill,
             } => {
                 let cx = *cx + node.translate[0];
                 let cy = *cy + node.translate[1];
                 let start = plan.analytic_vertices.len() as u32;
-                add_ellipse_analytic(&mut plan.analytic_vertices, cx, cy, *rx, *ry, *color, scene);
+                add_ellipse_analytic(&mut plan.analytic_vertices, cx, cy, *rx, *ry, fill, scene);
                 push_analytic_range(
                     &mut plan.commands,
                     start,
@@ -2545,7 +2673,7 @@ fn composition_plan_analytic(
                 x2,
                 y2,
                 thickness,
-                color,
+                fill,
             } => {
                 let start_point = [*x1 + node.translate[0], *y1 + node.translate[1]];
                 let end_point = [*x2 + node.translate[0], *y2 + node.translate[1]];
@@ -2555,7 +2683,7 @@ fn composition_plan_analytic(
                     start_point,
                     end_point,
                     *thickness,
-                    *color,
+                    fill.resolve_solid(),
                     scene,
                 );
                 push_analytic_range(
@@ -2867,20 +2995,92 @@ fn rasterize_svg_blocking(
     })
 }
 
+/// Emits a (optionally rounded, optionally gradient-filled) rect for the
+/// default MSAA pipeline. `corner_radius <= 0.0` takes the exact same
+/// 2-triangle quad path this function always used before rounded corners
+/// existed -- byte-identical output to before this feature existed, since
+/// `fill_vertex_color` also returns the plain per-vertex `color` unchanged
+/// for a `FillV1::Solid` fill (see that function's doc comment). This is
+/// verified directly by
+/// `rounded_rect_with_zero_radius_matches_the_original_plain_rect_tessellation`
+/// below.
+///
+/// `corner_radius > 0.0` tessellates properly rather than approximating:
+/// straight edges plus a small triangle-fan arc at each of the 4 corners,
+/// all fanned from the rect's center -- mirroring `add_ellipse`'s
+/// triangle-fan-from-center technique and reusing its angular resolution
+/// via `RECT_CORNER_SEGMENTS` (`ELLIPSE_SEGMENTS / 4`, i.e. the same
+/// degrees-per-segment density for one 90-degree corner as `add_ellipse`
+/// uses for a full 360-degree ellipse). A fan from the center to each
+/// consecutive pair of perimeter points is correct regardless of whether
+/// that pair spans a curved arc segment or a straight edge -- no special
+/// casing is needed for the 4 straight edges, since a single triangle
+/// between two straight-edge endpoints and the center is already exact.
+// See `add_rect_analytic`'s identical justification for this attribute.
+#[allow(clippy::too_many_arguments)]
 fn add_rect(
     vertices: &mut Vec<Vertex>,
     x: f32,
     y: f32,
     width: f32,
     height: f32,
-    color: Color,
+    corner_radius: f32,
+    fill: &FillV1,
     scene: &SceneV1,
 ) {
-    let a = vertex(x, y, color, scene);
-    let b = vertex(x + width, y, color, scene);
-    let c = vertex(x + width, y + height, color, scene);
-    let d = vertex(x, y + height, color, scene);
-    vertices.extend([a, b, c, a, c, d]);
+    let center = [x + width / 2.0, y + height / 2.0];
+    let half_extent = [width / 2.0, height / 2.0];
+    let make = |px: f32, py: f32| {
+        vertex(
+            px,
+            py,
+            fill_vertex_color(fill, px, py, center, half_extent),
+            scene,
+        )
+    };
+    if corner_radius <= 0.0 {
+        let a = make(x, y);
+        let b = make(x + width, y);
+        let c = make(x + width, y + height);
+        let d = make(x, y + height);
+        vertices.extend([a, b, c, a, c, d]);
+        return;
+    }
+    let r = corner_radius;
+    let center_vertex = make(center[0], center[1]);
+    // One (arc_center_x, arc_center_y, start_angle, end_angle) tuple per
+    // corner, in clockwise perimeter order starting at the top-right
+    // corner (this schema's scene-pixel space is y-down, so angle 0 is
+    // `+x` and increasing angle sweeps clockwise on screen).
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let corners = [
+        (x + width - r, y + r, -quarter, 0.0),
+        (x + width - r, y + height - r, 0.0, quarter),
+        (x + r, y + height - r, quarter, std::f32::consts::PI),
+        (
+            x + r,
+            y + r,
+            std::f32::consts::PI,
+            std::f32::consts::PI + quarter,
+        ),
+    ];
+    let mut perimeter = Vec::with_capacity(4 * (RECT_CORNER_SEGMENTS + 1));
+    for (arc_cx, arc_cy, start, end) in corners {
+        for segment in 0..=RECT_CORNER_SEGMENTS {
+            let angle = start + (end - start) * segment as f32 / RECT_CORNER_SEGMENTS as f32;
+            perimeter.push((arc_cx + r * angle.cos(), arc_cy + r * angle.sin()));
+        }
+    }
+    for pair in perimeter.windows(2) {
+        vertices.extend([
+            center_vertex,
+            make(pair[0].0, pair[0].1),
+            make(pair[1].0, pair[1].1),
+        ]);
+    }
+    let first = perimeter[0];
+    let last = *perimeter.last().expect("perimeter is never empty");
+    vertices.extend([center_vertex, make(last.0, last.1), make(first.0, first.1)]);
 }
 
 fn add_ellipse(
@@ -2889,17 +3089,27 @@ fn add_ellipse(
     cy: f32,
     rx: f32,
     ry: f32,
-    color: Color,
+    fill: &FillV1,
     scene: &SceneV1,
 ) {
-    let center = vertex(cx, cy, color, scene);
+    let center = [cx, cy];
+    let half_extent = [rx, ry];
+    let make = |px: f32, py: f32| {
+        vertex(
+            px,
+            py,
+            fill_vertex_color(fill, px, py, center, half_extent),
+            scene,
+        )
+    };
+    let center_vertex = make(cx, cy);
     for index in 0..ELLIPSE_SEGMENTS {
         let start = std::f32::consts::TAU * index as f32 / ELLIPSE_SEGMENTS as f32;
         let end = std::f32::consts::TAU * (index + 1) as f32 / ELLIPSE_SEGMENTS as f32;
         vertices.extend([
-            center,
-            vertex(cx + rx * start.cos(), cy + ry * start.sin(), color, scene),
-            vertex(cx + rx * end.cos(), cy + ry * end.sin(), color, scene),
+            center_vertex,
+            make(cx + rx * start.cos(), cy + ry * start.sin()),
+            make(cx + rx * end.cos(), cy + ry * end.sin()),
         ]);
     }
 }
@@ -3002,11 +3212,11 @@ fn scene_at(scene: &SceneV1, at_ms: u32) -> SceneV1 {
                     )
             })
             .collect();
-        if let (Some(color), Some(value)) = (
-            color_mut(&mut node.kind),
+        if let (Some(fill), Some(value)) = (
+            fill_mut(&mut node.kind),
             interpolate_color(&color_keyframes, at_ms),
         ) {
-            *color = value;
+            fill.set_solid(value);
         }
         let opacity_keyframes: Vec<_> = timeline
             .keyframes
@@ -3019,11 +3229,11 @@ fn scene_at(scene: &SceneV1, at_ms: u32) -> SceneV1 {
                     )
             })
             .collect();
-        if let (Some(color), Some(opacity)) = (
-            color_mut(&mut node.kind),
+        if let (Some(fill), Some(opacity)) = (
+            fill_mut(&mut node.kind),
             interpolate_opacity(&opacity_keyframes, at_ms),
         ) {
-            color[3] *= opacity;
+            fill.multiply_alpha(opacity);
         }
         let translate_keyframes: Vec<_> = timeline
             .keyframes
@@ -3043,25 +3253,25 @@ fn scene_at(scene: &SceneV1, at_ms: u32) -> SceneV1 {
     output
 }
 
-fn color_mut(kind: &mut NodeKindV1) -> Option<&mut Color> {
+fn fill_mut(kind: &mut NodeKindV1) -> Option<&mut FillV1> {
     match kind {
-        NodeKindV1::Rect { color, .. }
-        | NodeKindV1::Ellipse { color, .. }
-        | NodeKindV1::Line { color, .. }
-        | NodeKindV1::Path { color, .. }
-        | NodeKindV1::Text { color, .. } => Some(color),
+        NodeKindV1::Rect { fill, .. }
+        | NodeKindV1::Ellipse { fill, .. }
+        | NodeKindV1::Line { fill, .. }
+        | NodeKindV1::Path { fill, .. }
+        | NodeKindV1::Text { fill, .. } => Some(fill),
         NodeKindV1::Image { .. } => None,
     }
 }
 
 #[cfg(test)]
-fn color_of(kind: &NodeKindV1) -> Option<Color> {
+fn fill_of(kind: &NodeKindV1) -> Option<FillV1> {
     match kind {
-        NodeKindV1::Rect { color, .. }
-        | NodeKindV1::Ellipse { color, .. }
-        | NodeKindV1::Line { color, .. }
-        | NodeKindV1::Path { color, .. }
-        | NodeKindV1::Text { color, .. } => Some(*color),
+        NodeKindV1::Rect { fill, .. }
+        | NodeKindV1::Ellipse { fill, .. }
+        | NodeKindV1::Line { fill, .. }
+        | NodeKindV1::Path { fill, .. }
+        | NodeKindV1::Text { fill, .. } => Some(fill.clone()),
         NodeKindV1::Image { .. } => None,
     }
 }
@@ -3142,8 +3352,9 @@ fn rasterize_text_and_images(
                 y,
                 text,
                 size,
-                color,
+                fill,
             } => {
+                let color = fill.resolve_solid();
                 if text.len() > MAX_TEXT_BYTES {
                     return Err(RenderError::Asset(format!(
                         "text node '{}' exceeds 16 KiB",
@@ -3470,10 +3681,34 @@ fn vs_main(
     return output;
 }
 
-// Axis-aligned box SDF in the rect's local (fragment - center) space.
-fn rect_sdf(local: vec2<f32>, half_size: vec2<f32>) -> f32 {
-    let delta = abs(local) - half_size;
-    return max(delta.x, delta.y);
+// Axis-aligned (optionally rounded) box SDF in the rect's local
+// (fragment - center) space. `radius <= 0.0` (the overwhelmingly common
+// case -- every rect without a `corner_radius`) uses the exact same
+// Chebyshev-distance formula this function always used before rounded
+// corners existed, so a zero-radius rect's rendered output is completely
+// unaffected by this change.
+//
+// `radius > 0.0` uses the standard exact rounded-box SDF (Inigo Quilez's
+// well-known `sdRoundBox`): shrink the box by `radius` on every side, take
+// the Euclidean distance to *that* shrunk box's boundary via
+// `length(max(q, 0)) + min(max(q.x, q.y), 0)`, then subtract `radius` back
+// off to re-expand to the true (rounded) boundary. This -- not the simpler
+// `length(max(q, 0)) - radius` sometimes quoted -- is the correct exact
+// form: the simpler formula is only correct *outside* the box's inscribed
+// cross shape and returns 0 (instead of the true negative/inside distance)
+// for fragments inside that cross but outside the shrunk box, which would
+// wrongly zero out `fs_main`'s coverage ramp near (but not at) a rounded
+// edge's midpoint. Verified by rendering a rounded rect and decoding raw
+// RGBA output: corner pixels are background-colored where a sharp corner
+// would have been shape-colored, confirming this sign/offset convention is
+// actually correct rather than merely plausible-looking.
+fn rect_sdf(local: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+    if (radius <= 0.0) {
+        let delta = abs(local) - half_size;
+        return max(delta.x, delta.y);
+    }
+    let q = abs(local) - half_size + vec2<f32>(radius, radius);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0, 0.0))) - radius;
 }
 
 // Ellipse SDF approximation in "squashed" space: `local` is
@@ -3506,7 +3741,7 @@ fn capsule_sdf(point: vec2<f32>, a: vec2<f32>, b: vec2<f32>, half_thickness: f32
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var d: f32;
     if (input.shape_kind == SHAPE_RECT) {
-        d = rect_sdf(input.local, input.param0);
+        d = rect_sdf(input.local, input.param0, input.param1.x);
     } else if (input.shape_kind == SHAPE_ELLIPSE) {
         d = ellipse_sdf(input.local);
     } else {
@@ -3609,7 +3844,8 @@ mod tests {
                     y: 0.0,
                     width: 10.0,
                     height: 10.0,
-                    color: [1.0; 4],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0; 4]),
                 },
             }],
             timeline: None,
@@ -3638,7 +3874,7 @@ mod tests {
                     cy: 20.0,
                     rx: 5.0,
                     ry: 5.0,
-                    color: [0.0, 1.0, 0.0, 1.0],
+                    fill: FillV1::Solid([0.0, 1.0, 0.0, 1.0]),
                 },
             },
             NodeV1 {
@@ -3650,7 +3886,7 @@ mod tests {
                     x2: 20.0,
                     y2: 20.0,
                     thickness: 2.0,
-                    color: [0.0, 0.0, 1.0, 1.0],
+                    fill: FillV1::Solid([0.0, 0.0, 1.0, 1.0]),
                 },
             },
             NodeV1 {
@@ -3662,7 +3898,7 @@ mod tests {
                         renderer_schema::PointV1 { x: 10.0, y: 0.0 },
                         renderer_schema::PointV1 { x: 0.0, y: 10.0 },
                     ],
-                    color: [1.0; 4],
+                    fill: FillV1::Solid([1.0; 4]),
                 },
             },
             NodeV1 {
@@ -3673,7 +3909,7 @@ mod tests {
                     y: 0.0,
                     text: "t".into(),
                     size: 8.0,
-                    color: [1.0; 4],
+                    fill: FillV1::Solid([1.0; 4]),
                 },
             },
             NodeV1 {
@@ -3684,7 +3920,8 @@ mod tests {
                     y: 1.0,
                     width: 2.0,
                     height: 2.0,
-                    color: [1.0; 4],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0; 4]),
                 },
             },
             NodeV1 {
@@ -3735,8 +3972,8 @@ mod tests {
         });
         let at_middle = scene_at(&scene, 500);
         assert_eq!(
-            color_of(&at_middle.nodes[0].kind),
-            Some([0.5, 0.5, 0.5, 0.5])
+            fill_of(&at_middle.nodes[0].kind),
+            Some(FillV1::Solid([0.5, 0.5, 0.5, 0.5]))
         );
         assert_eq!(interpolate_color(&[], 0), None);
         assert_eq!(interpolate_opacity(&[], 0), None);
@@ -3811,8 +4048,8 @@ mod tests {
         });
         let at_middle = scene_at(&scene, 500);
         assert_eq!(
-            color_of(&at_middle.nodes[0].kind),
-            Some([1.0, 0.0, 0.0, 0.25])
+            fill_of(&at_middle.nodes[0].kind),
+            Some(FillV1::Solid([1.0, 0.0, 0.0, 0.25]))
         );
     }
 
@@ -3850,7 +4087,8 @@ mod tests {
                     y: 4.0,
                     width: 10.0,
                     height: 10.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0, 1.0, 1.0, 1.0]),
                 },
             }],
             timeline: Some(renderer_schema::TimelineV1 {
@@ -3952,7 +4190,7 @@ mod tests {
                         renderer_schema::PointV1 { x: 30.0, y: 10.0 },
                         renderer_schema::PointV1 { x: 10.0, y: 30.0 },
                     ],
-                    color: [1.0, 1.0, 1.0, 1.0],
+                    fill: FillV1::Solid([1.0, 1.0, 1.0, 1.0]),
                 },
             }],
             timeline: Some(renderer_schema::TimelineV1 {
@@ -4059,7 +4297,8 @@ mod tests {
                     y: 4.0,
                     width: 10.0,
                     height: 10.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0, 1.0, 1.0, 1.0]),
                 },
             }],
             timeline: Some(renderer_schema::TimelineV1 {
@@ -4151,7 +4390,7 @@ mod tests {
                 x2: 1.0,
                 y2: 1.0,
                 thickness: 1.0,
-                color: [1.0; 4],
+                fill: FillV1::Solid([1.0; 4]),
             },
         });
         assert_eq!(vertices_for_scene(&scene).0.len(), 6);
@@ -4162,7 +4401,7 @@ mod tests {
                 cy: 0.0,
                 rx: 1.0,
                 ry: 1.0,
-                color: [1.0; 4],
+                fill: FillV1::Solid([1.0; 4]),
             },
             NodeKindV1::Line {
                 x1: 0.0,
@@ -4170,18 +4409,18 @@ mod tests {
                 x2: 1.0,
                 y2: 1.0,
                 thickness: 1.0,
-                color: [1.0; 4],
+                fill: FillV1::Solid([1.0; 4]),
             },
             NodeKindV1::Path {
                 points: vec![renderer_schema::PointV1 { x: 0.0, y: 0.0 }; 3],
-                color: [1.0; 4],
+                fill: FillV1::Solid([1.0; 4]),
             },
             NodeKindV1::Text {
                 x: 0.0,
                 y: 0.0,
                 text: "x".into(),
                 size: 1.0,
-                color: [1.0; 4],
+                fill: FillV1::Solid([1.0; 4]),
             },
             NodeKindV1::Image {
                 x: 0.0,
@@ -4192,8 +4431,8 @@ mod tests {
             },
         ];
         for mut kind in variants {
-            let _ = color_of(&kind);
-            let _ = color_mut(&mut kind);
+            let _ = fill_of(&kind);
+            let _ = fill_mut(&mut kind);
         }
         assert_eq!(
             interpolate(&[(10, 1.0_f32), (20, 2.0)], 0, |a, b, t| a + (b - a) * t),
@@ -4278,7 +4517,7 @@ mod tests {
                     x2: 58.0,
                     y2: 58.0,
                     thickness: 6.0,
-                    color: [0.2, 0.2, 0.2, 1.0],
+                    fill: FillV1::Solid([0.2, 0.2, 0.2, 1.0]),
                 },
             }],
             timeline: None,
@@ -4386,7 +4625,7 @@ mod tests {
                     x2: 58.0,
                     y2: 58.0,
                     thickness: 6.0,
-                    color: [0.2, 0.2, 0.2, 1.0],
+                    fill: FillV1::Solid([0.2, 0.2, 0.2, 1.0]),
                 },
             }],
             timeline: None,
@@ -4810,7 +5049,7 @@ mod tests {
                     y: 1.0,
                     text: "AA".into(),
                     size: 12.0,
-                    color: [1.0; 4],
+                    fill: FillV1::Solid([1.0; 4]),
                 },
             },
             NodeV1 {
@@ -4821,7 +5060,8 @@ mod tests {
                     y: 1.0,
                     width: 2.0,
                     height: 2.0,
-                    color: [1.0; 4],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0; 4]),
                 },
             },
             NodeV1 {
@@ -4875,7 +5115,8 @@ mod tests {
                 y: 1.0,
                 width: 2.0,
                 height: 2.0,
-                color: [1.0; 4],
+                corner_radius: 0.0,
+                fill: FillV1::Solid([1.0; 4]),
             },
         });
         let primitive_plan = composition_plan(
@@ -4939,7 +5180,7 @@ mod tests {
                 y: 0.0,
                 text: "A".into(),
                 size: 2_000.0,
-                color: [1.0; 4],
+                fill: FillV1::Solid([1.0; 4]),
             },
         }];
         assert!(matches!(
@@ -5102,7 +5343,8 @@ mod tests {
                     y: 1.0,
                     width: 4.0,
                     height: 4.0,
-                    color: [1.0, 0.0, 0.0, 1.0],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0, 0.0, 0.0, 1.0]),
                 },
             },
             // Static across every frame: no keyframe targets it.
@@ -5114,7 +5356,7 @@ mod tests {
                     y: 10.0,
                     text: "AB".into(),
                     size: 12.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
+                    fill: FillV1::Solid([1.0, 1.0, 1.0, 1.0]),
                 },
             },
             // Static across every frame: no keyframe targets it.
@@ -5233,7 +5475,8 @@ mod tests {
                     y: 1.0,
                     width: 4.0,
                     height: 4.0,
-                    color: [1.0, 0.0, 0.0, 1.0],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0, 0.0, 0.0, 1.0]),
                 },
             },
             NodeV1 {
@@ -5244,7 +5487,7 @@ mod tests {
                     y: 10.0,
                     text: "AB".into(),
                     size: 12.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
+                    fill: FillV1::Solid([1.0, 1.0, 1.0, 1.0]),
                 },
             },
             NodeV1 {
@@ -5336,7 +5579,8 @@ mod tests {
                         y: 2.0,
                         width: 10.0,
                         height: 10.0,
-                        color: [1.0, 0.0, 0.0, 1.0],
+                        corner_radius: 0.0,
+                        fill: FillV1::Solid([1.0, 0.0, 0.0, 1.0]),
                     },
                 },
                 NodeV1 {
@@ -5347,7 +5591,7 @@ mod tests {
                         cy: 10.0,
                         rx: 6.0,
                         ry: 4.0,
-                        color: [0.0, 1.0, 0.0, 1.0],
+                        fill: FillV1::Solid([0.0, 1.0, 0.0, 1.0]),
                     },
                 },
                 NodeV1 {
@@ -5359,7 +5603,7 @@ mod tests {
                         x2: 40.0,
                         y2: 50.0,
                         thickness: 3.0,
-                        color: [0.0, 0.0, 1.0, 1.0],
+                        fill: FillV1::Solid([0.0, 0.0, 1.0, 1.0]),
                     },
                 },
                 NodeV1 {
@@ -5371,7 +5615,7 @@ mod tests {
                             renderer_schema::PointV1 { x: 60.0, y: 5.0 },
                             renderer_schema::PointV1 { x: 52.0, y: 20.0 },
                         ],
-                        color: [0.5, 0.0, 0.5, 1.0],
+                        fill: FillV1::Solid([0.5, 0.0, 0.5, 1.0]),
                     },
                 },
                 NodeV1 {
@@ -5382,7 +5626,7 @@ mod tests {
                         y: 44.0,
                         text: "Hi".into(),
                         size: 12.0,
-                        color: [0.0, 0.0, 0.0, 1.0],
+                        fill: FillV1::Solid([0.0, 0.0, 0.0, 1.0]),
                     },
                 },
                 NodeV1 {
@@ -5539,7 +5783,8 @@ mod tests {
                         y: 0.0,
                         width: 32.0,
                         height: 32.0,
-                        color: [1.0, 0.0, 0.0, 1.0],
+                        corner_radius: 0.0,
+                        fill: FillV1::Solid([1.0, 0.0, 0.0, 1.0]),
                     },
                 },
                 // Middle: an opaque green path covering the whole canvas --
@@ -5554,7 +5799,7 @@ mod tests {
                             renderer_schema::PointV1 { x: 32.0, y: 32.0 },
                             renderer_schema::PointV1 { x: 0.0, y: 32.0 },
                         ],
-                        color: [0.0, 1.0, 0.0, 1.0],
+                        fill: FillV1::Solid([0.0, 1.0, 0.0, 1.0]),
                     },
                 },
                 // Top: a small opaque blue square -- must occlude the green
@@ -5568,7 +5813,8 @@ mod tests {
                         y: 8.0,
                         width: 8.0,
                         height: 8.0,
-                        color: [0.0, 0.0, 1.0, 1.0],
+                        corner_radius: 0.0,
+                        fill: FillV1::Solid([0.0, 0.0, 1.0, 1.0]),
                     },
                 },
             ],
@@ -5657,7 +5903,7 @@ mod tests {
                     x2: 58.0,
                     y2: 58.0,
                     thickness: 6.0,
-                    color: [0.2, 0.2, 0.2, 1.0],
+                    fill: FillV1::Solid([0.2, 0.2, 0.2, 1.0]),
                 },
             }],
             timeline: None,
@@ -5699,7 +5945,7 @@ mod tests {
                     x2: 60.0,
                     y2: 30.0,
                     thickness: 6.0,
-                    color: [0.2, 0.2, 0.2, 1.0],
+                    fill: FillV1::Solid([0.2, 0.2, 0.2, 1.0]),
                 },
             }],
             timeline: None,
@@ -5956,6 +6202,462 @@ mod tests {
         );
     }
 
+    /// Portable (no-GPU) proof that a zero (or omitted) `corner_radius`
+    /// leaves `add_rect`'s output byte-identical to the plain 2-triangle
+    /// quad it always emitted before rounded corners existed. Reconstructs
+    /// that original tessellation by hand (the same `vertex()` calls in the
+    /// same `[a, b, c, a, c, d]` order `add_rect`'s original implementation
+    /// used) and compares every emitted `Vertex`'s position and color
+    /// field-by-field against `test_scene()`'s zero-radius rect.
+    #[test]
+    fn rounded_rect_with_zero_radius_matches_the_original_plain_rect_tessellation() {
+        let scene = test_scene();
+        let NodeKindV1::Rect {
+            x,
+            y,
+            width,
+            height,
+            corner_radius,
+            fill,
+        } = &scene.nodes[0].kind
+        else {
+            panic!("test_scene()'s only node must be a Rect");
+        };
+        assert_eq!(*corner_radius, 0.0);
+        let color = fill.resolve_solid();
+
+        let (actual, _) = vertices_for_scene(&scene);
+        let a = vertex(*x, *y, color, &scene);
+        let b = vertex(*x + *width, *y, color, &scene);
+        let c = vertex(*x + *width, *y + *height, color, &scene);
+        let d = vertex(*x, *y + *height, color, &scene);
+        let expected = [a, b, c, a, c, d];
+
+        assert_eq!(actual.len(), expected.len());
+        for (index, (found, want)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                found.position, want.position,
+                "vertex {index} position mismatch"
+            );
+            assert_eq!(found.color, want.color, "vertex {index} color mismatch");
+        }
+    }
+
+    /// Portable (no-GPU) proof that a positive `corner_radius` actually
+    /// changes the emitted geometry (more triangles than the flat 2-triangle
+    /// quad, since corners are now tessellated as arcs) rather than being
+    /// silently ignored by the vertex builder.
+    #[test]
+    fn rounded_rect_emits_more_triangles_than_a_plain_rect() {
+        let mut scene = test_scene();
+        let (plain, _) = vertices_for_scene(&scene);
+
+        let NodeKindV1::Rect { corner_radius, .. } = &mut scene.nodes[0].kind else {
+            panic!("test_scene()'s only node must be a Rect");
+        };
+        *corner_radius = 3.0;
+        scene.validate().unwrap();
+        let (rounded, _) = vertices_for_scene(&scene);
+
+        assert_eq!(
+            plain.len(),
+            6,
+            "a plain (zero-radius) rect is always 2 triangles"
+        );
+        assert!(
+            rounded.len() > plain.len(),
+            "expected a rounded rect to tessellate into more triangles ({}) than a plain \
+             rect ({})",
+            rounded.len(),
+            plain.len()
+        );
+    }
+
+    /// GPU pixel-decode proof (default MSAA pipeline) that `corner_radius`
+    /// actually rounds a rect's corners rather than merely not crashing:
+    /// renders the same bounding box twice, once sharp (`corner_radius:
+    /// 0.0`) and once rounded (`corner_radius: 10.0`), and confirms a pixel
+    /// near the bounding box's corner is shape-colored in the sharp render
+    /// but background-colored in the rounded render.
+    #[test]
+    fn rounds_rect_corners_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+
+        fn scene_with_radius(corner_radius: f32) -> SceneV1 {
+            SceneV1 {
+                version: SCENE_VERSION_V1.into(),
+                canvas: CanvasV1 {
+                    width: 40,
+                    height: 40,
+                    background: [1.0, 1.0, 1.0, 1.0],
+                },
+                nodes: vec![NodeV1 {
+                    id: "box".into(),
+                    translate: [0.0, 0.0],
+                    kind: NodeKindV1::Rect {
+                        x: 4.0,
+                        y: 4.0,
+                        width: 32.0,
+                        height: 32.0,
+                        corner_radius,
+                        fill: FillV1::Solid([0.0, 0.0, 0.0, 1.0]),
+                    },
+                }],
+                timeline: None,
+                effect: None,
+            }
+        }
+
+        let width = 40_usize;
+        let pixel_at = |pixels: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let sharp = scene_with_radius(0.0);
+        sharp.validate().unwrap();
+        let (sharp_pixels, sharp_warnings) = renderer.render_rgba(&sharp).unwrap();
+        assert!(sharp_warnings.is_empty());
+
+        let rounded = scene_with_radius(10.0);
+        rounded.validate().unwrap();
+        let (rounded_pixels, rounded_warnings) = renderer.render_rgba(&rounded).unwrap();
+        assert!(rounded_warnings.is_empty());
+
+        // (5, 5) sits just inside the shared 4..36 bounding box, near its
+        // top-left corner: distance to the top-left arc's center (14, 14)
+        // at radius 10 is ~12.7px, i.e. outside the rounded arc but well
+        // inside the sharp box.
+        let background = pixel_at(&sharp_pixels, 0, 0);
+        let sharp_corner = pixel_at(&sharp_pixels, 5, 5);
+        let rounded_corner = pixel_at(&rounded_pixels, 5, 5);
+
+        assert_ne!(
+            sharp_corner, background,
+            "sanity check: a sharp rect's bounding-box corner must be shape-colored"
+        );
+        assert_eq!(
+            rounded_corner, background,
+            "expected a corner_radius: 10.0 rect's corner pixel to be background-colored \
+             (proving the corner is actually rounded away), got {rounded_corner:?} vs. \
+             background {background:?}"
+        );
+    }
+
+    /// Analytic-AA counterpart to `rounds_rect_corners_on_an_available_gpu`:
+    /// same proof, but through `render_rgba_analytic_aa`, confirming the
+    /// analytic pipeline's `rect_sdf`/`param1`-carried radius also actually
+    /// rounds corners rather than silently ignoring `corner_radius`.
+    #[test]
+    fn rounds_rect_corners_under_analytic_aa_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+
+        fn scene_with_radius(corner_radius: f32) -> SceneV1 {
+            SceneV1 {
+                version: SCENE_VERSION_V1.into(),
+                canvas: CanvasV1 {
+                    width: 40,
+                    height: 40,
+                    background: [1.0, 1.0, 1.0, 1.0],
+                },
+                nodes: vec![NodeV1 {
+                    id: "box".into(),
+                    translate: [0.0, 0.0],
+                    kind: NodeKindV1::Rect {
+                        x: 4.0,
+                        y: 4.0,
+                        width: 32.0,
+                        height: 32.0,
+                        corner_radius,
+                        fill: FillV1::Solid([0.0, 0.0, 0.0, 1.0]),
+                    },
+                }],
+                timeline: None,
+                effect: None,
+            }
+        }
+
+        let width = 40_usize;
+        let pixel_at = |pixels: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let sharp = scene_with_radius(0.0);
+        sharp.validate().unwrap();
+        let (sharp_pixels, sharp_warnings) = renderer.render_rgba_analytic_aa(&sharp).unwrap();
+        assert!(sharp_warnings.is_empty());
+
+        let rounded = scene_with_radius(10.0);
+        rounded.validate().unwrap();
+        let (rounded_pixels, rounded_warnings) =
+            renderer.render_rgba_analytic_aa(&rounded).unwrap();
+        assert!(rounded_warnings.is_empty());
+
+        let background = pixel_at(&sharp_pixels, 0, 0);
+        let sharp_corner = pixel_at(&sharp_pixels, 5, 5);
+        let rounded_corner = pixel_at(&rounded_pixels, 5, 5);
+
+        assert_ne!(
+            sharp_corner, background,
+            "sanity check: a sharp rect's bounding-box corner must be shape-colored"
+        );
+        assert_eq!(
+            rounded_corner, background,
+            "expected a corner_radius: 10.0 rect's corner pixel to be background-colored under \
+             analytic AA too, got {rounded_corner:?} vs. background {background:?}"
+        );
+    }
+
+    /// GPU pixel-decode proof (default MSAA pipeline) that a linear gradient
+    /// fill produces real per-pixel interpolation: renders a wide rect with
+    /// a pure-red-to-pure-blue horizontal gradient and confirms pixels near
+    /// the left edge read close to red, pixels near the right edge read
+    /// close to blue, and a pixel at the horizontal midpoint is a genuine
+    /// intermediate blend (neither near-red nor near-blue) -- not one flat
+    /// color and not a hard cut partway across.
+    #[test]
+    fn linear_gradient_fill_interpolates_between_stops_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 16,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "gradient".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 16.0,
+                    corner_radius: 0.0,
+                    fill: FillV1::Gradient(GradientV1::LinearGradient {
+                        from: [1.0, 0.0, 0.0, 1.0],
+                        to: [0.0, 0.0, 1.0, 1.0],
+                        angle_degrees: 0.0,
+                    }),
+                },
+            }],
+            timeline: None,
+            effect: None,
+        };
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer.render_rgba(&scene).unwrap();
+        assert!(warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let near_left = pixel_at(1, 8);
+        let near_right = pixel_at(62, 8);
+        let middle = pixel_at(32, 8);
+
+        assert!(
+            near_left[0] > 180 && near_left[2] < 80,
+            "expected the pixel near the gradient's `from` edge to read close to pure red, \
+             got {near_left:?}"
+        );
+        assert!(
+            near_right[2] > 180 && near_right[0] < 80,
+            "expected the pixel near the gradient's `to` edge to read close to pure blue, \
+             got {near_right:?}"
+        );
+        assert!(
+            middle[0] > 40 && middle[0] < 215 && middle[2] > 40 && middle[2] < 215,
+            "expected the midpoint pixel to be a genuine intermediate red/blue blend (neither \
+             near-red nor near-blue), got {middle:?}"
+        );
+    }
+
+    /// Analytic-AA counterpart to
+    /// `linear_gradient_fill_interpolates_between_stops_on_an_available_gpu`:
+    /// same scene and same proof, but through `render_rgba_analytic_aa`,
+    /// confirming `add_rect_analytic` also resolves each vertex's color via
+    /// `fill_vertex_color` rather than silently collapsing a gradient `fill`
+    /// to one flat color.
+    #[test]
+    fn linear_gradient_fill_interpolates_under_analytic_aa_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 16,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "gradient".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 16.0,
+                    corner_radius: 0.0,
+                    fill: FillV1::Gradient(GradientV1::LinearGradient {
+                        from: [1.0, 0.0, 0.0, 1.0],
+                        to: [0.0, 0.0, 1.0, 1.0],
+                        angle_degrees: 0.0,
+                    }),
+                },
+            }],
+            timeline: None,
+            effect: None,
+        };
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer.render_rgba_analytic_aa(&scene).unwrap();
+        assert!(warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let near_left = pixel_at(1, 8);
+        let near_right = pixel_at(62, 8);
+        let middle = pixel_at(32, 8);
+
+        assert!(
+            near_left[0] > 180 && near_left[2] < 80,
+            "expected the pixel near the gradient's `from` edge to read close to pure red under \
+             analytic AA, got {near_left:?}"
+        );
+        assert!(
+            near_right[2] > 180 && near_right[0] < 80,
+            "expected the pixel near the gradient's `to` edge to read close to pure blue under \
+             analytic AA, got {near_right:?}"
+        );
+        assert!(
+            middle[0] > 40 && middle[0] < 215 && middle[2] > 40 && middle[2] < 215,
+            "expected the midpoint pixel to be a genuine intermediate red/blue blend under \
+             analytic AA, got {middle:?}"
+        );
+    }
+
+    /// GPU pixel-decode proof that a radial gradient on an `Ellipse` also
+    /// interpolates for real: `center` at the ellipse's middle, `edge` at
+    /// its boundary, and a genuine intermediate blend partway out.
+    #[test]
+    fn radial_gradient_fill_interpolates_between_stops_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 40,
+                height: 40,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "gradient".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Ellipse {
+                    cx: 20.0,
+                    cy: 20.0,
+                    rx: 18.0,
+                    ry: 18.0,
+                    fill: FillV1::Gradient(GradientV1::RadialGradient {
+                        center: [1.0, 0.0, 0.0, 1.0],
+                        edge: [0.0, 0.0, 1.0, 1.0],
+                    }),
+                },
+            }],
+            timeline: None,
+            effect: None,
+        };
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer.render_rgba(&scene).unwrap();
+        assert!(warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let at_center = pixel_at(20, 20);
+        let near_edge = pixel_at(20, 3);
+        let partway = pixel_at(20, 11);
+
+        assert!(
+            at_center[0] > 180 && at_center[2] < 80,
+            "expected the ellipse's center pixel to read close to the radial gradient's \
+             `center` color (pure red), got {at_center:?}"
+        );
+        assert!(
+            near_edge[2] > 180 && near_edge[0] < 80,
+            "expected a pixel near the ellipse's boundary to read close to the radial \
+             gradient's `edge` color (pure blue), got {near_edge:?}"
+        );
+        assert!(
+            partway[0] > 40 && partway[0] < 215 && partway[2] > 40 && partway[2] < 215,
+            "expected a pixel partway between the ellipse's center and edge to be a genuine \
+             intermediate blend, got {partway:?}"
+        );
+    }
+
     fn test_scene() -> SceneV1 {
         SceneV1 {
             version: SCENE_VERSION_V1.into(),
@@ -5972,7 +6674,8 @@ mod tests {
                     y: 1.0,
                     width: 10.0,
                     height: 10.0,
-                    color: [1.0, 0.0, 0.0, 1.0],
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0, 0.0, 0.0, 1.0]),
                 },
             }],
             timeline: None,
