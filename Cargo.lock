@@ -1232,6 +1232,7 @@ dependencies = [
  "anyhow",
  "clap",
  "image",
+ "renderer-core",
  "renderer-daemon",
  "renderer-schema",
  "renderer-terminal",

@@ -30,6 +30,13 @@ enum Command {
         input: PathBuf,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Use the experimental analytic (signed-distance-field) anti-
+        /// aliasing pipeline instead of the default MSAA+supersampling one,
+        /// for side-by-side quality/performance comparison. A separate,
+        /// additive pipeline -- see `renderer_core::GpuRenderer`'s
+        /// `_analytic_aa` methods -- not used by any other command.
+        #[arg(long)]
+        experimental_analytic_aa: bool,
     },
     /// Inspect image dimensions and SHA-256 without opening a browser.
     Inspect {
@@ -177,7 +184,11 @@ fn main() {
 
 fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Render { input, output } => render_direct(input, output),
+        Command::Render {
+            input,
+            output,
+            experimental_analytic_aa,
+        } => render_direct(input, output, experimental_analytic_aa),
         Command::Inspect { input } => inspect(input),
         Command::Daemon {
             command: DaemonCommand::Serve { endpoint },
@@ -235,15 +246,34 @@ fn error_code(error: &anyhow::Error) -> String {
     }
 }
 
-fn render_direct(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
+fn render_direct(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    experimental_analytic_aa: bool,
+) -> Result<()> {
     let scene = read_json::<SceneV1>(&input)?;
     let output = output.unwrap_or_else(|| PathBuf::from(".renderer/output/render.png"));
-    let daemon = renderer_daemon::RendererDaemon::new()?;
     let asset_root = asset_root_for(&input);
-    let rendered = if output.extension().and_then(|extension| extension.to_str()) == Some("gif") {
-        daemon.render_gif_inline_with_asset_root(&scene, &output, &asset_root)?
+    let is_gif = output.extension().and_then(|extension| extension.to_str()) == Some("gif");
+    let rendered = if experimental_analytic_aa {
+        // Bypasses `RendererDaemon` entirely: the analytic-AA pipeline is
+        // additive to `renderer_core::GpuRenderer` and has no daemon-level
+        // wrapper (and doesn't need one -- this flag exists purely for
+        // local, one-shot quality/performance comparison against the
+        // default path, not as a supported named-scene/daemon capability).
+        let renderer = renderer_core::GpuRenderer::new()?;
+        if is_gif {
+            renderer.render_gif_with_asset_root_analytic_aa(&scene, &output, &asset_root)?
+        } else {
+            renderer.render_png_with_asset_root_analytic_aa(&scene, &output, &asset_root)?
+        }
     } else {
-        daemon.render_inline_with_asset_root(&scene, &output, &asset_root)?
+        let daemon = renderer_daemon::RendererDaemon::new()?;
+        if is_gif {
+            daemon.render_gif_inline_with_asset_root(&scene, &output, &asset_root)?
+        } else {
+            daemon.render_inline_with_asset_root(&scene, &output, &asset_root)?
+        }
     };
     print_json(render_metadata(output, rendered.into()))
 }

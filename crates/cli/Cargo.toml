@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 image.workspace = true
+renderer-core = { path = "../renderer" }
 renderer-daemon = { path = "../daemon" }
 renderer-schema = { path = "../schema" }
 renderer-terminal = { path = "../terminal" }

@@ -15,6 +15,22 @@ Image nodes accept local PNG, JPEG, GIF, WebP, or SVG assets; SVG assets are
 rasterized directly at each node's declared size rather than decoded and
 rescaled.
 
+An experimental, opt-in analytic (signed-distance-field) anti-aliasing
+pipeline is also available for vector shapes, as a shadow-mode alternative to
+the default MSAA+supersampling path — a completely separate, additive set of
+pipelines/shaders that the default path never touches. Compute a per-fragment
+exact distance to each shape's true boundary instead of sampling/averaging;
+measured more accurate against numeric ground-truth pixel coverage than
+MSAA+supersampling on this project's own test scenes. Try it with:
+
+```sh
+cargo run -p renderer-cli -- render --input examples/basic.scene.json --output out.png --experimental-analytic-aa
+```
+
+and compare the result against a normal `render` (no flag) of the same
+input; `.gif` output works too. Not currently wired into the daemon, named
+scenes, or MCP — CLI-only, for local comparison.
+
 ## Development
 
 ```sh
