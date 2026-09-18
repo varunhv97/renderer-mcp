@@ -839,18 +839,31 @@ mod show {
 
     /// Simulated animation for Kitty-protocol terminals without the
     /// animation extension (Ghostty, cmux): loop transmitting each frame as
-    /// a plain static image reusing image id 1 (so each transmission
-    /// replaces the last), sleeping for its delay in between, until
-    /// `loops` is exhausted or the process is killed.
+    /// a plain static image reusing image id 1, sleeping for its delay in
+    /// between, until `loops` is exhausted or the process is killed.
+    ///
+    /// `a=T` (transmit and display) creates a new on-screen placement and,
+    /// by default, advances the cursor past it -- so naively repeating it
+    /// every frame stacks a new placement below the last one each time,
+    /// producing a cascade of images scrolling down the screen instead of
+    /// one frame updating in place. `C=1` tells the terminal not to move
+    /// the cursor after displaying, and deleting image id 1's placement
+    /// before each redraw (`a=d,d=i,i=1`) removes the previous frame first,
+    /// so every frame lands at the same fixed position.
     fn show_kitty_simulated_animation(
         sink: &mut dyn Write,
         frames: &[(Vec<u8>, u32)],
         loops: Option<u32>,
     ) -> std::io::Result<()> {
         let mut played = 0u32;
+        let mut first_frame = true;
         loop {
             for (png, delay) in frames {
-                sink.write_all(&kitty_transmit("a=T,f=100,i=1,q=2", png))?;
+                if !first_frame {
+                    sink.write_all(&kitty_escape("a=d,d=i,i=1"))?;
+                }
+                first_frame = false;
+                sink.write_all(&kitty_transmit("a=T,f=100,i=1,q=2,C=1", png))?;
                 sink.flush()?;
                 std::thread::sleep(Duration::from_millis(u64::from(*delay)));
             }

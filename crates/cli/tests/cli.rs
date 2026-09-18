@@ -648,7 +648,13 @@ fn show_simulates_kitty_animation_when_the_terminal_lacks_the_extension() {
 
     let written = std::fs::read(&tty_path).unwrap();
     let text = String::from_utf8(written).unwrap();
-    assert_eq!(text.matches("\x1b_Ga=T,f=100,i=1,q=2;").count(), 2);
+    // `C=1` (don't move the cursor) on every frame, and a delete of the
+    // previous placement before every frame but the first, are what keep
+    // simulated animation redrawing in place instead of cascading a new
+    // placement down the screen each frame -- the exact bug this test
+    // guards against.
+    assert_eq!(text.matches("\x1b_Ga=T,f=100,i=1,q=2,C=1;").count(), 2);
+    assert_eq!(text.matches("\x1b_Ga=d,d=i,i=1\x1b\\").count(), 1);
     assert!(!text.contains("a=a,i=1"));
 }
 
