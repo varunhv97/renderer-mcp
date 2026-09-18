@@ -52,7 +52,7 @@ fn respond(
             "serverInfo": { "name": "renderer-mcp", "version": env!("CARGO_PKG_VERSION") }
         })),
         Some("tools/list") => Ok(
-            serde_json::json!({ "tools": [render_tool(), named_scene_tool("create_scene"), named_scene_tool("get_scene"), named_scene_tool("replace_scene"), named_scene_tool("patch_scene"), named_scene_tool("render_named_scene"), named_scene_tool("export_named_gif"), named_scene_tool("inspect_image"), named_scene_tool("destroy_scene")] }),
+            serde_json::json!({ "tools": [render_tool(), named_scene_tool("create_scene"), named_scene_tool("get_scene"), named_scene_tool("replace_scene"), named_scene_tool("patch_scene"), named_scene_tool("render_named_scene"), named_scene_tool("export_named_gif"), named_scene_tool("inspect_image"), named_scene_tool("destroy_scene"), show_image_tool()] }),
         ),
         Some("tools/call") => call_tool(request, daemon),
         _ => Err("method not found".into()),
@@ -154,6 +154,48 @@ fn render_tool() -> serde_json::Value {
             "properties": {
                 "scene": scene_schema(),
                 "output_path": { "type": "string", "description": "Optional local destination path for the rendered PNG; must use a .png extension. Defaults to a path under .renderer/output/ when omitted." }
+            }
+        }
+    })
+}
+
+/// Schema for `show_image`, the MCP counterpart to the CLI's `renderer show`
+/// subcommand -- both are thin wrappers around the shared
+/// `renderer_terminal` crate, per this project's "CLI and MCP expose the
+/// same capabilities" principle. Parameters mirror `renderer show`'s flags
+/// one-for-one.
+fn show_image_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "show_image",
+        "description": "Display a local PNG or GIF inline in the caller's own terminal -- the same mechanism as the CLI's `renderer show <path>`. When running inside cmux (detected via $CMUX_SOCKET_PATH), the image opens in cmux's native file-preview panel instead of being drawn into the terminal grid; otherwise this detects a Kitty-graphics-protocol terminal (Kitty, Ghostty, cmux, WezTerm), iTerm2, or falls back to an ANSI true-color half-block rendering. This tool returns only a text summary of what happened (status and protocol used) -- unlike render_scene/render_named_scene, no image content is returned, because the whole point of this tool is that the image is already visible to the user through the terminal/cmux mechanism, not base64-encoded back to the caller.",
+        "inputSchema": {
+            "type": "object",
+            "required": [],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Local filesystem path to a PNG or GIF to display. Required unless `clear` is true, in which case it is ignored."
+                },
+                "protocol": {
+                    "type": "string",
+                    "enum": ["auto", "kitty", "iterm2", "ansi"],
+                    "default": "auto",
+                    "description": "Which terminal graphics protocol to use. \"auto\" (the default) detects the caller's terminal from environment variables and picks, in order: the Kitty graphics protocol (Kitty, Ghostty, cmux, or WezTerm), iTerm2's OSC 1337 inline-image protocol, or an ANSI true-color half-block fallback that works in any terminal. \"kitty\" forces the Kitty graphics protocol (with native terminal-driven animation for Kitty/WezTerm, or a simulated frame-by-frame redraw for Ghostty/cmux, which lack that extension). \"iterm2\" forces iTerm2's protocol, which decodes and loops an animated GIF itself. \"ansi\" forces the half-block fallback, simulating GIF animation with its own redraw loop. Ignored whenever cmux's native file-preview panel is used instead (see the top-level description) -- cmux always uses its own panel regardless of this value."
+                },
+                "tty": {
+                    "type": "string",
+                    "description": "Write escape sequences to this device file (e.g. \"/dev/ttys008\") instead of discovering a terminal automatically. Mainly useful for targeting a specific terminal session other than the one this MCP server's own process is attached to."
+                },
+                "clear": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Send only a delete/clear command and stop, instead of displaying an image: a Kitty delete-all-images command against the resolved terminal target, or, under cmux, a close of the most recently opened preview surface. When true, `path` is not required."
+                },
+                "loops": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Number of times to loop an animated GIF's simulated or native playback. 0 or omitted means loop forever, matching normal GIF playback. Has no effect on a static image or when `clear` is true."
+                }
             }
         }
     })
@@ -576,6 +618,9 @@ fn call_tool(
         .and_then(serde_json::Value::as_str)
         .ok_or("tools/call needs a name")?;
     let arguments = params.get("arguments").cloned().unwrap_or_default();
+    if name == "show_image" {
+        return call_show_image_tool(&arguments);
+    }
     if name != "render_scene" {
         return call_named_scene_tool(name, &arguments);
     }
@@ -678,6 +723,65 @@ fn call_named_scene_tool(
             serde_json::json!({ "content": [{ "type": "text", "text": serde_json::to_string(&result).map_err(|error| error.to_string())? }] }),
         ),
     }
+}
+
+/// Handler for `show_image`, calling straight into the shared
+/// `renderer_terminal` crate -- the same `renderer_terminal::run` the CLI's
+/// `renderer show` subcommand calls, so the two surfaces stay in lockstep.
+/// Unlike the CLI's structured `{"code","message"}` error convention, this
+/// crate's `tools/call` handlers just return `Result<_, String>` (see
+/// `call_named_scene_tool` above for the existing pattern this follows), so
+/// a `TerminalError` is flattened to its `Display` text.
+fn call_show_image_tool(arguments: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let clear = arguments
+        .get("clear")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let path = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    if path.is_none() && !clear {
+        return Err("path is required unless clear is true".into());
+    }
+    let protocol = arguments
+        .get("protocol")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let tty = arguments
+        .get("tty")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let loops = match arguments.get("loops") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|count| u32::try_from(count).ok())
+                .ok_or("loops must be a non-negative integer that fits in 32 bits")?,
+        ),
+    };
+
+    let outcome = renderer_terminal::run(renderer_terminal::ShowRequest {
+        path,
+        tty,
+        protocol,
+        clear,
+        loops,
+    })
+    .map_err(|error| error.to_string())?;
+
+    let mut summary = serde_json::json!({ "status": outcome.status });
+    if let Some(protocol) = outcome.protocol {
+        summary["protocol"] = serde_json::Value::String(protocol);
+    }
+    if let Some(path) = outcome.path {
+        summary["path"] = serde_json::Value::String(path.to_string_lossy().into_owned());
+    }
+    if let Some(message) = outcome.message {
+        summary["message"] = serde_json::Value::String(message);
+    }
+    Ok(serde_json::json!({ "content": [{ "type": "text", "text": summary.to_string() }] }))
 }
 
 fn expected_revision(arguments: &serde_json::Value) -> Result<Option<u64>, String> {
