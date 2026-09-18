@@ -198,6 +198,14 @@ impl GpuRenderer {
             (u64::from(timeline.duration_ms) * u64::from(timeline.fps)).div_ceil(1_000) as u32;
         let fps = u32::from(timeline.fps);
         let mut warnings = Vec::new();
+        // Created once, outside the frame loop, and shared (by `&mut`) across
+        // every frame's composition below: this is what lets a static
+        // asset -- one referenced identically by several/all frames, e.g. an
+        // unanimated background or logo image, or any glyph in an
+        // unanimated text node -- get decoded/rasterized once for the whole
+        // GIF export instead of once per frame. See `AssetCache`'s doc
+        // comment for the full rationale.
+        let mut cache = AssetCache::default();
         {
             let mut encoder =
                 GifEncoder::new(File::create(output).map_err(RenderError::OutputDirectory)?);
@@ -207,8 +215,9 @@ impl GpuRenderer {
             for frame_index in 0..frame_count {
                 let at_ms = frame_index * 1_000 / fps;
                 let animated = scene_at(scene, at_ms);
+                animated.validate()?;
                 let (pixels, frame_warnings) =
-                    self.render_rgba_with_asset_root(&animated, asset_root)?;
+                    self.render_composed_rgba_with_cache(&animated, asset_root, &mut cache)?;
                 warnings.extend(frame_warnings);
                 let image = RgbaImage::from_raw(scene.canvas.width, scene.canvas.height, pixels)
                     .expect("validated dimensions match readback length");
@@ -254,7 +263,27 @@ impl GpuRenderer {
         scene: &SceneV1,
         asset_root: &Path,
     ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
-        let plan = composition_plan(scene, asset_root, &self.font)?;
+        // A fresh, single-use `AssetCache` per call: every key this call
+        // touches is necessarily a first (and only) use, so behavior here is
+        // byte-identical to before `AssetCache` existed -- see `AssetCache`'s
+        // doc comment.
+        let mut cache = AssetCache::default();
+        self.render_composed_rgba_with_cache(scene, asset_root, &mut cache)
+    }
+
+    /// Same as [`Self::render_composed_rgba`], but takes the decode/
+    /// rasterize cache by `&mut` reference instead of creating one, so a
+    /// caller (namely `render_gif_with_asset_root`) can share one
+    /// `AssetCache` across many calls -- e.g. once per GIF frame -- so a
+    /// given asset is decoded/rasterized at most once across all of them.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn render_composed_rgba_with_cache(
+        &self,
+        scene: &SceneV1,
+        asset_root: &Path,
+        cache: &mut AssetCache,
+    ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        let plan = composition_plan(scene, asset_root, &self.font, cache)?;
         let width = scene.canvas.width;
         let height = scene.canvas.height;
         // When a scene-level effect is present, nodes are composited into
@@ -754,6 +783,77 @@ struct CompositionPlan {
     textures: Vec<TextureData>,
 }
 
+/// Decoded image pixel data, cached by exactly the key `composition_plan`
+/// already used for its function-local `image_textures` dedup map:
+/// `(source, upload_width, upload_height)`. Storing the final processed
+/// buffer (post raster-decode/SVG-rasterize *and* post-resize) means a cache
+/// hit needs no further work beyond a clone into that frame's own
+/// `CompositionPlan.textures`.
+struct DecodedImage {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+/// Rasterized glyph pixel data (already alpha-expanded to RGBA, matching
+/// what used to be pushed straight into `TextureData::pixels`), cached by
+/// exactly the key `composition_plan` already used for its function-local
+/// `glyph_textures` dedup map: `(char, size_bits)`.
+struct DecodedGlyph {
+    metrics: fontdue::Metrics,
+    pixels: Vec<u8>,
+}
+
+/// Cross-call cache of the *expensive* CPU-side work `composition_plan`
+/// performs per image/glyph -- disk read + `image`-crate decode or
+/// `resvg`/`usvg`/`tiny-skia` SVG parse+rasterize for images, `fontdue`
+/// rasterization for glyphs -- keyed identically to how `composition_plan`
+/// already deduped repeats *within* one call before this cache existed.
+///
+/// `render_composed_rgba` (single-shot renders, including every `render_png`
+/// / `render_rgba` call) creates a fresh, single-use `AssetCache` per call,
+/// so its behavior -- and therefore the golden-image tests -- is unaffected:
+/// every key is a "miss" exactly once, exactly as when the maps were
+/// function-local.
+///
+/// `render_gif_with_asset_root` instead creates ONE `AssetCache` before its
+/// per-frame loop and passes it by `&mut` reference into every frame's
+/// `composition_plan` call, so a given `(source, width, height)` or `(char,
+/// size_bits)` is decoded/rasterized at most once across the whole GIF
+/// export, no matter how many frames reference it -- static backgrounds,
+/// logos, and labels included.
+///
+/// This intentionally caches only the decoded *pixel data*, not GPU texture
+/// indices: each `composition_plan` call still pushes its own fresh entry
+/// (and index) into that frame's `CompositionPlan.textures` even on a cache
+/// hit, since GPU upload (`render_composed_rgba`'s `create_texture` /
+/// `write_texture` calls) still happens per frame -- see the module-level
+/// task notes on why that upload step is out of scope here.
+#[derive(Default)]
+struct AssetCache {
+    images: HashMap<(String, u32, u32), DecodedImage>,
+    glyphs: HashMap<(char, u32), DecodedGlyph>,
+    /// Test-only instrumentation: counts actual cache-miss decodes/
+    /// rasterizations (not lookups), so tests can assert a cache shared
+    /// across N `composition_plan` calls performs the expensive work exactly
+    /// once instead of N times. Never read outside `#[cfg(test)]` code.
+    #[cfg(test)]
+    image_decodes: usize,
+    #[cfg(test)]
+    glyph_rasterizations: usize,
+}
+
+#[cfg(test)]
+impl AssetCache {
+    fn image_decode_count(&self) -> usize {
+        self.image_decodes
+    }
+
+    fn glyph_rasterization_count(&self) -> usize {
+        self.glyph_rasterizations
+    }
+}
+
 impl Vertex {
     const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
         wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
@@ -816,6 +916,7 @@ fn composition_plan(
     scene: &SceneV1,
     asset_root: &Path,
     font: &Font,
+    cache: &mut AssetCache,
 ) -> Result<CompositionPlan, RenderError> {
     let mut plan = CompositionPlan {
         primitive_vertices: Vec::new(),
@@ -823,6 +924,12 @@ fn composition_plan(
         commands: Vec::new(),
         textures: Vec::new(),
     };
+    // These two maps stay function-local (unlike `cache`, which is shared
+    // across calls): they dedup repeated references to the same asset
+    // *within this one call* to a single `plan.textures` entry/index, so a
+    // glyph or image referenced twice in one frame still only gets pushed
+    // into that frame's `CompositionPlan.textures` once -- exactly the
+    // within-call behavior this file had before `AssetCache` existed.
     let mut image_textures = HashMap::new();
     let mut glyph_textures = HashMap::new();
     let mut texture_pixels = 0_u64;
@@ -846,26 +953,40 @@ fn composition_plan(
                     let (texture_index, metrics) = if let Some(value) = glyph_textures.get(&key) {
                         *value
                     } else {
-                        let (metrics, bitmap) = font.rasterize(character, *size);
-                        if metrics.width == 0 || metrics.height == 0 {
-                            cursor_x += metrics.advance_width;
-                            previous = Some(character);
-                            continue;
-                        }
+                        // Rasterize only on a cache miss: `cache.glyphs`
+                        // never holds a zero-size entry (see the `continue`
+                        // below), so a hit here always has real pixel data.
+                        let decoded = match cache.glyphs.entry(key) {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let (metrics, bitmap) = font.rasterize(character, *size);
+                                if metrics.width == 0 || metrics.height == 0 {
+                                    cursor_x += metrics.advance_width;
+                                    previous = Some(character);
+                                    continue;
+                                }
+                                let pixels = bitmap
+                                    .into_iter()
+                                    .flat_map(|alpha| [255, 255, 255, alpha])
+                                    .collect();
+                                #[cfg(test)]
+                                {
+                                    cache.glyph_rasterizations += 1;
+                                }
+                                entry.insert(DecodedGlyph { metrics, pixels })
+                            }
+                        };
+                        let metrics = decoded.metrics;
                         texture_pixels = reserve_composition_pixels(
                             texture_pixels,
                             (metrics.width * metrics.height) as u64,
                         )?;
-                        let pixels = bitmap
-                            .into_iter()
-                            .flat_map(|alpha| [255, 255, 255, alpha])
-                            .collect();
                         let index = plan.textures.len();
                         plan.textures.push(TextureData {
                             label: format!("glyph-{}-{}", character as u32, size),
                             width: metrics.width as u32,
                             height: metrics.height as u32,
-                            pixels,
+                            pixels: decoded.pixels.clone(),
                         });
                         glyph_textures.insert(key, (index, metrics));
                         (index, metrics)
@@ -904,40 +1025,57 @@ fn composition_plan(
                 let texture_index = if let Some(index) = image_textures.get(&cache_key) {
                     *index
                 } else {
-                    // For raster sources this returns the native-resolution
-                    // decode, resized below; for SVG sources `load_image`
-                    // rasterizes directly at `upload_width`x`upload_height`
-                    // (already equal to `upload_dimensions(..)`'s result, so
-                    // the resize below becomes a no-op for SVG).
-                    let image = load_image(asset_root, source, upload_width, upload_height)?;
-                    let (upload_width, upload_height) = upload_dimensions(
-                        image.width(),
-                        image.height(),
-                        target_width,
-                        target_height,
-                    );
-                    let image = if image.width() == upload_width && image.height() == upload_height
-                    {
-                        image
-                    } else {
-                        image::DynamicImage::ImageRgba8(image)
-                            .resize_exact(
-                                upload_width,
-                                upload_height,
-                                image::imageops::FilterType::Triangle,
-                            )
-                            .to_rgba8()
+                    // Decode/rasterize only on a cache miss.
+                    let decoded = match cache.images.entry(cache_key.clone()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            // For raster sources this returns the
+                            // native-resolution decode, resized below; for
+                            // SVG sources `load_image` rasterizes directly
+                            // at `upload_width`x`upload_height` (already
+                            // equal to `upload_dimensions(..)`'s result, so
+                            // the resize below becomes a no-op for SVG).
+                            let image =
+                                load_image(asset_root, source, upload_width, upload_height)?;
+                            let (final_width, final_height) = upload_dimensions(
+                                image.width(),
+                                image.height(),
+                                target_width,
+                                target_height,
+                            );
+                            let image =
+                                if image.width() == final_width && image.height() == final_height {
+                                    image
+                                } else {
+                                    image::DynamicImage::ImageRgba8(image)
+                                        .resize_exact(
+                                            final_width,
+                                            final_height,
+                                            image::imageops::FilterType::Triangle,
+                                        )
+                                        .to_rgba8()
+                                };
+                            #[cfg(test)]
+                            {
+                                cache.image_decodes += 1;
+                            }
+                            entry.insert(DecodedImage {
+                                width: image.width(),
+                                height: image.height(),
+                                pixels: image.into_raw(),
+                            })
+                        }
                     };
                     texture_pixels = reserve_composition_pixels(
                         texture_pixels,
-                        u64::from(image.width()) * u64::from(image.height()),
+                        u64::from(decoded.width) * u64::from(decoded.height),
                     )?;
                     let index = plan.textures.len();
                     plan.textures.push(TextureData {
                         label: format!("image-{source}"),
-                        width: image.width(),
-                        height: image.height(),
-                        pixels: image.into_raw(),
+                        width: decoded.width,
+                        height: decoded.height,
+                        pixels: decoded.pixels.clone(),
                     });
                     image_textures.insert(cache_key, index);
                     index
@@ -2524,7 +2662,8 @@ mod tests {
         rasterize_text_and_images(&mut pixels, &scene, directory.path(), &font).unwrap();
         assert!(pixels.iter().any(|value| *value != 0));
 
-        let plan = composition_plan(&scene, directory.path(), &font).unwrap();
+        let plan =
+            composition_plan(&scene, directory.path(), &font, &mut AssetCache::default()).unwrap();
         assert_eq!(plan.commands.len(), 5);
         assert_eq!(plan.textures.len(), 2);
         assert!(matches!(&plan.commands[0], DrawCommand::Textured { .. }));
@@ -2544,7 +2683,13 @@ mod tests {
                 color: [1.0; 4],
             },
         });
-        let primitive_plan = composition_plan(&primitives, directory.path(), &font).unwrap();
+        let primitive_plan = composition_plan(
+            &primitives,
+            directory.path(),
+            &font,
+            &mut AssetCache::default(),
+        )
+        .unwrap();
         assert_eq!(primitive_plan.commands.len(), 1);
         assert!(matches!(
             &primitive_plan.commands[0],
@@ -2725,6 +2870,225 @@ mod tests {
         for pixel in image.pixels() {
             assert_eq!(pixel.0, [0, 255, 0, 255]);
         }
+    }
+
+    /// Portable (no GPU required) proof that `AssetCache` actually caches:
+    /// this directly drives `composition_plan` the same way
+    /// `render_gif_with_asset_root` does for each frame of a GIF export --
+    /// one call per animation frame, `scene_at`-ing the base scene for each
+    /// frame's timestamp -- and shows the decode/rasterize call count for a
+    /// static image and static glyphs is exactly 1 per distinct asset when a
+    /// single `AssetCache` is shared across frames, versus 1 *per frame*
+    /// (the pre-change baseline) when each call gets its own fresh cache, as
+    /// `composition_plan` built locally before this change.
+    #[test]
+    fn shares_a_decoded_asset_cache_across_simulated_gif_frames() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
+            .save(directory.path().join("logo.png"))
+            .unwrap();
+        let font = Font::from_bytes(
+            include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+
+        let mut scene = test_scene();
+        scene.canvas.width = 32;
+        scene.canvas.height = 32;
+        scene.nodes = vec![
+            // Keyframed: this is the only thing that differs frame to frame.
+            NodeV1 {
+                id: "animated-box".into(),
+                kind: NodeKindV1::Rect {
+                    x: 1.0,
+                    y: 1.0,
+                    width: 4.0,
+                    height: 4.0,
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+            },
+            // Static across every frame: no keyframe targets it.
+            NodeV1 {
+                id: "label".into(),
+                kind: NodeKindV1::Text {
+                    x: 2.0,
+                    y: 10.0,
+                    text: "AB".into(),
+                    size: 12.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            },
+            // Static across every frame: no keyframe targets it.
+            NodeV1 {
+                id: "logo".into(),
+                kind: NodeKindV1::Image {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 4.0,
+                    height: 4.0,
+                    source: "logo.png".into(),
+                },
+            },
+        ];
+        scene.timeline = Some(renderer_schema::TimelineV1 {
+            fps: 5,
+            duration_ms: 1_000,
+            keyframes: vec![
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "animated-box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Opacity(0.0),
+                },
+                KeyframeV1 {
+                    at_ms: 1_000,
+                    target: "animated-box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Opacity(1.0),
+                },
+            ],
+        });
+        scene.validate().unwrap();
+
+        let timeline = scene.timeline.as_ref().unwrap();
+        let frame_count =
+            (u64::from(timeline.duration_ms) * u64::from(timeline.fps)).div_ceil(1_000) as u32;
+        let fps = u32::from(timeline.fps);
+        assert_eq!(frame_count, 5, "sanity check on the fixture's frame math");
+
+        // Baseline: mirrors `composition_plan`'s behavior before this
+        // change, where every call got its own fresh, function-local cache
+        // -- so every frame independently decodes the static image and
+        // rasterizes the static glyphs.
+        for frame_index in 0..frame_count {
+            let at_ms = frame_index * 1_000 / fps;
+            let animated = scene_at(&scene, at_ms);
+            let mut fresh_cache = AssetCache::default();
+            composition_plan(&animated, directory.path(), &font, &mut fresh_cache).unwrap();
+            assert_eq!(
+                fresh_cache.image_decode_count(),
+                1,
+                "a fresh per-frame cache decodes the static image once per frame"
+            );
+            assert_eq!(
+                fresh_cache.glyph_rasterization_count(),
+                2,
+                "a fresh per-frame cache rasterizes both static glyphs ('A' and 'B') once per frame"
+            );
+        }
+
+        // Under test: one `AssetCache` shared across every frame -- exactly
+        // what `render_gif_with_asset_root` now does -- must decode/
+        // rasterize each distinct static asset exactly once for the *whole*
+        // multi-frame export, not once per frame.
+        let mut shared_cache = AssetCache::default();
+        for frame_index in 0..frame_count {
+            let at_ms = frame_index * 1_000 / fps;
+            let animated = scene_at(&scene, at_ms);
+            composition_plan(&animated, directory.path(), &font, &mut shared_cache).unwrap();
+        }
+        assert_eq!(
+            shared_cache.image_decode_count(),
+            1,
+            "the static image must be decoded exactly once across all {frame_count} frames \
+             sharing one AssetCache, not once per frame"
+        );
+        assert_eq!(
+            shared_cache.glyph_rasterization_count(),
+            2,
+            "each of the 2 distinct static glyphs must be rasterized exactly once across all \
+             {frame_count} frames sharing one AssetCache, not once per frame"
+        );
+    }
+
+    /// GPU smoke coverage (skips gracefully with no adapter, matching this
+    /// file's other `_on_an_available_gpu` tests) for the same scenario as
+    /// `shares_a_decoded_asset_cache_across_simulated_gif_frames` above, but
+    /// driven through the real public `render_gif_with_asset_root` entry
+    /// point end to end: a multi-frame export with a keyframed node plus
+    /// static image/text nodes must still produce a correct, valid,
+    /// warning-free GIF now that the decode/rasterize cache is shared across
+    /// frames.
+    #[test]
+    fn renders_a_gif_with_static_assets_across_frames_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
+            .save(directory.path().join("logo.png"))
+            .unwrap();
+
+        let mut scene = test_scene();
+        scene.canvas.width = 32;
+        scene.canvas.height = 32;
+        scene.nodes = vec![
+            NodeV1 {
+                id: "animated-box".into(),
+                kind: NodeKindV1::Rect {
+                    x: 1.0,
+                    y: 1.0,
+                    width: 4.0,
+                    height: 4.0,
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+            },
+            NodeV1 {
+                id: "label".into(),
+                kind: NodeKindV1::Text {
+                    x: 2.0,
+                    y: 10.0,
+                    text: "AB".into(),
+                    size: 12.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            },
+            NodeV1 {
+                id: "logo".into(),
+                kind: NodeKindV1::Image {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 4.0,
+                    height: 4.0,
+                    source: "logo.png".into(),
+                },
+            },
+        ];
+        scene.timeline = Some(renderer_schema::TimelineV1 {
+            fps: 5,
+            duration_ms: 1_000,
+            keyframes: vec![
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "animated-box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Opacity(0.0),
+                },
+                KeyframeV1 {
+                    at_ms: 1_000,
+                    target: "animated-box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Opacity(1.0),
+                },
+            ],
+        });
+
+        let output = directory.path().join("scene.gif");
+        let rendered = renderer
+            .render_gif_with_asset_root(&scene, &output, directory.path())
+            .unwrap();
+        assert_eq!(rendered.frame_count, 5);
+        assert!(rendered.warnings.is_empty());
+        assert!(
+            fs::metadata(&output).unwrap().len() > 0,
+            "GIF output must not be empty"
+        );
+        let decoded = image::open(&output).unwrap_or_else(|error| {
+            panic!("render_gif_with_asset_root did not produce a valid, decodable GIF: {error}")
+        });
+        assert_eq!(decoded.width(), 32);
+        assert_eq!(decoded.height(), 32);
     }
 
     fn test_scene() -> SceneV1 {
