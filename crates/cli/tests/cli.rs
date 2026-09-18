@@ -852,24 +852,37 @@ mod cmux_show {
         assert!(error["message"].as_str().unwrap().contains("not_found"));
     }
 
-    /// A malformed (non-JSON-RPC-shaped) response from cmux is also a hard
-    /// `cmux_error`, not a silent fallback.
+    /// A socket that *accepts a connection* but doesn't answer with valid
+    /// JSON-RPC (for example, `CMUX_SOCKET_PATH` leaked into a shell
+    /// outside the cmux instance that actually owns that socket) is treated
+    /// the same as cmux being unavailable: fall back to the terminal-
+    /// protocol path rather than failing `show` outright.
     #[test]
-    fn show_reports_a_structured_error_for_a_malformed_cmux_response() {
+    fn show_falls_back_to_terminal_protocol_when_the_cmux_response_is_malformed() {
         let (socket_path, _handle) = fake_cmux_server("this is not json");
         let directory = tempfile::tempdir().unwrap();
         let png_path = directory.path().join("image.png");
         write_test_png(&png_path);
+        let tty_path = directory.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
 
         let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
             .env("CMUX_SOCKET_PATH", &socket_path)
-            .current_dir(directory.path())
-            .args(["show", png_path.to_str().unwrap()])
+            .args([
+                "show",
+                png_path.to_str().unwrap(),
+                "--tty",
+                tty_path.to_str().unwrap(),
+                "--protocol",
+                "kitty",
+            ])
             .output()
             .unwrap();
-        assert!(!output.status.success());
-        let error = parse_error(output.stderr);
-        assert_eq!(error["code"], "cmux_error");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("\"protocol\":\"kitty\""));
+        let written = std::fs::read(&tty_path).unwrap();
+        assert!(String::from_utf8(written).unwrap().starts_with("\x1b_Ga=T"));
     }
 
     /// A path that doesn't exist fails with the same `io_error` code (and

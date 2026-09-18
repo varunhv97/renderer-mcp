@@ -962,57 +962,75 @@ mod cmux_preview {
         Some(stream)
     }
 
+    /// The outcome of one request/response round-trip, per [`send_request`].
+    /// `Response` is a structurally valid JSON-RPC reply from a genuine
+    /// cmux peer -- whether `ok: true` or `ok: false`; callers decide how
+    /// to handle that. `Unavailable` covers every transport-level problem
+    /// (write/read failure, no response, non-JSON response) and is grouped
+    /// with a failed `connect` rather than treated as a hard error: a
+    /// socket that *accepts a connection* but doesn't speak cmux's
+    /// protocol correctly for this caller (for example, `CMUX_SOCKET_PATH`
+    /// leaked via process-environment inheritance into a shell outside the
+    /// cmux instance that actually owns that socket) isn't meaningfully
+    /// different from "cmux isn't available here" -- the caller should
+    /// fall back to the terminal-protocol path either way, the same as it
+    /// would if `connect` itself had failed.
+    enum RequestOutcome {
+        Unavailable,
+        Response(Response),
+    }
+
     /// One request/response round-trip: writes a single newline-terminated
     /// JSON request and reads a single newline-terminated JSON response,
-    /// per cmux's documented framing. Returns the raw, unparsed `Response`
-    /// -- including an `ok: false` application-level rejection, which is
-    /// not itself treated as a transport failure here, since some callers
-    /// (`try_clear_at`) need to inspect the specific error code rather than
-    /// always turning it into a hard error. A transport-level problem
-    /// (write/read failure, malformed JSON) is always a hard error: unlike
-    /// `connect`, once we've established a connection we know cmux is
-    /// present, so a failure from here on is a real problem rather than
-    /// "try something else".
+    /// per cmux's documented framing. See [`RequestOutcome`] for how
+    /// failures after a successful `connect` are classified.
     fn send_request(
         stream: &mut UnixStream,
         id: &str,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<Response, TerminalError> {
+    ) -> Result<RequestOutcome, TerminalError> {
         let cmux_error = |message: String| TerminalError::Cmux { message };
 
+        // Encoding our own well-typed params can't fail in practice, so a
+        // failure here points at a local bug rather than an unusable peer
+        // -- unlike everything below, it stays a hard error.
         let mut payload = serde_json::to_vec(&Request { id, method, params })
             .map_err(|source| cmux_error(format!("could not encode request: {source}")))?;
         payload.push(b'\n');
-        stream
-            .write_all(&payload)
-            .map_err(|source| cmux_error(format!("could not write to socket: {source}")))?;
-
-        let mut line = String::new();
-        BufReader::new(&mut *stream)
-            .read_line(&mut line)
-            .map_err(|source| cmux_error(format!("could not read from socket: {source}")))?;
-        if line.trim().is_empty() {
-            return Err(cmux_error(
-                "connection closed without a response".to_string(),
-            ));
+        if stream.write_all(&payload).is_err() {
+            return Ok(RequestOutcome::Unavailable);
         }
 
-        serde_json::from_str(&line)
-            .map_err(|source| cmux_error(format!("malformed response: {source}")))
+        let mut line = String::new();
+        if BufReader::new(&mut *stream).read_line(&mut line).is_err() {
+            return Ok(RequestOutcome::Unavailable);
+        }
+        if line.trim().is_empty() {
+            return Ok(RequestOutcome::Unavailable);
+        }
+
+        match serde_json::from_str(&line) {
+            Ok(response) => Ok(RequestOutcome::Response(response)),
+            Err(_) => Ok(RequestOutcome::Unavailable),
+        }
     }
 
     /// [`send_request`], but an `ok: false` response is itself turned into
     /// a hard `TerminalError::Cmux` -- the behavior every caller except
-    /// `try_clear_at` wants.
+    /// `try_clear_at` wants. `Ok(None)` propagates a `RequestOutcome::Unavailable`
+    /// for the caller to fall back on, same as a failed `connect`.
     fn call(
         stream: &mut UnixStream,
         id: &str,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, TerminalError> {
+    ) -> Result<Option<serde_json::Value>, TerminalError> {
         let cmux_error = |message: String| TerminalError::Cmux { message };
-        let response = send_request(stream, id, method, params)?;
+        let response = match send_request(stream, id, method, params)? {
+            RequestOutcome::Unavailable => return Ok(None),
+            RequestOutcome::Response(response) => response,
+        };
         if !response.ok {
             let detail = response
                 .error
@@ -1023,9 +1041,10 @@ mod cmux_preview {
                 .unwrap_or_else(|| "unknown error".to_string());
             return Err(cmux_error(format!("rejected `{method}`: {detail}")));
         }
-        response
+        let result = response
             .result
-            .ok_or_else(|| cmux_error(format!("no result for `{method}`")))
+            .ok_or_else(|| cmux_error(format!("no result for `{method}`")))?;
+        Ok(Some(result))
     }
 
     fn load_state(state_file: &Path) -> Option<State> {
@@ -1053,11 +1072,13 @@ mod cmux_preview {
         let _ = fs::remove_file(state_file);
     }
 
-    /// `run`'s display path via cmux. `Ok(None)` means cmux isn't
-    /// available (`CMUX_SOCKET_PATH` unset, or its socket didn't accept a
-    /// connection) and the caller should fall back to terminal-protocol
-    /// detection unchanged. Once a connection is established, a bad path
-    /// or a rejected/malformed RPC is surfaced as a hard error instead.
+    /// `run`'s display path via cmux. `Ok(None)` means cmux isn't usable
+    /// here -- either `CMUX_SOCKET_PATH` is unset, its socket didn't accept
+    /// a connection, or (see `RequestOutcome`) it accepted a connection but
+    /// didn't answer like a real cmux peer -- and the caller should fall
+    /// back to terminal-protocol detection unchanged. Once we have a
+    /// structurally valid response, a bad path or a rejected RPC is
+    /// surfaced as a hard error instead.
     pub(super) fn try_show(path: &Path) -> Result<Option<&'static str>, TerminalError> {
         let Some(socket) = socket_path() else {
             return Ok(None);
@@ -1080,12 +1101,15 @@ mod cmux_preview {
             path: path.to_path_buf(),
             source,
         })?;
-        let result = call(
+        let Some(result) = call(
             &mut stream,
             "renderer-show",
             "file.open",
             serde_json::json!({ "path": absolute.to_string_lossy() }),
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         if let Some(surface_id) = result.get("surface_id").and_then(|value| value.as_str()) {
             save_state(state_file, surface_id);
         }
@@ -1110,12 +1134,15 @@ mod cmux_preview {
         let Some(state) = load_state(state_file) else {
             return Ok(CmuxClearOutcome::NoSurface);
         };
-        let response = send_request(
+        let response = match send_request(
             &mut stream,
             "renderer-clear",
             "surface.close",
             serde_json::json!({ "surface_id": state.surface_id }),
-        )?;
+        )? {
+            RequestOutcome::Unavailable => return Ok(CmuxClearOutcome::Unavailable),
+            RequestOutcome::Response(response) => response,
+        };
         // The recorded surface (or the workspace/window it lived in) may
         // already be gone -- the user closed the tab, or a stale state file
         // survived from an earlier, now-defunct cmux session. `--clear` is
@@ -1245,8 +1272,16 @@ mod cmux_preview {
             assert!(error.to_string().contains("not_found"));
         }
 
+        /// A socket that *accepts a connection* but doesn't answer with
+        /// valid JSON-RPC isn't meaningfully different from "cmux isn't
+        /// available" -- most plausibly a `CMUX_SOCKET_PATH` value that
+        /// leaked (via process-environment inheritance) into a shell
+        /// outside the cmux instance that actually owns that socket, so a
+        /// live socket answers but isn't really our cmux control channel.
+        /// This should fall back to the terminal-protocol path, not hard
+        /// error and leave the user with nothing displayed.
         #[test]
-        fn try_show_at_returns_a_clear_error_for_a_malformed_response() {
+        fn try_show_at_falls_back_when_the_response_is_malformed() {
             let (socket_path, _handle) = fake_server("not json at all");
             let state_file = tempfile::tempdir()
                 .unwrap()
@@ -1256,9 +1291,23 @@ mod cmux_preview {
             let image_path = image_dir.path().join("test.png");
             fs::write(&image_path, b"unused").unwrap();
 
-            let error = try_show_at(&socket_path, &state_file, &image_path).unwrap_err();
-            assert_eq!(error.code(), "cmux_error");
-            assert!(error.to_string().contains("malformed response"));
+            let result = try_show_at(&socket_path, &state_file, &image_path);
+            assert_eq!(result.unwrap(), None);
+        }
+
+        #[test]
+        fn try_show_at_falls_back_when_the_connection_closes_without_a_response() {
+            let (socket_path, _handle) = fake_server("");
+            let state_file = tempfile::tempdir()
+                .unwrap()
+                .path()
+                .join("cmux-preview-surface.json");
+            let image_dir = tempfile::tempdir().unwrap();
+            let image_path = image_dir.path().join("test.png");
+            fs::write(&image_path, b"unused").unwrap();
+
+            let result = try_show_at(&socket_path, &state_file, &image_path);
+            assert_eq!(result.unwrap(), None);
         }
 
         #[test]
@@ -1383,6 +1432,24 @@ mod cmux_preview {
                 .join("cmux-preview-surface.json");
 
             let outcome = try_clear_at(&missing_socket, &state_file).unwrap();
+            assert_eq!(outcome, CmuxClearOutcome::Unavailable);
+        }
+
+        /// Mirrors `try_show_at_falls_back_when_the_response_is_malformed`:
+        /// a connectable socket that doesn't answer with valid JSON-RPC is
+        /// treated the same as cmux being unavailable, not a hard error.
+        #[test]
+        fn try_clear_at_falls_back_when_the_response_is_malformed() {
+            let (socket_path, _handle) = fake_server("not json at all");
+            let state_dir = tempfile::tempdir().unwrap();
+            let state_file = state_dir.path().join("cmux-preview-surface.json");
+            fs::write(
+                &state_file,
+                r#"{"surface_id":"33333333-3333-3333-3333-333333333333"}"#,
+            )
+            .unwrap();
+
+            let outcome = try_clear_at(&socket_path, &state_file).unwrap();
             assert_eq!(outcome, CmuxClearOutcome::Unavailable);
         }
     }
