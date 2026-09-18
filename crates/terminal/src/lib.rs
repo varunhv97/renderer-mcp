@@ -964,19 +964,21 @@ mod cmux_preview {
 
     /// One request/response round-trip: writes a single newline-terminated
     /// JSON request and reads a single newline-terminated JSON response,
-    /// per cmux's documented framing. Returns the response's `result` on
-    /// success, or a `TerminalError::Cmux` describing whatever went wrong
-    /// -- a transport failure, a malformed response, or an `ok: false`
-    /// application-level error. Unlike `connect`, every failure here is a
-    /// hard error: once we've established a connection we know cmux is
+    /// per cmux's documented framing. Returns the raw, unparsed `Response`
+    /// -- including an `ok: false` application-level rejection, which is
+    /// not itself treated as a transport failure here, since some callers
+    /// (`try_clear_at`) need to inspect the specific error code rather than
+    /// always turning it into a hard error. A transport-level problem
+    /// (write/read failure, malformed JSON) is always a hard error: unlike
+    /// `connect`, once we've established a connection we know cmux is
     /// present, so a failure from here on is a real problem rather than
     /// "try something else".
-    fn call(
+    fn send_request(
         stream: &mut UnixStream,
         id: &str,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, TerminalError> {
+    ) -> Result<Response, TerminalError> {
         let cmux_error = |message: String| TerminalError::Cmux { message };
 
         let mut payload = serde_json::to_vec(&Request { id, method, params })
@@ -996,8 +998,21 @@ mod cmux_preview {
             ));
         }
 
-        let response: Response = serde_json::from_str(&line)
-            .map_err(|source| cmux_error(format!("malformed response: {source}")))?;
+        serde_json::from_str(&line)
+            .map_err(|source| cmux_error(format!("malformed response: {source}")))
+    }
+
+    /// [`send_request`], but an `ok: false` response is itself turned into
+    /// a hard `TerminalError::Cmux` -- the behavior every caller except
+    /// `try_clear_at` wants.
+    fn call(
+        stream: &mut UnixStream,
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, TerminalError> {
+        let cmux_error = |message: String| TerminalError::Cmux { message };
+        let response = send_request(stream, id, method, params)?;
         if !response.ok {
             let detail = response
                 .error
@@ -1092,19 +1107,45 @@ mod cmux_preview {
         let Some(mut stream) = connect(socket) else {
             return Ok(CmuxClearOutcome::Unavailable);
         };
-        match load_state(state_file) {
-            Some(state) => {
-                call(
-                    &mut stream,
-                    "renderer-clear",
-                    "surface.close",
-                    serde_json::json!({ "surface_id": state.surface_id }),
-                )?;
+        let Some(state) = load_state(state_file) else {
+            return Ok(CmuxClearOutcome::NoSurface);
+        };
+        let response = send_request(
+            &mut stream,
+            "renderer-clear",
+            "surface.close",
+            serde_json::json!({ "surface_id": state.surface_id }),
+        )?;
+        // The recorded surface (or the workspace/window it lived in) may
+        // already be gone -- the user closed the tab, or a stale state file
+        // survived from an earlier, now-defunct cmux session. `--clear` is
+        // meant to be idempotent ("make sure nothing is showing"), so
+        // treat cmux telling us the target is already gone as success
+        // rather than an error, the same as `CmuxClearOutcome::NoSurface`.
+        // Any other rejection (a real transport/application error) still
+        // propagates as a hard failure.
+        if !response.ok {
+            let code = response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_deref());
+            if code == Some("not_found") {
                 clear_state(state_file);
-                Ok(CmuxClearOutcome::Cleared)
+                return Ok(CmuxClearOutcome::NoSurface);
             }
-            None => Ok(CmuxClearOutcome::NoSurface),
+            let detail = response
+                .error
+                .map(|error| match error.code {
+                    Some(code) => format!("{} ({code})", error.message),
+                    None => error.message,
+                })
+                .unwrap_or_else(|| "unknown error".to_string());
+            return Err(TerminalError::Cmux {
+                message: format!("rejected `surface.close`: {detail}"),
+            });
         }
+        clear_state(state_file);
+        Ok(CmuxClearOutcome::Cleared)
     }
 
     #[cfg(test)]
@@ -1269,6 +1310,50 @@ mod cmux_preview {
                 request["params"]["surface_id"],
                 "33333333-3333-3333-3333-333333333333"
             );
+        }
+
+        /// A recorded surface can already be gone -- the tab was closed, or
+        /// the state file survived from a now-defunct cmux session/window.
+        /// `--clear` is meant to be idempotent, so cmux rejecting the close
+        /// with a `not_found` code must be treated as success (and the
+        /// stale state file cleaned up), not propagated as an error.
+        #[test]
+        fn try_clear_at_treats_a_not_found_surface_as_already_cleared() {
+            let (socket_path, _handle) = fake_server(
+                r#"{"id":"renderer-clear","ok":false,"error":{"message":"Workspace not found","code":"not_found"}}"#,
+            );
+            let state_dir = tempfile::tempdir().unwrap();
+            let state_file = state_dir.path().join("cmux-preview-surface.json");
+            fs::write(
+                &state_file,
+                r#"{"surface_id":"33333333-3333-3333-3333-333333333333"}"#,
+            )
+            .unwrap();
+
+            let outcome = try_clear_at(&socket_path, &state_file).unwrap();
+            assert_eq!(outcome, CmuxClearOutcome::NoSurface);
+            assert!(!state_file.exists());
+        }
+
+        /// A rejection for any other reason must still be a hard error --
+        /// only `not_found` is treated as "already cleared".
+        #[test]
+        fn try_clear_at_still_errors_on_a_non_not_found_rejection() {
+            let (socket_path, _handle) = fake_server(
+                r#"{"id":"renderer-clear","ok":false,"error":{"message":"internal error","code":"internal"}}"#,
+            );
+            let state_dir = tempfile::tempdir().unwrap();
+            let state_file = state_dir.path().join("cmux-preview-surface.json");
+            fs::write(
+                &state_file,
+                r#"{"surface_id":"33333333-3333-3333-3333-333333333333"}"#,
+            )
+            .unwrap();
+
+            let error = try_clear_at(&socket_path, &state_file).unwrap_err();
+            assert!(error.to_string().contains("internal"));
+            // The state file is left alone so a retry has something to act on.
+            assert!(state_file.exists());
         }
 
         #[test]
