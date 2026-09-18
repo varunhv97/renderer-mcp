@@ -104,6 +104,54 @@ Recording only enqueues onto a channel from the request-handling path, so it
 adds no latency there; if the metrics directory can't be created, the daemon
 logs a warning and keeps serving without it.
 
+## Inline terminal preview
+
+`renderer show <path>` displays a local PNG or GIF directly inline in the
+terminal -- useful for a coding-agent workflow where the agent renders a
+visual and wants to show it to the human without them opening a separate
+image viewer:
+
+```sh
+cargo run -p renderer-cli -- show out.png
+cargo run -p renderer-cli -- show out.gif --loops 3
+cargo run -p renderer-cli -- show --clear
+```
+
+If stdout is itself a terminal, escape sequences are written there directly.
+If not (for example when `renderer` is invoked as a detached subprocess by
+an agent's tool-calling mechanism, so stdout is piped rather than a tty),
+`show` walks the process ancestry (`ps -o ppid=,tty= -p <pid>`, capped at 32
+ancestors) looking for the nearest ancestor process that does have a
+controlling terminal, and writes there instead. This only works on macOS and
+Linux; on Windows, or if no real terminal can be found either way, `show`
+prints `no interactive terminal detected; image saved at <path>, open it
+manually` and exits 0 rather than failing.
+
+The terminal protocol is auto-detected from environment variables unless
+overridden:
+
+| Terminal signal | Protocol used |
+| --- | --- |
+| `KITTY_WINDOW_ID`, `TERM=xterm-kitty`, `TERM_PROGRAM=ghostty`, `GHOSTTY_RESOURCES_DIR`, `CMUX_WORKSPACE_ID`/`CMUX_SURFACE_ID` (cmux is Ghostty-based), or `TERM_PROGRAM=WezTerm` | Kitty graphics protocol |
+| `TERM_PROGRAM=iTerm.app` | iTerm2 OSC 1337 inline images |
+| anything else | ANSI 24-bit half-block fallback (e.g. Terminal.app) |
+
+For an animated GIF, WezTerm and plain Kitty use the Kitty protocol's native
+animation extension (the terminal itself handles frame timing and looping).
+Ghostty and cmux support the Kitty graphics protocol but not its animation
+extension, so a GIF headed there -- and any GIF on the ANSI fallback -- is
+played back as *simulated* animation instead: `show` itself loops,
+retransmitting each frame and sleeping for its delay, until `--loops` (0 or
+omitted means loop forever, like a normal GIF) is exhausted or the process is
+killed. iTerm2 always gets the raw GIF bytes as-is and handles decoding and
+looping itself.
+
+Flags: `--tty <path>` writes to a specific device file instead of
+auto-detecting one (mainly for testing against a particular terminal
+session); `--protocol <auto|kitty|iterm2|ansi>` overrides detection;
+`--clear` sends only a Kitty delete-all-images command and exits; `--loops
+<n>` bounds a simulated/native animation's loop count.
+
 ## MCP server
 
 `renderer-mcp` speaks newline-delimited JSON-RPC over stdio (`initialize`,

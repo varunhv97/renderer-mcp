@@ -1,5 +1,6 @@
 use std::{
     net::{SocketAddr, TcpListener},
+    path::Path,
     process::Command,
     time::Duration,
 };
@@ -379,6 +380,276 @@ fn scene_subcommands_round_trip_through_a_running_daemon() {
 
     let _ = daemon.kill();
     let _ = daemon.wait();
+}
+
+/// Writes a tiny 2x2 PNG fixture, returning its path.
+fn write_test_png(path: &Path) {
+    let mut image = image::RgbaImage::new(2, 2);
+    for pixel in image.pixels_mut() {
+        *pixel = image::Rgba([200, 100, 50, 255]);
+    }
+    image.save(path).unwrap();
+}
+
+/// Writes a tiny animated GIF fixture with one 2x2 frame per entry in
+/// `delays_ms`, each a different solid color so frames are distinguishable.
+fn write_test_gif(path: &Path, delays_ms: &[u32]) {
+    use image::codecs::gif::GifEncoder;
+    use image::{Delay, Frame, RgbaImage};
+
+    let file = std::fs::File::create(path).unwrap();
+    let mut encoder = GifEncoder::new(file);
+    for (index, delay_ms) in delays_ms.iter().enumerate() {
+        let mut frame_image = RgbaImage::new(2, 2);
+        let shade = (index as u8).wrapping_mul(60);
+        for pixel in frame_image.pixels_mut() {
+            *pixel = image::Rgba([shade, 0, 255 - shade, 255]);
+        }
+        let delay = Delay::from_numer_denom_ms(*delay_ms, 1);
+        encoder
+            .encode_frame(Frame::from_parts(frame_image, 0, 0, delay))
+            .unwrap();
+    }
+}
+
+/// `show --clear` sends only the Kitty delete-all-images command to the
+/// device the `--tty` override names -- a regular file stands in for a real
+/// tty device here since the code only ever opens-and-writes it.
+#[test]
+fn show_clear_sends_only_the_kitty_delete_all_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .args(["show", "--clear", "--tty", tty_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(&tty_path).unwrap(), b"\x1b_Ga=d,d=A\x1b\\");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"status\":\"cleared\""));
+}
+
+/// A static PNG through `--protocol kitty` produces exactly one Kitty
+/// transmit command carrying the raw PNG bytes.
+#[test]
+fn show_writes_a_kitty_transmit_command_for_a_static_png() {
+    let directory = tempfile::tempdir().unwrap();
+    let png_path = directory.path().join("image.png");
+    write_test_png(&png_path);
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .args([
+            "show",
+            png_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+            "--protocol",
+            "kitty",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read(&tty_path).unwrap();
+    let text = String::from_utf8(written).unwrap();
+    assert!(text.starts_with("\x1b_Ga=T,f=100,i=1,q=2;"));
+    assert!(text.ends_with("\x1b\\"));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"protocol\":\"kitty\""));
+}
+
+/// A static PNG through `--protocol iterm2` produces the documented OSC
+/// 1337 escape sequence carrying the raw file bytes.
+#[test]
+fn show_writes_an_iterm2_osc_1337_command_for_a_static_png() {
+    let directory = tempfile::tempdir().unwrap();
+    let png_path = directory.path().join("image.png");
+    write_test_png(&png_path);
+    let png_bytes = std::fs::read(&png_path).unwrap();
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .args([
+            "show",
+            png_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+            "--protocol",
+            "iterm2",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read(&tty_path).unwrap();
+    let text = String::from_utf8(written).unwrap();
+    assert!(text.starts_with(&format!(
+        "\x1b]1337;File=inline=1;size={};width=auto;height=auto;preserveAspectRatio=1:",
+        png_bytes.len()
+    )));
+    assert!(text.ends_with('\u{7}'));
+}
+
+/// A static PNG through `--protocol ansi` produces true-color half-block
+/// escape sequences (no graphics-protocol control string at all).
+#[test]
+fn show_writes_ansi_half_blocks_for_a_static_png() {
+    let directory = tempfile::tempdir().unwrap();
+    let png_path = directory.path().join("image.png");
+    write_test_png(&png_path);
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .args([
+            "show",
+            png_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+            "--protocol",
+            "ansi",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read(&tty_path).unwrap();
+    let text = String::from_utf8(written).unwrap();
+    assert!(text.contains("\x1b[38;2;"));
+    assert!(text.contains("\x1b[48;2;"));
+    assert!(text.contains('\u{2580}'));
+    assert!(!text.contains("\x1b_G"));
+}
+
+/// A file that isn't a PNG or GIF is rejected with the structured
+/// `unsupported_image` error rather than an attempted (and likely garbled)
+/// terminal write.
+#[test]
+fn show_rejects_a_file_that_is_not_png_or_gif() {
+    let directory = tempfile::tempdir().unwrap();
+    let text_path = directory.path().join("not-an-image.txt");
+    std::fs::write(&text_path, b"just some text").unwrap();
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .args([
+            "show",
+            text_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = parse_error(output.stderr);
+    assert_eq!(error["code"], "unsupported_image");
+    assert_eq!(std::fs::read(&tty_path).unwrap(), b"");
+}
+
+/// An unknown `--protocol` value is rejected with a structured error before
+/// any terminal write is attempted.
+#[test]
+fn show_rejects_an_unknown_protocol_flag() {
+    let directory = tempfile::tempdir().unwrap();
+    let png_path = directory.path().join("image.png");
+    write_test_png(&png_path);
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .args([
+            "show",
+            png_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+            "--protocol",
+            "carrier-pigeon",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = parse_error(output.stderr);
+    assert_eq!(error["code"], "invalid_protocol");
+}
+
+/// An animated GIF through `--protocol kitty` with a Kitty-animation-capable
+/// environment (`KITTY_WINDOW_ID` set) sends the terminal-driven animation
+/// sequence: one root-frame transmit, one additional-frame transmit per
+/// remaining frame, and a single animation-control command -- fast and
+/// deterministic since none of that requires the process itself to sleep.
+#[test]
+fn show_sends_native_kitty_animation_for_an_animation_capable_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let gif_path = directory.path().join("anim.gif");
+    write_test_gif(&gif_path, &[10, 10, 10]);
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env("KITTY_WINDOW_ID", "1")
+        .env_remove("TERM_PROGRAM")
+        .args([
+            "show",
+            gif_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+            "--protocol",
+            "kitty",
+            "--loops",
+            "3",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read(&tty_path).unwrap();
+    let text = String::from_utf8(written).unwrap();
+    assert_eq!(text.matches("a=T,f=100,i=1,q=2,z=").count(), 1);
+    assert_eq!(text.matches("a=f,i=1,q=2,z=").count(), 2);
+    // --loops 3 maps to v=4 per the protocol's "loop number-1 times" rule.
+    assert!(text.contains("\x1b_Ga=a,i=1,q=2,s=3,v=4\x1b\\"));
+}
+
+/// An animated GIF through `--protocol kitty` in a non-animation-capable
+/// environment (no Kitty/WezTerm signals) falls back to simulated
+/// animation: the same static-image transmit command repeated once per
+/// frame, with no animation-control command at all. Uses tiny per-frame
+/// delays and `--loops 1` to keep the test fast and bounded.
+#[test]
+fn show_simulates_kitty_animation_when_the_terminal_lacks_the_extension() {
+    let directory = tempfile::tempdir().unwrap();
+    let gif_path = directory.path().join("anim.gif");
+    write_test_gif(&gif_path, &[5, 5]);
+    let tty_path = directory.path().join("fake-tty");
+    std::fs::write(&tty_path, b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
+        .env_remove("KITTY_WINDOW_ID")
+        .env_remove("TERM_PROGRAM")
+        .args([
+            "show",
+            gif_path.to_str().unwrap(),
+            "--tty",
+            tty_path.to_str().unwrap(),
+            "--protocol",
+            "kitty",
+            "--loops",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read(&tty_path).unwrap();
+    let text = String::from_utf8(written).unwrap();
+    assert_eq!(text.matches("\x1b_Ga=T,f=100,i=1,q=2;").count(), 2);
+    assert!(!text.contains("a=a,i=1"));
 }
 
 /// Runs `scene get` for a scene ID that doesn't exist against a real,
