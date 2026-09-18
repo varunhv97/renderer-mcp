@@ -166,6 +166,15 @@ enum CliError {
         #[source]
         source: std::io::Error,
     },
+    /// Any failure talking to cmux's JSON-RPC control socket once a
+    /// connection has actually been established -- a transport error, a
+    /// malformed response, or an `ok: false` application-level error. A
+    /// failure to connect at all is deliberately *not* represented here:
+    /// that's treated as "cmux isn't available" and falls back to the
+    /// terminal-protocol path instead of erroring, per `show`'s cmux
+    /// integration.
+    #[error("cmux error: {message}")]
+    Cmux { message: String },
 }
 
 impl CliError {
@@ -175,6 +184,7 @@ impl CliError {
             CliError::InvalidJson { .. } => "invalid_json",
             CliError::UnsupportedImage { .. } => "unsupported_image",
             CliError::InvalidProtocol { .. } => "invalid_protocol",
+            CliError::Cmux { .. } => "cmux_error",
         }
     }
 }
@@ -427,6 +437,18 @@ mod show {
         // this is always populated once we get here.
         let path = path.expect("clap requires `path` unless --clear is given");
 
+        // Prefer cmux's native file-preview panel over every terminal
+        // graphics protocol below, when it's available -- see
+        // `cmux_preview` for why. `Ok(None)` means cmux isn't available and
+        // we fall through unchanged to the existing detection/behavior.
+        if let Some(protocol_name) = cmux_preview::try_show(&path)? {
+            return print_json(serde_json::json!({
+                "status": "displayed",
+                "protocol": protocol_name,
+                "path": path,
+            }));
+        }
+
         let target = match resolve_terminal_target(tty.as_deref()) {
             TerminalResolution::NoTerminal => {
                 println!("{}", no_terminal_message(&path));
@@ -464,6 +486,14 @@ mod show {
     /// command. A no-op (but still exit-0) message when no terminal target
     /// can be found, matching `run`'s treatment of that case.
     fn run_clear(tty: Option<&Path>) -> Result<()> {
+        // Same preference as `run`: when cmux is available, handle `--clear`
+        // entirely through it (closing the last-opened preview surface)
+        // rather than falling back to a Kitty delete-all command that would
+        // just collide with the agent's TUI the same way this feature
+        // exists to avoid.
+        if cmux_preview::try_clear()? {
+            return Ok(());
+        }
         match resolve_terminal_target(tty) {
             TerminalResolution::NoTerminal => {
                 println!("{NO_TERMINAL_CLEAR_MESSAGE}");
@@ -1041,6 +1071,466 @@ mod show {
             .iter()
             .map(|(image, delay)| Ok((encode_frame_png(path, image)?, *delay)))
             .collect()
+    }
+
+    // -- cmux native file preview --------------------------------------------
+    //
+    // cmux (a native macOS terminal for running coding agents, built on
+    // Ghostty) exposes a JSON-RPC-over-Unix-socket control API at the path
+    // named by `CMUX_SOCKET_PATH`. Its `file.open` method opens a local file
+    // in cmux's own native file-preview panel -- a UI surface entirely
+    // separate from the terminal grid, so unlike every protocol above it
+    // can never collide with an agent's own actively-redrawn TUI (the
+    // motivating problem: a detached `show` subprocess's raw pty write has
+    // no way to know where a chat transcript ends and an input box begins).
+    // This is tried first, ahead of all Kitty/iTerm2/ANSI detection, and
+    // used instead of it entirely whenever cmux is reachable. `UnixStream`
+    // is POSIX-only, so this whole integration is unix-only; on other
+    // platforms (this workspace's CI includes a Windows target) it compiles
+    // to a stub that always reports cmux as unavailable.
+    //
+    // The env-var/working-directory-reading entry points (`try_show`,
+    // `try_clear`) are thin wrappers around `_at`-suffixed functions that
+    // take the socket path and state-file path as explicit arguments --
+    // mirroring `detect_protocol_auto`'s injected-`get` pattern above, and
+    // for the same reason: `std::env::set_var`/`set_current_dir` are
+    // process-global and would race across this binary's parallel test
+    // threads, so the tests exercise the `_at` functions directly instead.
+    #[cfg(unix)]
+    mod cmux_preview {
+        use super::*;
+        use serde::{Deserialize, Serialize};
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        /// Env var cmux sets to the path of its control socket.
+        const SOCKET_ENV: &str = "CMUX_SOCKET_PATH";
+        /// Read/write timeout applied to the control-socket connection, so
+        /// a hung or misbehaving socket can't make `show` hang forever.
+        const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
+        /// Where the most recently opened preview surface's id is
+        /// persisted, so a later `show --clear` can close it. Relative to
+        /// the working directory, following the same `.renderer/`-prefixed
+        /// local generated-state convention as the daemon's
+        /// `.renderer/metrics` directory (see `DEFAULT_METRICS_DIR` in
+        /// `crates/daemon/src/lib.rs`).
+        const STATE_PATH: &str = ".renderer/cmux-preview-surface.json";
+
+        #[derive(Debug, Serialize)]
+        struct Request<'a> {
+            id: &'a str,
+            method: &'a str,
+            params: serde_json::Value,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Response {
+            ok: bool,
+            #[serde(default)]
+            result: Option<serde_json::Value>,
+            #[serde(default)]
+            error: Option<RpcError>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct RpcError {
+            message: String,
+            #[serde(default)]
+            code: Option<String>,
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct State {
+            surface_id: String,
+        }
+
+        fn socket_path() -> Option<PathBuf> {
+            std::env::var(SOCKET_ENV)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        }
+
+        fn state_path() -> PathBuf {
+            PathBuf::from(STATE_PATH)
+        }
+
+        /// Connects to cmux's control socket, applying `SOCKET_TIMEOUT` in
+        /// both directions. Any failure at all (no such socket, connection
+        /// refused, a timeout while configuring the connection, ...) is
+        /// treated as "cmux isn't available" rather than an error -- per
+        /// the spec, callers fall back to the terminal-protocol path
+        /// instead of failing `show` outright.
+        fn connect(path: &Path) -> Option<UnixStream> {
+            let stream = UnixStream::connect(path).ok()?;
+            stream.set_read_timeout(Some(SOCKET_TIMEOUT)).ok()?;
+            stream.set_write_timeout(Some(SOCKET_TIMEOUT)).ok()?;
+            Some(stream)
+        }
+
+        /// One request/response round-trip: writes a single
+        /// newline-terminated JSON request and reads a single
+        /// newline-terminated JSON response, per cmux's documented framing.
+        /// Returns the response's `result` on success, or a `CliError::Cmux`
+        /// describing whatever went wrong -- a transport failure, a
+        /// malformed response, or an `ok: false` application-level error.
+        /// Unlike `connect`, every failure here is a hard error: once we've
+        /// established a connection we know cmux is present, so a failure
+        /// from here on is a real problem rather than "try something else".
+        fn call(
+            stream: &mut UnixStream,
+            id: &str,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, CliError> {
+            let cmux_error = |message: String| CliError::Cmux { message };
+
+            let mut payload = serde_json::to_vec(&Request { id, method, params })
+                .map_err(|source| cmux_error(format!("could not encode request: {source}")))?;
+            payload.push(b'\n');
+            stream
+                .write_all(&payload)
+                .map_err(|source| cmux_error(format!("could not write to socket: {source}")))?;
+
+            let mut line = String::new();
+            BufReader::new(&mut *stream)
+                .read_line(&mut line)
+                .map_err(|source| cmux_error(format!("could not read from socket: {source}")))?;
+            if line.trim().is_empty() {
+                return Err(cmux_error(
+                    "connection closed without a response".to_string(),
+                ));
+            }
+
+            let response: Response = serde_json::from_str(&line)
+                .map_err(|source| cmux_error(format!("malformed response: {source}")))?;
+            if !response.ok {
+                let detail = response
+                    .error
+                    .map(|error| match error.code {
+                        Some(code) => format!("{} ({code})", error.message),
+                        None => error.message,
+                    })
+                    .unwrap_or_else(|| "unknown error".to_string());
+                return Err(cmux_error(format!("rejected `{method}`: {detail}")));
+            }
+            response
+                .result
+                .ok_or_else(|| cmux_error(format!("no result for `{method}`")))
+        }
+
+        fn load_state(state_file: &Path) -> Option<State> {
+            let contents = fs::read_to_string(state_file).ok()?;
+            serde_json::from_str(&contents).ok()
+        }
+
+        /// Best-effort: an unwritable working directory shouldn't fail an
+        /// otherwise-successful `show`, it just means a later
+        /// `show --clear` won't have a recorded surface to close.
+        fn save_state(state_file: &Path, surface_id: &str) {
+            if let Some(parent) = state_file.parent()
+                && fs::create_dir_all(parent).is_err()
+            {
+                return;
+            }
+            if let Ok(json) = serde_json::to_string(&State {
+                surface_id: surface_id.to_string(),
+            }) {
+                let _ = fs::write(state_file, json);
+            }
+        }
+
+        fn clear_state(state_file: &Path) {
+            let _ = fs::remove_file(state_file);
+        }
+
+        /// `renderer show <path>` via cmux. `Ok(None)` means cmux isn't
+        /// available (`CMUX_SOCKET_PATH` unset, or its socket didn't accept
+        /// a connection) and the caller should fall back to
+        /// terminal-protocol detection unchanged. Once a connection is
+        /// established, a bad path or a rejected/malformed RPC is
+        /// surfaced as a hard error instead.
+        pub(super) fn try_show(path: &Path) -> Result<Option<&'static str>> {
+            let Some(socket) = socket_path() else {
+                return Ok(None);
+            };
+            try_show_at(&socket, &state_path(), path)
+        }
+
+        /// The testable core of `try_show`, with the socket and state-file
+        /// paths taken as explicit arguments instead of read from the
+        /// environment/working directory.
+        fn try_show_at(
+            socket: &Path,
+            state_file: &Path,
+            path: &Path,
+        ) -> Result<Option<&'static str>> {
+            let Some(mut stream) = connect(socket) else {
+                return Ok(None);
+            };
+            let absolute = fs::canonicalize(path).map_err(|source| CliError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let result = call(
+                &mut stream,
+                "renderer-show",
+                "file.open",
+                serde_json::json!({ "path": absolute.to_string_lossy() }),
+            )?;
+            if let Some(surface_id) = result.get("surface_id").and_then(|value| value.as_str()) {
+                save_state(state_file, surface_id);
+            }
+            Ok(Some("cmux"))
+        }
+
+        /// `renderer show --clear` via cmux: closes the most recently
+        /// opened preview surface, if one was recorded, via
+        /// `surface.close`. Returns `Ok(true)` once handled (having already
+        /// printed its own status line), `Ok(false)` if cmux isn't
+        /// reachable and the caller should fall back to the
+        /// terminal-protocol clear behavior instead.
+        pub(super) fn try_clear() -> Result<bool> {
+            let Some(socket) = socket_path() else {
+                return Ok(false);
+            };
+            try_clear_at(&socket, &state_path())
+        }
+
+        /// The testable core of `try_clear`, with the socket and
+        /// state-file paths taken as explicit arguments.
+        fn try_clear_at(socket: &Path, state_file: &Path) -> Result<bool> {
+            let Some(mut stream) = connect(socket) else {
+                return Ok(false);
+            };
+            match load_state(state_file) {
+                Some(state) => {
+                    call(
+                        &mut stream,
+                        "renderer-clear",
+                        "surface.close",
+                        serde_json::json!({ "surface_id": state.surface_id }),
+                    )?;
+                    clear_state(state_file);
+                    print_json(serde_json::json!({ "status": "cleared", "protocol": "cmux" }))?;
+                }
+                None => {
+                    println!("no cmux preview surface recorded; nothing to clear");
+                }
+            }
+            Ok(true)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use std::os::unix::net::UnixListener;
+
+            /// Spawns a fake cmux control-socket server bound to a tempdir
+            /// path: accepts exactly one connection, reads one
+            /// newline-terminated request, and writes back `response` (with
+            /// a trailing newline added if it doesn't already end in one).
+            /// Returns the socket path and a join handle yielding the raw
+            /// request bytes it read.
+            fn fake_server(response: &'static str) -> (PathBuf, std::thread::JoinHandle<Vec<u8>>) {
+                let dir = tempfile::tempdir().unwrap();
+                // Keep the tempdir alive for the server thread's lifetime by
+                // leaking it -- fine for a short-lived test process, and
+                // simpler than threading an extra lifetime through the join
+                // handle.
+                let socket_path = dir.keep().join("cmux.sock");
+                let listener = UnixListener::bind(&socket_path).unwrap();
+                let handle = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    let mut reader = BufReader::new(&mut stream);
+                    let _ = reader.read_until(b'\n', &mut request);
+                    let mut body = response.as_bytes().to_vec();
+                    if !body.ends_with(b"\n") {
+                        body.push(b'\n');
+                    }
+                    let _ = stream.write_all(&body);
+                    request
+                });
+                (socket_path, handle)
+            }
+
+            #[test]
+            fn try_show_at_round_trips_a_successful_file_open() {
+                let (socket_path, handle) = fake_server(
+                    r#"{"id":"renderer-show","ok":true,"result":{"surface_id":"11111111-1111-1111-1111-111111111111","pane_id":"22222222-2222-2222-2222-222222222222"}}"#,
+                );
+                let state_dir = tempfile::tempdir().unwrap();
+                let state_file = state_dir.path().join("cmux-preview-surface.json");
+
+                let image_dir = tempfile::tempdir().unwrap();
+                let image_path = image_dir.path().join("test.png");
+                fs::write(&image_path, b"not-really-a-png-but-unused-here").unwrap();
+
+                let result = try_show_at(&socket_path, &state_file, &image_path);
+                assert_eq!(result.unwrap(), Some("cmux"));
+
+                let request = String::from_utf8(handle.join().unwrap()).unwrap();
+                let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+                assert_eq!(request["method"], "file.open");
+                let sent_path = request["params"]["path"].as_str().unwrap();
+                assert!(Path::new(sent_path).is_absolute());
+                assert_eq!(
+                    fs::canonicalize(sent_path).unwrap(),
+                    fs::canonicalize(&image_path).unwrap()
+                );
+
+                let saved_state = fs::read_to_string(&state_file).unwrap();
+                assert!(saved_state.contains("11111111-1111-1111-1111-111111111111"));
+            }
+
+            #[test]
+            fn try_show_at_falls_back_when_the_socket_is_unreachable() {
+                let missing_socket = tempfile::tempdir().unwrap().path().join("no-such.sock");
+                let state_file = tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("cmux-preview-surface.json");
+                let image_dir = tempfile::tempdir().unwrap();
+                let image_path = image_dir.path().join("test.png");
+                fs::write(&image_path, b"unused").unwrap();
+
+                let result = try_show_at(&missing_socket, &state_file, &image_path);
+                assert_eq!(result.unwrap(), None);
+            }
+
+            #[test]
+            fn try_show_at_returns_a_clear_error_for_an_ok_false_response() {
+                let (socket_path, _handle) = fake_server(
+                    r#"{"id":"renderer-show","ok":false,"error":{"message":"File not found: /nope.png","code":"not_found"}}"#,
+                );
+                let state_file = tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("cmux-preview-surface.json");
+                let image_dir = tempfile::tempdir().unwrap();
+                let image_path = image_dir.path().join("test.png");
+                fs::write(&image_path, b"unused").unwrap();
+
+                let error = try_show_at(&socket_path, &state_file, &image_path).unwrap_err();
+                let cli_error = error.downcast_ref::<CliError>().unwrap();
+                assert_eq!(cli_error.code(), "cmux_error");
+                assert!(cli_error.to_string().contains("File not found"));
+                assert!(cli_error.to_string().contains("not_found"));
+            }
+
+            #[test]
+            fn try_show_at_returns_a_clear_error_for_a_malformed_response() {
+                let (socket_path, _handle) = fake_server("not json at all");
+                let state_file = tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("cmux-preview-surface.json");
+                let image_dir = tempfile::tempdir().unwrap();
+                let image_path = image_dir.path().join("test.png");
+                fs::write(&image_path, b"unused").unwrap();
+
+                let error = try_show_at(&socket_path, &state_file, &image_path).unwrap_err();
+                let cli_error = error.downcast_ref::<CliError>().unwrap();
+                assert_eq!(cli_error.code(), "cmux_error");
+                assert!(cli_error.to_string().contains("malformed response"));
+            }
+
+            #[test]
+            fn try_show_at_reports_a_clear_error_when_the_path_cannot_be_canonicalized() {
+                // The server is reachable but should never receive a
+                // request: canonicalization is checked first and fails
+                // here since the path doesn't exist.
+                let dir = tempfile::tempdir().unwrap();
+                let socket_path = dir.path().join("cmux.sock");
+                let listener = UnixListener::bind(&socket_path).unwrap();
+                let handle = std::thread::spawn(move || listener.accept());
+                let state_file = dir.path().join("cmux-preview-surface.json");
+
+                let error = try_show_at(
+                    &socket_path,
+                    &state_file,
+                    Path::new("/no/such/path/definitely-missing.png"),
+                )
+                .unwrap_err();
+
+                let cli_error = error.downcast_ref::<CliError>().unwrap();
+                assert_eq!(cli_error.code(), "io_error");
+                assert!(cli_error.to_string().contains("could not read"));
+                // No connection should have been made, so the accept thread
+                // never returns on its own; drop it without joining.
+                drop(handle);
+            }
+
+            #[test]
+            fn try_clear_at_closes_the_recorded_surface_and_removes_the_state_file() {
+                let (socket_path, handle) = fake_server(
+                    r#"{"id":"renderer-clear","ok":true,"result":{"surface_id":"33333333-3333-3333-3333-333333333333"}}"#,
+                );
+                let state_dir = tempfile::tempdir().unwrap();
+                let state_file = state_dir.path().join("cmux-preview-surface.json");
+                fs::write(
+                    &state_file,
+                    r#"{"surface_id":"33333333-3333-3333-3333-333333333333"}"#,
+                )
+                .unwrap();
+
+                let handled = try_clear_at(&socket_path, &state_file);
+                assert!(handled.unwrap());
+                assert!(!state_file.exists());
+
+                let request = String::from_utf8(handle.join().unwrap()).unwrap();
+                let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+                assert_eq!(request["method"], "surface.close");
+                assert_eq!(
+                    request["params"]["surface_id"],
+                    "33333333-3333-3333-3333-333333333333"
+                );
+            }
+
+            #[test]
+            fn try_clear_at_reports_no_surface_recorded_without_erroring() {
+                let (socket_path, handle) = fake_server("irrelevant: no request is sent");
+                let state_file = tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("cmux-preview-surface.json");
+
+                let handled = try_clear_at(&socket_path, &state_file);
+                assert!(handled.unwrap());
+
+                // A connection is opened (to check availability) but no
+                // request is ever sent since there's no surface to close;
+                // drop the server's own connection without requiring it to
+                // have received anything.
+                let _ = handle.join();
+            }
+
+            #[test]
+            fn try_clear_at_falls_back_when_the_socket_is_unreachable() {
+                let missing_socket = tempfile::tempdir().unwrap().path().join("no-such.sock");
+                let state_file = tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("cmux-preview-surface.json");
+
+                let handled = try_clear_at(&missing_socket, &state_file);
+                assert!(!handled.unwrap());
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    mod cmux_preview {
+        use super::*;
+
+        pub(super) fn try_show(_path: &Path) -> Result<Option<&'static str>> {
+            Ok(None)
+        }
+
+        pub(super) fn try_clear() -> Result<bool> {
+            Ok(false)
+        }
     }
 
     #[cfg(test)]
