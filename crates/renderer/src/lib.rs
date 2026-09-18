@@ -99,6 +99,17 @@ pub struct GpuRenderer {
     textured_pipeline: wgpu::RenderPipeline,
     texture_bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// Pipeline for the analytic (signed-distance-field + `fwidth`)
+    /// anti-aliasing "shadow mode" path -- see the `..._analytic_aa` methods
+    /// below and `ANALYTIC_SHADER`'s doc comment. Wholly separate from
+    /// `primitive_pipeline`; never used by any pre-existing render entry
+    /// point.
+    analytic_pipeline: wgpu::RenderPipeline,
+    /// Single-sampled twin of `textured_pipeline` (same shader, same vertex
+    /// layout), used only by the analytic-AA path's text/image draws -- see
+    /// `create_analytic_pipelines`'s doc comment for why a separate pipeline
+    /// object is required here even though the shader is identical.
+    textured_pipeline_single: wgpu::RenderPipeline,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,6 +243,12 @@ impl GpuRenderer {
         .map_err(|_| RenderError::Font)?;
         let (primitive_pipeline, textured_pipeline, texture_bind_group_layout, sampler) =
             create_pipelines(&device);
+        // Additive: builds the two extra pipelines the analytic-AA "shadow
+        // mode" path uses (see `create_analytic_pipelines`'s doc comment).
+        // Every pipeline/shader/field above this line is untouched by this
+        // call -- it only reads `texture_bind_group_layout`.
+        let (analytic_pipeline, textured_pipeline_single) =
+            create_analytic_pipelines(&device, &texture_bind_group_layout);
         Ok(Self {
             device,
             queue,
@@ -240,6 +257,8 @@ impl GpuRenderer {
             textured_pipeline,
             texture_bind_group_layout,
             sampler,
+            analytic_pipeline,
+            textured_pipeline_single,
         })
     }
 
@@ -778,6 +797,625 @@ impl GpuRenderer {
     }
 }
 
+/// Analytic (signed-distance-field + `fwidth`) anti-aliasing "shadow mode"
+/// entry points. Every method here is net-new and additive: none of them are
+/// called by, or share any mutable state with, the pre-existing
+/// `render_png`/`render_gif`/`render_rgba` family (or their
+/// `_with_asset_root` variants) above, which remain completely untouched and
+/// keep producing byte-identical output via the original MSAA+supersampling
+/// path (`primitive_pipeline`/`textured_pipeline`, `MSAA_SAMPLE_COUNT`,
+/// `SUPERSAMPLE_FACTOR`).
+///
+/// This path renders vector primitives (rect/ellipse/line) with exact
+/// analytic per-fragment distance fields instead of stochastic/regular-grid
+/// coverage sampling: no multisampling, no supersampling, a single sample
+/// per fragment. See `ANALYTIC_SHADER` for the shader-side technique and
+/// `composition_plan_analytic` for how each shape type is handled,
+/// including `Path`'s documented fallback to the existing MSAA pipeline.
+impl GpuRenderer {
+    /// Analytic-AA counterpart to [`Self::render_png`].
+    pub fn render_png_analytic_aa(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+    ) -> Result<RenderedImage, RenderError> {
+        let root =
+            std::env::current_dir().map_err(|error| RenderError::Asset(error.to_string()))?;
+        self.render_png_with_asset_root_analytic_aa(scene, output, &root)
+    }
+
+    /// Analytic-AA counterpart to [`Self::render_png_with_asset_root`].
+    pub fn render_png_with_asset_root_analytic_aa(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+        asset_root: &Path,
+    ) -> Result<RenderedImage, RenderError> {
+        scene.validate()?;
+        ensure_png_output_path(output)?;
+        let (pixels, warnings) = self.render_rgba_with_asset_root_analytic_aa(scene, asset_root)?;
+        fs::create_dir_all(output.parent().unwrap_or(Path::new(".")))
+            .map_err(RenderError::OutputDirectory)?;
+        RgbaImage::from_raw(scene.canvas.width, scene.canvas.height, pixels.clone())
+            .expect("validated dimensions match readback length")
+            .save_with_format(output, image::ImageFormat::Png)?;
+        let sha256 = hash_file(output)?;
+        Ok(RenderedImage {
+            width: scene.canvas.width,
+            height: scene.canvas.height,
+            sha256,
+            frame_count: 1,
+            warnings,
+        })
+    }
+
+    /// Analytic-AA counterpart to [`Self::render_gif`].
+    pub fn render_gif_analytic_aa(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+    ) -> Result<RenderedImage, RenderError> {
+        let root =
+            std::env::current_dir().map_err(|error| RenderError::Asset(error.to_string()))?;
+        self.render_gif_with_asset_root_analytic_aa(scene, output, &root)
+    }
+
+    /// Analytic-AA counterpart to [`Self::render_gif_with_asset_root`].
+    /// Structurally identical to that method (same frame count/timing math,
+    /// same `AssetCache` sharing across frames, same GIF encoder settings)
+    /// except each frame is composited with
+    /// `render_composed_rgba_analytic_with_cache` instead of
+    /// `render_composed_rgba_with_cache`.
+    pub fn render_gif_with_asset_root_analytic_aa(
+        &self,
+        scene: &SceneV1,
+        output: &Path,
+        asset_root: &Path,
+    ) -> Result<RenderedImage, RenderError> {
+        scene.validate()?;
+        let timeline = scene.timeline.as_ref().ok_or(RenderError::InvalidScene(
+            renderer_schema::SceneValidationError::InvalidTimeline,
+        ))?;
+        fs::create_dir_all(output.parent().unwrap_or(Path::new(".")))
+            .map_err(RenderError::OutputDirectory)?;
+        let frame_count =
+            (u64::from(timeline.duration_ms) * u64::from(timeline.fps)).div_ceil(1_000) as u32;
+        let fps = u32::from(timeline.fps);
+        let mut warnings = Vec::new();
+        let mut cache = AssetCache::default();
+        {
+            let mut encoder = GifEncoder::new_with_speed(
+                File::create(output).map_err(RenderError::OutputDirectory)?,
+                10,
+            );
+            encoder
+                .set_repeat(Repeat::Infinite)
+                .map_err(RenderError::Gif)?;
+            for frame_index in 0..frame_count {
+                let at_ms = frame_index * 1_000 / fps;
+                let animated = scene_at(scene, at_ms);
+                animated.validate()?;
+                let (pixels, frame_warnings) = self
+                    .render_composed_rgba_analytic_with_cache(&animated, asset_root, &mut cache)?;
+                warnings.extend(frame_warnings);
+                let image = RgbaImage::from_raw(scene.canvas.width, scene.canvas.height, pixels)
+                    .expect("validated dimensions match readback length");
+                encoder
+                    .encode_frame(Frame::from_parts(
+                        image,
+                        0,
+                        0,
+                        Delay::from_numer_denom_ms(1_000, fps),
+                    ))
+                    .map_err(RenderError::Gif)?;
+            }
+        }
+        warnings.sort();
+        warnings.dedup();
+        Ok(RenderedImage {
+            width: scene.canvas.width,
+            height: scene.canvas.height,
+            sha256: hash_file(output)?,
+            frame_count,
+            warnings,
+        })
+    }
+
+    /// Analytic-AA counterpart to [`Self::render_rgba`].
+    pub fn render_rgba_analytic_aa(
+        &self,
+        scene: &SceneV1,
+    ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        let root =
+            std::env::current_dir().map_err(|error| RenderError::Asset(error.to_string()))?;
+        self.render_rgba_with_asset_root_analytic_aa(scene, &root)
+    }
+
+    /// Analytic-AA counterpart to [`Self::render_rgba_with_asset_root`]: same
+    /// contract (validates the scene, returns declared-size straight-alpha
+    /// RGBA8 bytes plus warnings), but composites with the SDF/`fwidth`
+    /// pipeline instead of MSAA+supersampling.
+    pub fn render_rgba_with_asset_root_analytic_aa(
+        &self,
+        scene: &SceneV1,
+        asset_root: &Path,
+    ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        scene.validate()?;
+        let mut cache = AssetCache::default();
+        self.render_composed_rgba_analytic_with_cache(scene, asset_root, &mut cache)
+    }
+
+    /// Analytic-AA counterpart to
+    /// `GpuRenderer::render_composed_rgba_with_cache`. Renders directly at
+    /// the scene's declared canvas size -- no `SUPERSAMPLE_FACTOR` scaling,
+    /// no downsample step -- because the SDF/`fwidth` technique produces a
+    /// resolution-correct ~1-pixel-wide analytic edge from a single sample,
+    /// with no oversized intermediate texture needed.
+    ///
+    /// Node z-order (draw order) must match document order exactly, same as
+    /// the original path, but different node kinds here need different GPU
+    /// pipelines with different render-target sample counts (the analytic
+    /// rect/ellipse/line pipeline and the single-sampled text/image pipeline
+    /// both draw into a single-sampled attachment; the `Path` fallback draws
+    /// into a multisampled attachment that resolves into the same target --
+    /// see `composition_plan_analytic`'s `AnalyticDrawCommand` grouping).
+    /// Since a render pass's attachment sample count is fixed for its
+    /// duration, this opens one render pass per contiguous same-technique
+    /// run of nodes (all consecutive Analytic commands merged into one
+    /// pass -- see `composition_plan_analytic` -- likewise for consecutive
+    /// Textured or Path commands), each loading the prior pass's contents
+    /// (`LoadOp::Load`) except the very first, which clears the canvas
+    /// background. This costs a handful of extra render-pass begin/end calls
+    /// versus a single monolithic pass -- see the module's performance
+    /// comparison for measured real-world cost -- in exchange for exact
+    /// z-order correctness across heterogeneous pipelines.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn render_composed_rgba_analytic_with_cache(
+        &self,
+        scene: &SceneV1,
+        asset_root: &Path,
+        cache: &mut AssetCache,
+    ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        let plan = composition_plan_analytic(scene, asset_root, &self.font, cache)?;
+        let width = scene.canvas.width;
+        let height = scene.canvas.height;
+        let has_effect = scene.effect.is_some();
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("renderer-cli analytic target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: if has_effect {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            },
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let analytic_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("renderer-cli analytic vertices"),
+                contents: bytemuck::cast_slice(&plan.analytic_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let path_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("renderer-cli analytic path (msaa fallback) vertices"),
+                contents: bytemuck::cast_slice(&plan.path_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let textured_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("renderer-cli analytic textured vertices"),
+                contents: bytemuck::cast_slice(&plan.textured_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let mut texture_resources = Vec::with_capacity(plan.textures.len());
+        for data in &plan.textures {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&data.label),
+                size: wgpu::Extent3d {
+                    width: data.width,
+                    height: data.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data.pixels,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(data.width * 4),
+                    rows_per_image: Some(data.height),
+                },
+                wgpu::Extent3d {
+                    width: data.width,
+                    height: data.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&data.label),
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            texture_resources.push((texture, texture_view, bind_group));
+        }
+
+        let unpadded_bytes_per_row = width * 4;
+        let padded_bytes_per_row =
+            align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("renderer-cli analytic readback"),
+            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("renderer-cli analytic commands"),
+            });
+
+        // Only allocated when the plan actually contains a `Path` command --
+        // most scenes have none -- since it's otherwise wasted memory/setup
+        // for a render target this path never touches.
+        let needs_path_pass = plan
+            .commands
+            .iter()
+            .any(|command| matches!(command, AnalyticDrawCommand::Path(_)));
+        let msaa_texture = needs_path_pass.then(|| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("renderer-cli analytic path msaa target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: MSAA_SAMPLE_COUNT,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        });
+        let msaa_view = msaa_texture
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        // Clear `view` to the background color exactly once, unconditionally,
+        // before any node draws -- every subsequent pass below uses
+        // `LoadOp::Load` unconditionally. (This subsumes the old "empty
+        // scene" special case too: with zero commands, this is the only
+        // pass that runs, producing exactly the cleared-background canvas.)
+        //
+        // Why this replaced a per-command `cleared`-flag "first pass clears,
+        // rest load" scheme: that scheme is correct for `AnalyticDrawCommand
+        // ::Analytic`/`::Textured` (both render directly into the
+        // single-sampled `view`, where `LoadOp::Load` genuinely means "keep
+        // what's already there"), but it silently corrupted output whenever
+        // a `Path` command *wasn't* first. `Path` renders into a
+        // multisampled `msaa_view` with `resolve_target: Some(&view)` --
+        // and `LoadOp::Load` on a resolve-source attachment loads that
+        // multisampled texture's *own* prior contents, not the resolve
+        // target's. Since `msaa_texture` is freshly created on every call,
+        // "loading" it reads back empty/undefined data regardless of what
+        // `view` already held, and the end-of-pass resolve then overwrites
+        // every pixel of `view` (not just the ones the path itself covers)
+        // with that empty data -- silently erasing every node drawn before
+        // it. (Caught by rendering a rect followed by a path/text scene and
+        // finding the rect's pixels had gone from opaque red to fully
+        // transparent after the path pass ran.)
+        //
+        // The fix: `Path` no longer resolves directly onto `view` at all.
+        // It resolves into its own fresh, self-contained `path_overlay`
+        // texture (always cleared to transparent -- correct, since that
+        // texture has no "prior content" to preserve, it's brand new every
+        // time), then a second, ordinary single-sampled pass alpha-blends
+        // that overlay onto `view` via the existing textured-quad machinery
+        // (`textured_pipeline_single`) with `LoadOp::Load` -- which is
+        // correct here because this second pass has no `resolve_target` at
+        // all, so `Load` unambiguously means "keep what's in `view`".
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("renderer-cli analytic clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(to_wgpu_color(scene.canvas.background)),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            drop(pass);
+        }
+        for command in &plan.commands {
+            match command {
+                AnalyticDrawCommand::Path(range) => {
+                    let msaa_view = msaa_view
+                        .as_ref()
+                        .expect("msaa target is built whenever a Path command exists");
+                    let path_overlay_texture =
+                        self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("renderer-cli analytic path overlay"),
+                            size: wgpu::Extent3d {
+                                width,
+                                height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        });
+                    let path_overlay_view =
+                        path_overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("renderer-cli analytic path (msaa fallback) pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: msaa_view,
+                                resolve_target: Some(&path_overlay_view),
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Discard,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        pass.set_pipeline(&self.primitive_pipeline);
+                        pass.set_vertex_buffer(0, path_buffer.slice(..));
+                        pass.draw(range.clone(), 0..1);
+                    }
+                    let mut overlay_vertices = Vec::with_capacity(6);
+                    add_textured_rect(
+                        &mut overlay_vertices,
+                        0.0,
+                        0.0,
+                        width as f32,
+                        height as f32,
+                        [1.0; 4],
+                        scene,
+                    );
+                    let overlay_buffer =
+                        self.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("renderer-cli analytic path overlay blit vertices"),
+                                contents: bytemuck::cast_slice(&overlay_vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            });
+                    let overlay_bind_group =
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("renderer-cli analytic path overlay bind group"),
+                            layout: &self.texture_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &path_overlay_view,
+                                    ),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                            ],
+                        });
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("renderer-cli analytic path overlay blit pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.textured_pipeline_single);
+                    pass.set_vertex_buffer(0, overlay_buffer.slice(..));
+                    pass.set_bind_group(0, &overlay_bind_group, &[]);
+                    pass.draw(0..overlay_vertices.len() as u32, 0..1);
+                }
+                AnalyticDrawCommand::Analytic(range) => {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("renderer-cli analytic pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.analytic_pipeline);
+                    pass.set_vertex_buffer(0, analytic_buffer.slice(..));
+                    pass.draw(range.clone(), 0..1);
+                }
+                AnalyticDrawCommand::Textured {
+                    texture_index,
+                    vertices,
+                } => {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("renderer-cli analytic textured pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.textured_pipeline_single);
+                    pass.set_vertex_buffer(0, textured_buffer.slice(..));
+                    pass.set_bind_group(0, &texture_resources[*texture_index].2, &[]);
+                    pass.draw(vertices.clone(), 0..1);
+                }
+            }
+        }
+
+        let effect_texture;
+        let final_texture = if let Some(effect) = &scene.effect {
+            let pipeline = self.build_effect_pipeline(&effect.shader)?;
+            let created = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("renderer-cli analytic effect target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let effect_view = created.create_view(&wgpu::TextureViewDescriptor::default());
+            let effect_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("renderer-cli analytic effect bind group"),
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("renderer-cli analytic effect pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &effect_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &effect_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            effect_texture = created;
+            &effect_texture
+        } else {
+            &texture
+        };
+
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: final_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &output_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = output_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|_| RenderError::Readback)?
+            .map_err(|_| RenderError::Readback)?;
+        let mapped = slice.get_mapped_range();
+        let mut pixels = vec![0; (unpadded_bytes_per_row * height) as usize];
+        for (row, target) in pixels
+            .chunks_exact_mut(unpadded_bytes_per_row as usize)
+            .enumerate()
+        {
+            let start = row * padded_bytes_per_row as usize;
+            target.copy_from_slice(&mapped[start..start + unpadded_bytes_per_row as usize]);
+        }
+        drop(mapped);
+        output_buffer.unmap();
+        // Unlike the original path, there is no supersampled intermediate to
+        // downsample here: `pixels` is already at the scene's declared size.
+        Ok((pixels, Vec::new()))
+    }
+}
+
 fn create_pipelines(
     device: &wgpu::Device,
 ) -> (
@@ -884,6 +1522,92 @@ fn create_pipelines(
     )
 }
 
+/// Builds the two pipelines the analytic-AA "shadow mode" path uses (see the
+/// `impl GpuRenderer` block above `create_pipelines`, and `ANALYTIC_SHADER`).
+/// Wholly separate from `create_pipelines`, which this function does not
+/// call and does not modify in any way -- the existing MSAA+supersampling
+/// pipelines it builds are unaffected.
+///
+/// - `analytic_pipeline` draws rect/ellipse/line primitives with the SDF
+///   shader (`ANALYTIC_SHADER`), single-sampled (`multisample.count == 1`),
+///   matching the single-sampled render target `render_composed_rgba_
+///   analytic_with_cache` uses (no MSAA texture, no resolve).
+/// - `textured_pipeline_single` draws text glyphs and images. It uses the
+///   exact same shader source (`TEXTURED_SHADER`) and vertex format
+///   (`TexturedVertex`) as the existing `textured_pipeline`, but a *new*
+///   `wgpu::RenderPipeline` object is required because `textured_pipeline`
+///   was built with `multisample.count == MSAA_SAMPLE_COUNT` to match the
+///   msaa attachment it is normally drawn into; a pipeline's multisample
+///   state must match whatever render pass attachment it is bound within; a
+///   4x-multisample pipeline cannot be used inside a single-sampled render
+///   pass (`create_render_pipeline` would be fine, but the later
+///   `set_pipeline` inside a mismatched pass would be a validation error).
+///   Sharing `texture_bind_group_layout` and the (multisample-agnostic)
+///   sampler with the original path is safe: neither carries any
+///   sample-count information.
+fn create_analytic_pipelines(
+    device: &wgpu::Device,
+    texture_bind_group_layout: &wgpu::BindGroupLayout,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let analytic_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("renderer-cli analytic primitives"),
+        source: wgpu::ShaderSource::Wgsl(ANALYTIC_SHADER.into()),
+    });
+    let analytic_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("renderer-cli analytic layout"),
+        bind_group_layouts: &[],
+        push_constant_ranges: &[],
+    });
+    let analytic_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("renderer-cli analytic pipeline"),
+        layout: Some(&analytic_layout),
+        vertex: wgpu::VertexState {
+            module: &analytic_shader,
+            entry_point: "vs_main",
+            buffers: &[AnalyticVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &analytic_shader,
+            entry_point: "fs_main",
+            targets: &[Some(color_target())],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    let texture_shader_single = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("renderer-cli textured quads (single-sample)"),
+        source: wgpu::ShaderSource::Wgsl(TEXTURED_SHADER.into()),
+    });
+    let textured_layout_single = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("renderer-cli textured layout (single-sample)"),
+        bind_group_layouts: &[texture_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let textured_pipeline_single = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("renderer-cli textured pipeline (single-sample)"),
+        layout: Some(&textured_layout_single),
+        vertex: wgpu::VertexState {
+            module: &texture_shader_single,
+            entry_point: "vs_main",
+            buffers: &[TexturedVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &texture_shader_single,
+            entry_point: "fs_main",
+            targets: &[Some(color_target())],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    (analytic_pipeline, textured_pipeline_single)
+}
+
 fn color_target() -> wgpu::ColorTargetState {
     wgpu::ColorTargetState {
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -933,6 +1657,221 @@ impl TexturedVertex {
             attributes: &Self::ATTRIBUTES,
         }
     }
+}
+
+/// Vertex format for the analytic (signed-distance-field) anti-aliasing
+/// pipeline -- see `ANALYTIC_SHADER`. Rect, ellipse, and line SDFs each need
+/// genuinely different per-vertex data: a rect's box SDF needs a half-extent;
+/// an ellipse's squashed-space SDF needs radii-normalized local coordinates;
+/// a line's capsule SDF needs both segment endpoints, a half-thickness, and
+/// the fragment's own local position. Two designs were considered: (a) three
+/// small, shape-specific vertex formats/pipelines/shaders, or (b) one
+/// flexible format wide enough for the most demanding shape (the line
+/// capsule), tagged with a `shape_kind` the fragment shader switches on.
+/// This uses (b): one pipeline and one shader module is simpler to build,
+/// test, and reason about than three near-identical small ones for a
+/// renderer this size, at the cost of a few unused `f32`s per vertex on the
+/// simpler shapes (`param1`/`param2` go unused for Rect and Ellipse) -- a
+/// fine trade here. Each shape's builder function
+/// (`add_rect_analytic`/`add_ellipse_analytic`/`add_line_analytic` below)
+/// zeroes whatever fields its shape kind does not use.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AnalyticVertex {
+    /// Clip-space position, computed exactly like `vertex()`/`add_textured_
+    /// rect`'s `point()` helper above.
+    clip_position: [f32; 2],
+    color: Color,
+    /// Which SDF `fs_main` (in `ANALYTIC_SHADER`) evaluates for this
+    /// fragment -- one of `ANALYTIC_SHAPE_RECT`/`ANALYTIC_SHAPE_ELLIPSE`/
+    /// `ANALYTIC_SHAPE_LINE`. Constant across every vertex of one shape, so
+    /// it is marked `@interpolate(flat)` on the WGSL side (required for
+    /// integer varyings regardless).
+    shape_kind: u32,
+    /// Meaning depends on `shape_kind`:
+    /// - Rect: `(fragment - center)`, in scene-pixel units.
+    /// - Ellipse: `(fragment - center) / (rx, ry)` -- already in the
+    ///   ellipse's "squashed" unit-circle space.
+    /// - Line: the fragment's raw scene-pixel position (the capsule SDF
+    ///   needs the actual position, not one pre-offset by anything).
+    local: [f32; 2],
+    /// Rect: `(half_width, half_height)`. Line: segment start `a`. Unused
+    /// (zeroed) for Ellipse.
+    param0: [f32; 2],
+    /// Line: segment end `b`. Unused (zeroed) for Rect and Ellipse.
+    param1: [f32; 2],
+    /// Line: `.x` is the half-thickness; `.y` is unused padding. Unused
+    /// (zeroed) for Rect and Ellipse.
+    param2: [f32; 2],
+}
+
+impl AnalyticVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
+        0 => Float32x2,
+        1 => Float32x4,
+        2 => Uint32,
+        3 => Float32x2,
+        4 => Float32x2,
+        5 => Float32x2,
+        6 => Float32x2,
+    ];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+const ANALYTIC_SHAPE_RECT: u32 = 0;
+const ANALYTIC_SHAPE_ELLIPSE: u32 = 1;
+const ANALYTIC_SHAPE_LINE: u32 = 2;
+
+/// Geometry margin, in scene-pixel units, that every analytic-AA shape
+/// builder expands its emitted triangle(s) by beyond the shape's true
+/// mathematical boundary (while the SDF math itself still measures distance
+/// to the *true*, unexpanded boundary -- see each builder function). The
+/// rasterizer only ever runs the fragment shader on pixels actually covered
+/// by the submitted geometry; without this margin, pixels just outside the
+/// exact edge -- exactly the pixels `fwidth`-based coverage needs to fade
+/// smoothly through on its way to 0 -- would never be shaded at all,
+/// producing a hard clip at the true edge instead of a smooth fade beside
+/// it. 2 scene pixels is comfortably wider than the ~1-pixel coverage band
+/// `fs_main` computes for any shape/canvas size this renderer supports.
+const ANALYTIC_AA_MARGIN: f32 = 2.0;
+
+/// Same clip-space mapping as `vertex()`/`add_textured_rect`'s `point()`
+/// helper above, factored out for the three analytic-AA shape builders.
+fn analytic_clip_position(x: f32, y: f32, scene: &SceneV1) -> [f32; 2] {
+    [
+        x / scene.canvas.width as f32 * 2.0 - 1.0,
+        1.0 - y / scene.canvas.height as f32 * 2.0,
+    ]
+}
+
+/// Emits an analytic-AA rect: a single quad expanded by `ANALYTIC_AA_MARGIN`
+/// on every side, carrying the *true* (unexpanded) half-extent in `param0`
+/// so `rect_sdf` in `ANALYTIC_SHADER` measures distance to the actual
+/// declared rect boundary.
+fn add_rect_analytic(
+    vertices: &mut Vec<AnalyticVertex>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    color: Color,
+    scene: &SceneV1,
+) {
+    let half_size = [width / 2.0, height / 2.0];
+    let center = [x + half_size[0], y + half_size[1]];
+    let margin = ANALYTIC_AA_MARGIN;
+    let make = |px: f32, py: f32| AnalyticVertex {
+        clip_position: analytic_clip_position(px, py, scene),
+        color,
+        shape_kind: ANALYTIC_SHAPE_RECT,
+        local: [px - center[0], py - center[1]],
+        param0: half_size,
+        param1: [0.0; 2],
+        param2: [0.0; 2],
+    };
+    let a = make(x - margin, y - margin);
+    let b = make(x + width + margin, y - margin);
+    let c = make(x + width + margin, y + height + margin);
+    let d = make(x - margin, y + height + margin);
+    vertices.extend([a, b, c, a, c, d]);
+}
+
+/// Emits an analytic-AA ellipse as a triangle fan (mirroring `add_ellipse`'s
+/// shape), but with the fan's *geometry* radii expanded by
+/// `ANALYTIC_AA_MARGIN` (so the rasterizer shades a ring of pixels just
+/// outside the true boundary) while `local` -- and therefore `ellipse_sdf`
+/// in `ANALYTIC_SHADER` -- is always computed against the *true*,
+/// unexpanded `rx`/`ry`.
+fn add_ellipse_analytic(
+    vertices: &mut Vec<AnalyticVertex>,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    color: Color,
+    scene: &SceneV1,
+) {
+    let geo_rx = rx + ANALYTIC_AA_MARGIN;
+    let geo_ry = ry + ANALYTIC_AA_MARGIN;
+    let make = |px: f32, py: f32| AnalyticVertex {
+        clip_position: analytic_clip_position(px, py, scene),
+        color,
+        shape_kind: ANALYTIC_SHAPE_ELLIPSE,
+        local: [(px - cx) / rx, (py - cy) / ry],
+        param0: [0.0; 2],
+        param1: [0.0; 2],
+        param2: [0.0; 2],
+    };
+    let center = make(cx, cy);
+    for index in 0..ELLIPSE_SEGMENTS {
+        let start = std::f32::consts::TAU * index as f32 / ELLIPSE_SEGMENTS as f32;
+        let end = std::f32::consts::TAU * (index + 1) as f32 / ELLIPSE_SEGMENTS as f32;
+        vertices.extend([
+            center,
+            make(cx + geo_rx * start.cos(), cy + geo_ry * start.sin()),
+            make(cx + geo_rx * end.cos(), cy + geo_ry * end.sin()),
+        ]);
+    }
+}
+
+/// Emits an analytic-AA line as a single quad wide/long enough to cover the
+/// entire capsule (both rounded ends included) plus `ANALYTIC_AA_MARGIN`,
+/// carrying the *true* (unexpanded) endpoints and half-thickness so
+/// `capsule_sdf` in `ANALYTIC_SHADER` measures distance to the actual
+/// declared stroke.
+fn add_line_analytic(
+    vertices: &mut Vec<AnalyticVertex>,
+    start: [f32; 2],
+    end: [f32; 2],
+    thickness: f32,
+    color: Color,
+    scene: &SceneV1,
+) {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    if length == 0.0 {
+        return;
+    }
+    let dir = [dx / length, dy / length];
+    let perp = [-dir[1], dir[0]];
+    let half_thickness = thickness / 2.0;
+    let extent = half_thickness + ANALYTIC_AA_MARGIN;
+    let offset = |along: f32, across: f32| {
+        [
+            dir[0] * along + perp[0] * across,
+            dir[1] * along + perp[1] * across,
+        ]
+    };
+    let corner = |base: [f32; 2], along: f32, across: f32| {
+        let delta = offset(along, across);
+        [base[0] + delta[0], base[1] + delta[1]]
+    };
+    let p1 = corner(start, -extent, -extent);
+    let p2 = corner(end, extent, -extent);
+    let p3 = corner(end, extent, extent);
+    let p4 = corner(start, -extent, extent);
+    let make = |p: [f32; 2]| AnalyticVertex {
+        clip_position: analytic_clip_position(p[0], p[1], scene),
+        color,
+        shape_kind: ANALYTIC_SHAPE_LINE,
+        local: p,
+        param0: start,
+        param1: end,
+        param2: [half_thickness, 0.0],
+    };
+    let a = make(p1);
+    let b = make(p2);
+    let c = make(p3);
+    let d = make(p4);
+    vertices.extend([a, b, c, a, c, d]);
 }
 
 enum DrawCommand {
@@ -1284,6 +2223,338 @@ fn composition_plan(
         }
     }
     Ok(plan)
+}
+
+/// Draw-command list for the analytic-AA composition plan (see
+/// `CompositionPlanAnalytic`/`composition_plan_analytic`). This mirrors
+/// `DrawCommand` above but splits its catch-all `Primitive` variant into two
+/// -- `Analytic` (Rect/Ellipse/Line, drawn with `AnalyticVertex`/`analytic_
+/// pipeline`) and `Path` (drawn with the original `Vertex`/`primitive_
+/// pipeline`, as the documented MSAA fallback -- see `composition_plan_
+/// analytic`'s doc comment) -- since those two need different GPU pipelines
+/// with different render-target sample counts and therefore different
+/// render passes (see `render_composed_rgba_analytic_with_cache`).
+enum AnalyticDrawCommand {
+    Analytic(std::ops::Range<u32>),
+    Path(std::ops::Range<u32>),
+    Textured {
+        texture_index: usize,
+        vertices: std::ops::Range<u32>,
+    },
+}
+
+/// Analytic-AA counterpart to `CompositionPlan`. `textures` and `textured_
+/// vertices` are the same `TextureData`/`TexturedVertex` types the original
+/// path uses (text/images are handled identically either way -- see
+/// `composition_plan_analytic`); `analytic_vertices` holds the new `Analytic
+/// Vertex` geometry for Rect/Ellipse/Line, and `path_vertices` holds plain
+/// `Vertex` geometry (built with the existing, untouched `add_path`) for the
+/// `Path` MSAA fallback.
+struct CompositionPlanAnalytic {
+    analytic_vertices: Vec<AnalyticVertex>,
+    path_vertices: Vec<Vertex>,
+    textured_vertices: Vec<TexturedVertex>,
+    commands: Vec<AnalyticDrawCommand>,
+    textures: Vec<TextureData>,
+}
+
+/// Analytic-AA counterpart to `composition_plan`. A separate function
+/// (rather than a shared helper `composition_plan` also calls) so that
+/// `composition_plan` itself -- and therefore every existing render entry
+/// point's behavior -- is not touched at all by this addition. Text and
+/// image handling below is intentionally near-identical to
+/// `composition_plan`'s (same caching, same validation, same texture
+/// upload prep -- none of `AssetCache`/`DecodedImage`/`DecodedGlyph`/
+/// `TextureData`/`reserve_composition_pixels`/`validate_text_raster`/
+/// `load_image`/`upload_dimensions`/`bounded_image_dimension`/`ensure_
+/// target_image_dimensions` are modified, only reused) since this project's
+/// SDF/`fwidth` anti-aliasing technique is specifically about vector
+/// *shape* edges, not about how text glyphs or images are rasterized/
+/// uploaded.
+///
+/// Rect/Ellipse/Line nodes are built with the new `add_*_analytic` builders
+/// into `analytic_vertices`. `Path` nodes are the one documented exception
+/// to "fully analytic": implementing a mathematically sound analytic SDF for
+/// an arbitrary (potentially concave, potentially self-intersecting)
+/// filled polygon is substantially more involved than the closed-form
+/// rect/ellipse/capsule SDFs above, so -- as this project's task brief
+/// explicitly allows -- `Path` nodes here fall back to exactly the existing
+/// MSAA `primitive_pipeline`/`add_path`/`Vertex` machinery, unchanged,
+/// executed in its own multisampled render pass that resolves into the same
+/// target the analytic passes draw into (see `render_composed_rgba_
+/// analytic_with_cache`). This means a scene that uses `Path` nodes gets
+/// MSAA-only (no supersampling) quality for just those nodes while every
+/// other shape in the same scene still gets full analytic AA -- a
+/// consciously narrower guarantee for one shape kind, not a silent gap.
+fn composition_plan_analytic(
+    scene: &SceneV1,
+    asset_root: &Path,
+    font: &Font,
+    cache: &mut AssetCache,
+) -> Result<CompositionPlanAnalytic, RenderError> {
+    let mut plan = CompositionPlanAnalytic {
+        analytic_vertices: Vec::new(),
+        path_vertices: Vec::new(),
+        textured_vertices: Vec::new(),
+        commands: Vec::new(),
+        textures: Vec::new(),
+    };
+    let mut image_textures = HashMap::new();
+    let mut glyph_textures = HashMap::new();
+    let mut texture_pixels = 0_u64;
+    for node in &scene.nodes {
+        match &node.kind {
+            NodeKindV1::Text {
+                x,
+                y,
+                text,
+                size,
+                color,
+            } => {
+                validate_text_raster(node.id.as_str(), text, *size, scene)?;
+                let mut cursor_x = *x;
+                let mut previous = None;
+                for character in text.chars() {
+                    if let Some(left) = previous {
+                        cursor_x += font.horizontal_kern(left, character, *size).unwrap_or(0.0);
+                    }
+                    let key = (character, size.to_bits());
+                    let (texture_index, metrics) = if let Some(value) = glyph_textures.get(&key) {
+                        *value
+                    } else {
+                        let decoded = match cache.glyphs.entry(key) {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let (metrics, bitmap) = font.rasterize(character, *size);
+                                if metrics.width == 0 || metrics.height == 0 {
+                                    cursor_x += metrics.advance_width;
+                                    previous = Some(character);
+                                    continue;
+                                }
+                                let pixels = bitmap
+                                    .into_iter()
+                                    .flat_map(|alpha| [255, 255, 255, alpha])
+                                    .collect();
+                                #[cfg(test)]
+                                {
+                                    cache.glyph_rasterizations += 1;
+                                }
+                                entry.insert(DecodedGlyph { metrics, pixels })
+                            }
+                        };
+                        let metrics = decoded.metrics;
+                        texture_pixels = reserve_composition_pixels(
+                            texture_pixels,
+                            (metrics.width * metrics.height) as u64,
+                        )?;
+                        let index = plan.textures.len();
+                        plan.textures.push(TextureData {
+                            label: format!("glyph-{}-{}", character as u32, size),
+                            width: metrics.width as u32,
+                            height: metrics.height as u32,
+                            pixels: decoded.pixels.clone(),
+                        });
+                        glyph_textures.insert(key, (index, metrics));
+                        (index, metrics)
+                    };
+                    let start = plan.textured_vertices.len() as u32;
+                    add_textured_rect(
+                        &mut plan.textured_vertices,
+                        cursor_x + metrics.xmin as f32,
+                        *y + (*size - metrics.height as f32 - metrics.ymin as f32),
+                        metrics.width as f32,
+                        metrics.height as f32,
+                        *color,
+                        scene,
+                    );
+                    plan.commands.push(AnalyticDrawCommand::Textured {
+                        texture_index,
+                        vertices: start..start + 6,
+                    });
+                    cursor_x += metrics.advance_width;
+                    previous = Some(character);
+                }
+            }
+            NodeKindV1::Image {
+                x,
+                y,
+                width,
+                height,
+                source,
+            } => {
+                let target_width = bounded_image_dimension(*width, "width")?;
+                let target_height = bounded_image_dimension(*height, "height")?;
+                ensure_target_image_dimensions(target_width, target_height, source)?;
+                let upload_width = target_width.min(MAX_GPU_TEXTURE_DIMENSION);
+                let upload_height = target_height.min(MAX_GPU_TEXTURE_DIMENSION);
+                let cache_key = (source.clone(), upload_width, upload_height);
+                let texture_index = if let Some(index) = image_textures.get(&cache_key) {
+                    *index
+                } else {
+                    let decoded = match cache.images.entry(cache_key.clone()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let image =
+                                load_image(asset_root, source, upload_width, upload_height)?;
+                            let (final_width, final_height) = upload_dimensions(
+                                image.width(),
+                                image.height(),
+                                target_width,
+                                target_height,
+                            );
+                            let image =
+                                if image.width() == final_width && image.height() == final_height {
+                                    image
+                                } else {
+                                    image::DynamicImage::ImageRgba8(image)
+                                        .resize_exact(
+                                            final_width,
+                                            final_height,
+                                            image::imageops::FilterType::Triangle,
+                                        )
+                                        .to_rgba8()
+                                };
+                            #[cfg(test)]
+                            {
+                                cache.image_decodes += 1;
+                            }
+                            entry.insert(DecodedImage {
+                                width: image.width(),
+                                height: image.height(),
+                                pixels: image.into_raw(),
+                            })
+                        }
+                    };
+                    texture_pixels = reserve_composition_pixels(
+                        texture_pixels,
+                        u64::from(decoded.width) * u64::from(decoded.height),
+                    )?;
+                    let index = plan.textures.len();
+                    plan.textures.push(TextureData {
+                        label: format!("image-{source}"),
+                        width: decoded.width,
+                        height: decoded.height,
+                        pixels: decoded.pixels.clone(),
+                    });
+                    image_textures.insert(cache_key, index);
+                    index
+                };
+                let start = plan.textured_vertices.len() as u32;
+                add_textured_rect(
+                    &mut plan.textured_vertices,
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    [1.0; 4],
+                    scene,
+                );
+                plan.commands.push(AnalyticDrawCommand::Textured {
+                    texture_index,
+                    vertices: start..start + 6,
+                });
+            }
+            NodeKindV1::Path { points, color } => {
+                let start = plan.path_vertices.len() as u32;
+                add_path(&mut plan.path_vertices, points, *color, scene);
+                let end = plan.path_vertices.len() as u32;
+                if start != end {
+                    if let Some(AnalyticDrawCommand::Path(range)) = plan.commands.last_mut() {
+                        range.end = end;
+                    } else {
+                        plan.commands.push(AnalyticDrawCommand::Path(start..end));
+                    }
+                }
+            }
+            NodeKindV1::Rect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => {
+                let start = plan.analytic_vertices.len() as u32;
+                add_rect_analytic(
+                    &mut plan.analytic_vertices,
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    *color,
+                    scene,
+                );
+                push_analytic_range(
+                    &mut plan.commands,
+                    start,
+                    plan.analytic_vertices.len() as u32,
+                );
+            }
+            NodeKindV1::Ellipse {
+                cx,
+                cy,
+                rx,
+                ry,
+                color,
+            } => {
+                let start = plan.analytic_vertices.len() as u32;
+                add_ellipse_analytic(
+                    &mut plan.analytic_vertices,
+                    *cx,
+                    *cy,
+                    *rx,
+                    *ry,
+                    *color,
+                    scene,
+                );
+                push_analytic_range(
+                    &mut plan.commands,
+                    start,
+                    plan.analytic_vertices.len() as u32,
+                );
+            }
+            NodeKindV1::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                thickness,
+                color,
+            } => {
+                let start = plan.analytic_vertices.len() as u32;
+                add_line_analytic(
+                    &mut plan.analytic_vertices,
+                    [*x1, *y1],
+                    [*x2, *y2],
+                    *thickness,
+                    *color,
+                    scene,
+                );
+                push_analytic_range(
+                    &mut plan.commands,
+                    start,
+                    plan.analytic_vertices.len() as u32,
+                );
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// Merges a freshly-emitted `[start, end)` `AnalyticVertex` range into
+/// `commands`: extends the last command if it is already an `Analytic` run
+/// (matching how `composition_plan`'s catch-all branch merges consecutive
+/// `Primitive` commands above), otherwise pushes a new one. A no-op when
+/// `start == end` (an unfilled range, matching e.g. `add_line_analytic`'s
+/// early return for a zero-length line).
+fn push_analytic_range(commands: &mut Vec<AnalyticDrawCommand>, start: u32, end: u32) {
+    if start == end {
+        return;
+    }
+    if let Some(AnalyticDrawCommand::Analytic(range)) = commands.last_mut() {
+        range.end = end;
+    } else {
+        commands.push(AnalyticDrawCommand::Analytic(start..end));
+    }
 }
 
 fn upload_dimensions(
@@ -2087,6 +3358,122 @@ fn vs_main(
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(image_texture, image_sampler, input.uv) * input.tint;
+}
+"#;
+
+/// Shader for the analytic (signed-distance-field) anti-aliasing pipeline
+/// (`analytic_pipeline`, built in `create_analytic_pipelines`; vertex format
+/// is `AnalyticVertex`). Renders rect/ellipse/line primitives with an exact
+/// analytic distance to each shape's true mathematical boundary, converted
+/// to a smooth per-fragment coverage value with `fwidth` -- a single sample
+/// per fragment, no multisampling.
+///
+/// Sign convention (standard for SDF rendering): `d < 0` means inside the
+/// shape, `d == 0` is exactly on the boundary, `d > 0` means outside.
+///
+/// `fwidth(d)` is the screen-space rate of change of `d` between this
+/// fragment and its neighbors -- i.e. "how many `d` units does one pixel
+/// span here" -- which is why this technique needs no separate resolution
+/// or transform parameter: it is automatically correct at any zoom/skew
+/// because it is derived from the GPU's own rasterization derivatives.
+/// `coverage` linearly ramps from 1 (fully inside) to 0 (fully outside)
+/// across a band roughly one pixel wide, centered on `d == 0`.
+const ANALYTIC_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) @interpolate(flat) shape_kind: u32,
+    @location(2) local: vec2<f32>,
+    @location(3) param0: vec2<f32>,
+    @location(4) param1: vec2<f32>,
+    @location(5) param2: vec2<f32>,
+}
+
+const SHAPE_RECT: u32 = 0u;
+const SHAPE_ELLIPSE: u32 = 1u;
+const SHAPE_LINE: u32 = 2u;
+
+@vertex
+fn vs_main(
+    @location(0) clip_position: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) shape_kind: u32,
+    @location(3) local: vec2<f32>,
+    @location(4) param0: vec2<f32>,
+    @location(5) param1: vec2<f32>,
+    @location(6) param2: vec2<f32>,
+) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = vec4<f32>(clip_position, 0.0, 1.0);
+    output.color = color;
+    output.shape_kind = shape_kind;
+    output.local = local;
+    output.param0 = param0;
+    output.param1 = param1;
+    output.param2 = param2;
+    return output;
+}
+
+// Axis-aligned box SDF in the rect's local (fragment - center) space.
+fn rect_sdf(local: vec2<f32>, half_size: vec2<f32>) -> f32 {
+    let delta = abs(local) - half_size;
+    return max(delta.x, delta.y);
+}
+
+// Ellipse SDF approximation in "squashed" space: `local` is
+// `(fragment - center) / (rx, ry)`, so the true ellipse boundary maps to the
+// unit circle, where `length(local) - 1.0` is exactly zero. This is NOT the
+// true Euclidean distance to an ellipse boundary for `rx != ry` (that has no
+// simple closed form); it is a standard, widely used approximation. The
+// per-fragment gradient still shrinks smoothly to zero exactly at the
+// boundary -- all `fwidth`-based coverage actually needs -- but the *rate*
+// isn't perfectly isotropic away from the major/minor axes for very
+// eccentric ellipses, so the apparent AA band width can vary slightly around
+// the boundary of a very non-circular ellipse. Acceptable trade-off for this
+// renderer's scale; see `Path`'s documented fallback below for the same
+// spirit applied to a harder shape.
+fn ellipse_sdf(local: vec2<f32>) -> f32 {
+    return length(local) - 1.0;
+}
+
+// Standard 2D capsule SDF: distance from `point` to the segment [a, b],
+// minus the half-thickness. `point`/`a`/`b` are all in the same (scene-pixel)
+// space.
+fn capsule_sdf(point: vec2<f32>, a: vec2<f32>, b: vec2<f32>, half_thickness: f32) -> f32 {
+    let pa = point - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * h) - half_thickness;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    var d: f32;
+    if (input.shape_kind == SHAPE_RECT) {
+        d = rect_sdf(input.local, input.param0);
+    } else if (input.shape_kind == SHAPE_ELLIPSE) {
+        d = ellipse_sdf(input.local);
+    } else {
+        d = capsule_sdf(input.local, input.param0, input.param1, input.param2.x);
+    }
+    // `fwidth(d)` (for the true-unit-gradient SDFs above) is exactly a unit
+    // pixel's footprint width projected onto the distance gradient's
+    // direction -- i.e. exactly how far `d` needs to travel to cross one
+    // whole pixel. A coverage ramp that spans exactly that width, centered
+    // on `d == 0`, is `clamp(0.5 - d / fwidth(d), 0.0, 1.0)`: 1.0 (fully
+    // covered) at `d == -fwidth(d)/2` (half a pixel-footprint inside), 0.0
+    // at `d == +fwidth(d)/2`. An earlier version divided by `fwidth(d) *
+    // 0.5` here, which halves the ramp's width (saturates to fully
+    // covered/uncovered at a quarter-pixel-footprint instead of half) --
+    // caught by comparing rendered output against numerically-integrated
+    // ground-truth pixel coverage: it saturated to exactly the fill/
+    // background color at pixels whose true area coverage was still only
+    // ~89%/~17%, not near 100%/0%.
+    let aa_width = max(fwidth(d), 1e-5);
+    let coverage = clamp(0.5 - d / aa_width, 0.0, 1.0);
+    var color = input.color;
+    color.a = color.a * coverage;
+    return color;
 }
 "#;
 
@@ -3486,6 +4873,658 @@ mod tests {
         });
         assert_eq!(decoded.width(), 32);
         assert_eq!(decoded.height(), 32);
+    }
+
+    // ---- Analytic (SDF + fwidth) anti-aliasing "shadow mode" tests ----
+    //
+    // New, separately-named tests only: none of these touch, modify, or
+    // regenerate any existing golden image or existing test above, and none
+    // of the existing tests above were changed to make room for these.
+
+    /// Basic functional coverage of the analytic-AA path across every node
+    /// kind this renderer supports, including the documented `Path` MSAA
+    /// fallback (see `composition_plan_analytic`'s doc comment) and an image
+    /// asset. Mirrors the spirit of `compiles_all_geometry_and_reports_
+    /// unrasterized_nodes` (portable) and `renders_png_and_gif_on_an_
+    /// available_gpu` (GPU) above, but actually renders through the new
+    /// `_analytic_aa` entry points end to end.
+    #[test]
+    fn analytic_aa_renders_every_node_kind_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
+            .save(directory.path().join("logo.png"))
+            .unwrap();
+
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![
+                NodeV1 {
+                    id: "rect".into(),
+                    kind: NodeKindV1::Rect {
+                        x: 2.0,
+                        y: 2.0,
+                        width: 10.0,
+                        height: 10.0,
+                        color: [1.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                NodeV1 {
+                    id: "ellipse".into(),
+                    kind: NodeKindV1::Ellipse {
+                        cx: 30.0,
+                        cy: 10.0,
+                        rx: 6.0,
+                        ry: 4.0,
+                        color: [0.0, 1.0, 0.0, 1.0],
+                    },
+                },
+                NodeV1 {
+                    id: "line".into(),
+                    kind: NodeKindV1::Line {
+                        x1: 4.0,
+                        y1: 30.0,
+                        x2: 40.0,
+                        y2: 50.0,
+                        thickness: 3.0,
+                        color: [0.0, 0.0, 1.0, 1.0],
+                    },
+                },
+                NodeV1 {
+                    id: "path".into(),
+                    kind: NodeKindV1::Path {
+                        points: vec![
+                            renderer_schema::PointV1 { x: 45.0, y: 5.0 },
+                            renderer_schema::PointV1 { x: 60.0, y: 5.0 },
+                            renderer_schema::PointV1 { x: 52.0, y: 20.0 },
+                        ],
+                        color: [0.5, 0.0, 0.5, 1.0],
+                    },
+                },
+                NodeV1 {
+                    id: "text".into(),
+                    kind: NodeKindV1::Text {
+                        x: 4.0,
+                        y: 44.0,
+                        text: "Hi".into(),
+                        size: 12.0,
+                        color: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                NodeV1 {
+                    id: "logo".into(),
+                    kind: NodeKindV1::Image {
+                        x: 44.0,
+                        y: 44.0,
+                        width: 8.0,
+                        height: 8.0,
+                        source: "logo.png".into(),
+                    },
+                },
+            ],
+            timeline: None,
+            effect: None,
+        };
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer
+            .render_rgba_with_asset_root_analytic_aa(&scene, directory.path())
+            .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(pixels.len(), 64 * 64 * 4);
+
+        // Every non-background color used above must appear somewhere in the
+        // output (allowing for AA blending, so this checks for "close to"
+        // rather than an exact byte match) -- proof each node kind actually
+        // rasterized something instead of silently no-opping.
+        let expects = [
+            ("rect (red)", [255u8, 0, 0]),
+            ("ellipse (green)", [0, 255, 0]),
+            ("line (blue)", [0, 0, 255]),
+            // Not a naive linear-to-255 mapping (0.5*255=128): this
+            // renderer's output is sRGB-gamma-encoded, and gamma-encoding
+            // linear 0.5 gives ~0.735, i.e. ~188/255 -- confirmed against
+            // the actual rendered pixel value. Every other entry in this
+            // list happens to use a pure 0.0/1.0 channel value, which gamma
+            // encoding leaves unchanged, so this is the only one affected.
+            ("path (purple)", [188, 0, 188]),
+            ("image (logo)", [10, 20, 30]),
+        ];
+        for (label, target) in expects {
+            let found = pixels.as_chunks::<4>().0.iter().any(|pixel| {
+                (0..3).all(|channel| (pixel[channel] as i16 - target[channel] as i16).abs() <= 12)
+            });
+            assert!(
+                found,
+                "{label}: expected a pixel close to {target:?} in the analytic-AA render"
+            );
+        }
+
+        // A round trip through `render_png_with_asset_root_analytic_aa`
+        // works end to end too.
+        let png = renderer
+            .render_png_with_asset_root_analytic_aa(
+                &scene,
+                &directory.path().join("out.png"),
+                directory.path(),
+            )
+            .unwrap();
+        assert_eq!(png.width, 64);
+        assert_eq!(png.height, 64);
+        assert_eq!(png.frame_count, 1);
+    }
+
+    /// Analytic-AA counterpart to `anti_aliases_diagonal_primitive_edges_
+    /// on_an_available_gpu` above: same diagonal-line scene, same "at least
+    /// one pixel strictly between background and line color" check, but
+    /// rendered through `render_rgba_analytic_aa` instead of `render_rgba`.
+    /// Confirms the SDF/`fwidth` pipeline produces real coverage-weighted
+    /// blending, not a hard binary edge, exactly like the existing MSAA path
+    /// -- from an entirely separate pipeline/shader.
+    #[test]
+    fn analytic_aa_anti_aliases_diagonal_primitive_edges_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = diagonal_line_scene();
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer.render_rgba_analytic_aa(&scene).unwrap();
+        assert!(warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+        let background_pixel = pixel_at(0, 0);
+        let line_pixel = pixel_at(32, 32);
+        assert_ne!(background_pixel, line_pixel);
+
+        let mut found_blended_pixel = false;
+        'scan: for y in 0..scene.canvas.height as usize {
+            for x in 0..width {
+                let pixel = pixel_at(x, y);
+                let strictly_between = (0..3).all(|channel| {
+                    let low = background_pixel[channel].min(line_pixel[channel]);
+                    let high = background_pixel[channel].max(line_pixel[channel]);
+                    pixel[channel] > low && pixel[channel] < high
+                });
+                if strictly_between {
+                    found_blended_pixel = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(
+            found_blended_pixel,
+            "expected at least one analytically anti-aliased pixel strictly between the \
+             background color {background_pixel:?} and the line color {line_pixel:?}"
+        );
+    }
+
+    /// Confirms `Path` nodes still render via the documented MSAA fallback
+    /// (see `composition_plan_analytic`'s doc comment) *and* that draw order
+    /// across heterogeneous pipelines is preserved: a `Path` node sandwiched
+    /// between two analytic-pipeline `Rect` nodes must still composite in
+    /// document order (later nodes drawn on top of earlier ones), even
+    /// though the multi-pass design (`render_composed_rgba_analytic_with_
+    /// cache`) executes the `Path` node in a separate, differently-sampled
+    /// render pass from its analytic-pipeline neighbors.
+    #[test]
+    fn analytic_aa_preserves_z_order_across_the_path_msaa_fallback_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 32,
+                height: 32,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![
+                // Bottom: a big opaque red square covering the whole canvas.
+                NodeV1 {
+                    id: "background-rect".into(),
+                    kind: NodeKindV1::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 32.0,
+                        height: 32.0,
+                        color: [1.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                // Middle: an opaque green path covering the whole canvas --
+                // must fully occlude the red rect beneath it.
+                NodeV1 {
+                    id: "middle-path".into(),
+                    kind: NodeKindV1::Path {
+                        points: vec![
+                            renderer_schema::PointV1 { x: 0.0, y: 0.0 },
+                            renderer_schema::PointV1 { x: 32.0, y: 0.0 },
+                            renderer_schema::PointV1 { x: 32.0, y: 32.0 },
+                            renderer_schema::PointV1 { x: 0.0, y: 32.0 },
+                        ],
+                        color: [0.0, 1.0, 0.0, 1.0],
+                    },
+                },
+                // Top: a small opaque blue square -- must occlude the green
+                // path beneath it, proving the *next* analytic-pipeline pass
+                // still loads (not clears) the prior Path pass's output.
+                NodeV1 {
+                    id: "top-rect".into(),
+                    kind: NodeKindV1::Rect {
+                        x: 8.0,
+                        y: 8.0,
+                        width: 8.0,
+                        height: 8.0,
+                        color: [0.0, 0.0, 1.0, 1.0],
+                    },
+                },
+            ],
+            timeline: None,
+            effect: None,
+        };
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer.render_rgba_analytic_aa(&scene).unwrap();
+        assert!(warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+        // Far from every edge, so no AA blending is in play: a corner (only
+        // the green path should be visible -- proving it occluded the red
+        // rect) and the small blue square's center (proving it occluded the
+        // green path).
+        let corner = pixel_at(2, 2);
+        let top = pixel_at(12, 12);
+        assert!(
+            corner[1] > 200 && corner[0] < 40 && corner[2] < 40,
+            "expected the green path to occlude the red rect beneath it at a corner far from \
+             any edge, got {corner:?}"
+        );
+        assert!(
+            top[2] > 200 && top[0] < 40 && top[1] < 40,
+            "expected the blue rect to occlude the green path beneath it at its center, got {top:?}"
+        );
+    }
+
+    /// GIF export through the analytic-AA path works end to end, mirroring
+    /// `renders_png_and_gif_on_an_available_gpu` above but via `render_gif_
+    /// analytic_aa`.
+    #[test]
+    fn analytic_aa_renders_gif_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut scene = test_scene();
+        scene.timeline = Some(renderer_schema::TimelineV1 {
+            fps: 2,
+            duration_ms: 1_000,
+            keyframes: vec![],
+        });
+        let gif = renderer
+            .render_gif_analytic_aa(&scene, &directory.path().join("scene.gif"))
+            .unwrap();
+        assert_eq!(gif.frame_count, 2);
+        assert!(gif.warnings.is_empty());
+        let decoded = image::open(directory.path().join("scene.gif")).unwrap_or_else(|error| {
+            panic!("render_gif_analytic_aa did not produce a valid, decodable GIF: {error}")
+        });
+        assert_eq!(decoded.width(), scene.canvas.width);
+        assert_eq!(decoded.height(), scene.canvas.height);
+    }
+
+    /// The diagonal-line scene shared by the MSAA/SSAA and analytic-AA
+    /// anti-aliasing tests/quality comparison, factored out so both sides of
+    /// the comparison render *exactly* the same geometry.
+    fn diagonal_line_scene() -> SceneV1 {
+        SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "diagonal".into(),
+                kind: NodeKindV1::Line {
+                    x1: 6.0,
+                    y1: 6.0,
+                    x2: 58.0,
+                    y2: 58.0,
+                    thickness: 6.0,
+                    color: [0.2, 0.2, 0.2, 1.0],
+                },
+            }],
+            timeline: None,
+            effect: None,
+        }
+    }
+
+    /// A shallow-angle (not 45°) diagonal line, otherwise matching
+    /// `diagonal_line_scene`'s style (same canvas size, thickness, color).
+    /// Used only by `analytic_aa_matches_numeric_ground_truth_coverage_
+    /// better_than_msaa_supersampling_on_an_available_gpu`, which needs to
+    /// sample real *rendered pixels* (necessarily at integer positions)
+    /// spanning several distinct true-coverage bands. A 45° line's AA
+    /// transition band is only ~1.4px wide in x (each 1px step in x moves
+    /// ~0.7px perpendicular to the edge, and the AA band itself is only
+    /// about 1px wide), too narrow to contain 5 well-separated integer-pixel
+    /// samples -- confirmed numerically: scanning `diagonal_line_scene`'s
+    /// 45° line finds only 1 of 5 target coverage bands at integer
+    /// resolution, no matter how wide a window is scanned. A shallow slope
+    /// spreads that same true 1px-wide transition band across many more
+    /// integer x steps, making it actually samplable. Kept as its own
+    /// fixture (rather than changing `diagonal_line_scene` itself) so the
+    /// pre-existing tests already calibrated against the 45° line are
+    /// untouched.
+    fn shallow_diagonal_line_scene() -> SceneV1 {
+        SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "shallow-diagonal".into(),
+                kind: NodeKindV1::Line {
+                    x1: 4.0,
+                    y1: 20.0,
+                    x2: 60.0,
+                    y2: 30.0,
+                    thickness: 6.0,
+                    color: [0.2, 0.2, 0.2, 1.0],
+                },
+            }],
+            timeline: None,
+            effect: None,
+        }
+    }
+
+    /// Numerically estimates the *true* fractional pixel-area coverage of a
+    /// capsule (2D thick line segment, matching `capsule_sdf` in
+    /// `ANALYTIC_SHADER` and `add_line_analytic`'s geometry) at raster pixel
+    /// `(pixel_x, pixel_y)`, by regularly subsampling that pixel's
+    /// continuous `[pixel_x, pixel_x+1) x [pixel_y, pixel_y+1)` region (in
+    /// the same scene-pixel coordinate space `vertex()`/`add_line` use --
+    /// scene x/y coordinates map 1:1 onto continuous framebuffer pixel
+    /// coordinates, since `vertex()`'s `x / canvas.width * 2 - 1` clip-space
+    /// transform is exactly the inverse of the standard NDC-to-viewport
+    /// transform) and computing what fraction of subsample points the exact
+    /// capsule SDF (no shader approximation, no `fwidth`) classifies as
+    /// inside.
+    ///
+    /// This is deliberately independent of *both* renderers under test: it
+    /// does not call `capsule_sdf`/`ANALYTIC_SHADER` (the analytic path's
+    /// own formula) or rely on MSAA/supersampling in any way, so comparing
+    /// each renderer's actual output against this number is a fair,
+    /// non-circular ground-truth check for both.
+    /// Standard sRGB EOTF (byte 0-255 -> linear 0.0-1.0), matching the
+    /// `Rgba8UnormSrgb` render target format this renderer uses throughout.
+    fn srgb_decode_byte(byte: f32) -> f32 {
+        let c = byte / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// Inverse of `srgb_decode_byte` (linear 0.0-1.0 -> byte 0-255).
+    fn srgb_encode_byte(linear: f32) -> f32 {
+        let c = if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        c * 255.0
+    }
+
+    fn linear_mix(a: f32, b: f32, t: f32) -> f32 {
+        a + (b - a) * t
+    }
+
+    fn capsule_coverage_numeric(
+        pixel_x: i32,
+        pixel_y: i32,
+        a: [f32; 2],
+        b: [f32; 2],
+        half_thickness: f32,
+        subsamples: u32,
+    ) -> f32 {
+        let ba = [b[0] - a[0], b[1] - a[1]];
+        let ba_len_sq = ba[0] * ba[0] + ba[1] * ba[1];
+        let mut inside = 0u32;
+        for row in 0..subsamples {
+            for column in 0..subsamples {
+                let sx = pixel_x as f32 + (column as f32 + 0.5) / subsamples as f32;
+                let sy = pixel_y as f32 + (row as f32 + 0.5) / subsamples as f32;
+                let pa = [sx - a[0], sy - a[1]];
+                let h = ((pa[0] * ba[0] + pa[1] * ba[1]) / ba_len_sq).clamp(0.0, 1.0);
+                let dx = pa[0] - ba[0] * h;
+                let dy = pa[1] - ba[1] * h;
+                let distance = (dx * dx + dy * dy).sqrt() - half_thickness;
+                if distance < 0.0 {
+                    inside += 1;
+                }
+            }
+        }
+        inside as f32 / (subsamples * subsamples) as f32
+    }
+
+    /// The core quality-comparison test: renders the exact same diagonal-
+    /// line scene (`diagonal_line_scene`) through both the existing
+    /// MSAA+supersampling path (`render_rgba`, completely untouched by this
+    /// change) and the new analytic SDF/`fwidth` path
+    /// (`render_rgba_analytic_aa`), then checks each renderer's output
+    /// against a numerically-estimated *ground-truth* coverage
+    /// (`capsule_coverage_numeric`, 64x64 subsamples per pixel -- computed
+    /// from the exact capsule geometry, independent of either renderer's own
+    /// internals) at several sample pixels spanning a range of true coverage
+    /// fractions along the line's edge.
+    ///
+    /// A coverage fraction is turned into an "expected" byte value by
+    /// decoding the scene's actual rendered pure background/line-interior
+    /// colors from sRGB to linear, interpolating *there*, then re-encoding
+    /// (`srgb_decode_byte`/`srgb_encode_byte`/`linear_mix` below) -- not
+    /// naive byte-space interpolation (which the simpler pre-existing
+    /// `anti_aliases_diagonal_primitive_edges_on_an_available_gpu`/
+    /// `supersamples_diagonal_primitive_edges_beyond_msaa_alone_on_an_
+    /// available_gpu` tests above use, since they only check "is there any
+    /// blending at all", a check loose enough not to care). This one
+    /// computes real numeric error against ground truth, and the render
+    /// target is `Rgba8UnormSrgb` -- the GPU blends in linear space -- so
+    /// byte-space interpolation was measured to disagree with real output
+    /// by up to ~23 (of 255) at mid-range coverage, large enough to make
+    /// this comparison meaningless without the gamma-correct version.
+    ///
+    /// Thresholds have real headroom above/below what's actually measured
+    /// on this machine's real GPU (Apple M1/Metal) with this scene: analytic
+    /// mean absolute error ~4.3 (max ~9.9), MSAA+supersampling mean ~7.3
+    /// (max ~16.9) -- so ordinary cross-GPU/driver rounding differences
+    /// shouldn't make this flaky, while a real regression in either path's
+    /// edge quality, or the two techniques becoming indistinguishable,
+    /// still fails it. See `shallow_diagonal_line_scene`'s doc comment for
+    /// why this test uses a shallow-angle line rather than
+    /// `diagonal_line_scene`'s 45° one.
+    #[test]
+    fn analytic_aa_matches_numeric_ground_truth_coverage_better_than_msaa_supersampling_on_an_available_gpu()
+     {
+        const MAX_MEAN_ANALYTIC_ERROR: f32 = 7.0;
+        const MIN_MEAN_MSAA_ERROR: f32 = 5.0;
+
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = shallow_diagonal_line_scene();
+        scene.validate().unwrap();
+
+        let (msaa_pixels, msaa_warnings) = renderer.render_rgba(&scene).unwrap();
+        assert!(msaa_warnings.is_empty());
+        let (analytic_pixels, analytic_warnings) =
+            renderer.render_rgba_analytic_aa(&scene).unwrap();
+        assert!(analytic_warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |pixels: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+        // Pure endpoint colors, measured from the actual GPU output (same
+        // approach the pre-existing anti-aliasing tests above use) rather
+        // than assumed from the scene's linear input color, since this
+        // renderer's actual color-space handling is an internal detail
+        // neither this test nor the pre-existing ones above depend on.
+        // (32, 25) is deep in the shallow line's interior -- its centerline
+        // passes through y=25 at x=32 -- and far from either rounded cap.
+        let background_byte = pixel_at(&msaa_pixels, 0, 0)[0] as f32;
+        let line_byte = pixel_at(&msaa_pixels, 32, 25)[0] as f32;
+        assert_eq!(
+            pixel_at(&analytic_pixels, 0, 0)[0] as f32,
+            background_byte,
+            "both paths must render the exact same flat background color away from any edge"
+        );
+        assert!(
+            (pixel_at(&analytic_pixels, 32, 25)[0] as f32 - line_byte).abs() <= 2.0,
+            "both paths must render essentially the same line-interior color far from any edge"
+        );
+
+        let line_a = [4.0_f32, 20.0];
+        let line_b = [60.0_f32, 30.0];
+        let half_thickness = 3.0_f32;
+
+        let mut analytic_errors = Vec::new();
+        let mut msaa_errors = Vec::new();
+        let mut sampled_coverages = Vec::new();
+        // Scan a window straddling the diagonal edge (inset from both the
+        // canvas border and the line's rounded end caps) and keep pixels
+        // whose true numeric coverage lands in a set of well-separated
+        // bands, so the sampled set spans a real range of coverage
+        // fractions rather than clustering near one value.
+        let mut remaining_bands: Vec<(f32, f32)> =
+            vec![(0.05, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 0.95)];
+        'scan: for y in 4..40usize {
+            for x in 10..56usize {
+                let coverage = capsule_coverage_numeric(
+                    x as i32,
+                    y as i32,
+                    line_a,
+                    line_b,
+                    half_thickness,
+                    64,
+                );
+                if let Some(band_index) = remaining_bands
+                    .iter()
+                    .position(|(low, high)| coverage >= *low && coverage < *high)
+                {
+                    // NOT naive byte-space linear interpolation: the render
+                    // target is `Rgba8UnormSrgb`, so the GPU blends
+                    // `coverage`-weighted colors in *linear* space and then
+                    // gamma-encodes the result for storage. Byte-space
+                    // interpolation between `background_byte`/`line_byte`
+                    // follows a visibly different curve (most divergent
+                    // around 40-60% coverage -- confirmed empirically: it
+                    // was off by 9-22 bytes here before this fix), so the
+                    // "expected" value must decode both endpoints to linear,
+                    // interpolate there, then re-encode.
+                    let expected = srgb_encode_byte(linear_mix(
+                        srgb_decode_byte(background_byte),
+                        srgb_decode_byte(line_byte),
+                        coverage,
+                    ));
+                    let analytic_actual = pixel_at(&analytic_pixels, x, y)[0] as f32;
+                    let msaa_actual = pixel_at(&msaa_pixels, x, y)[0] as f32;
+                    analytic_errors.push((analytic_actual - expected).abs());
+                    msaa_errors.push((msaa_actual - expected).abs());
+                    sampled_coverages.push(coverage);
+                    remaining_bands.remove(band_index);
+                    if remaining_bands.is_empty() {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        assert!(
+            sampled_coverages.len() >= 4,
+            "expected to find pixels spanning most of the coverage-fraction bands near the \
+             diagonal edge (found {} of 5: {sampled_coverages:?})",
+            sampled_coverages.len()
+        );
+
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        let analytic_mean_error = mean(&analytic_errors);
+        let msaa_mean_error = mean(&msaa_errors);
+
+        assert!(
+            analytic_mean_error <= MAX_MEAN_ANALYTIC_ERROR,
+            "analytic-AA mean absolute byte error against numeric ground-truth coverage was \
+             {analytic_mean_error}, expected <= {MAX_MEAN_ANALYTIC_ERROR} \
+             (per-sample errors: {analytic_errors:?}, coverages: {sampled_coverages:?})"
+        );
+        assert!(
+            msaa_mean_error >= analytic_mean_error,
+            "expected the analytic-AA path's mean absolute error against numeric ground truth \
+             ({analytic_mean_error}) to be no worse than the existing MSAA+supersampling path's \
+             ({msaa_mean_error}) on identical geometry -- analytic AA should match ground truth \
+             at least as well since it computes an exact per-fragment distance instead of \
+             estimating coverage from a fixed sample grid"
+        );
+        // Loosely confirms MSAA+supersampling's error is in the range this
+        // project has already measured for it (see this test's doc comment)
+        // rather than accidentally testing two near-identical numbers.
+        assert!(
+            msaa_mean_error >= MIN_MEAN_MSAA_ERROR,
+            "expected the existing MSAA+supersampling path's mean absolute error ({msaa_mean_error}) \
+             to be at least {MIN_MEAN_MSAA_ERROR} on this scene, matching this project's prior \
+             measurements (see this test's doc comment) -- if not, this comparison may no longer \
+             be meaningfully distinguishing the two techniques"
+        );
     }
 
     fn test_scene() -> SceneV1 {
