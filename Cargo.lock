@@ -1230,17 +1230,15 @@ name = "renderer-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "clap",
  "image",
- "is-terminal",
  "renderer-daemon",
  "renderer-schema",
+ "renderer-terminal",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "terminal_size",
  "thiserror 2.0.20",
 ]
 
@@ -1281,6 +1279,7 @@ dependencies = [
  "image",
  "renderer-daemon",
  "renderer-schema",
+ "renderer-terminal",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1292,6 +1291,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "renderer-terminal"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "image",
+ "is-terminal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "terminal_size",
  "thiserror 2.0.20",
 ]
 

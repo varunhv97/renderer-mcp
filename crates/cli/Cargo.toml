@@ -10,16 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
 clap.workspace = true
 image.workspace = true
-is-terminal = "0.4"
 renderer-daemon = { path = "../daemon" }
 renderer-schema = { path = "../schema" }
+renderer-terminal = { path = "../terminal" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-terminal_size = "0.4"
 thiserror.workspace = true
 
 [dev-dependencies]

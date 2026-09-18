@@ -3,6 +3,7 @@ members = [
   "crates/schema",
   "crates/renderer",
   "crates/daemon",
+  "crates/terminal",
   "crates/cli",
   "crates/mcp",
 ]

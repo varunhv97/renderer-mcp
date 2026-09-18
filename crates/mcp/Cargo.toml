@@ -13,6 +13,7 @@ base64.workspace = true
 image.workspace = true
 renderer-daemon = { path = "../daemon" }
 renderer-schema = { path = "../schema" }
+renderer-terminal = { path = "../terminal" }
 serde_json.workspace = true
 sha2.workspace = true
 
