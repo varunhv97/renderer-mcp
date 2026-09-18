@@ -288,6 +288,24 @@ fn node_id_schema() -> serde_json::Value {
     })
 }
 
+/// Schema for a node's optional `translate` field (`NodeV1::translate`),
+/// shared across all six node kinds. Unlike `x`/`y`/`cx`/`cy`/etc. (which
+/// differ per node kind), `translate` is uniform: an additive [dx, dy]
+/// offset applied on top of the node's own coordinates at render time, e.g.
+/// for a rect, effectively `(x + translate[0], y + translate[1])`. This is
+/// also the only property `kind: "translate"` keyframes animate (see
+/// `animated_property_schema`).
+fn translate_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": { "type": "number" },
+        "minItems": 2,
+        "maxItems": 2,
+        "default": [0.0, 0.0],
+        "description": "Optional additive [dx, dy] pixel offset applied on top of this node's own coordinates at render time. Defaults to [0.0, 0.0] (no offset) when omitted. Values are unconstrained (any finite number); this is the same field `kind: \"translate\"` timeline keyframes animate."
+    })
+}
+
 /// Schema for one `{x, y}` point in a `path` node's `points` array
 /// (`PointV1`).
 fn point_schema() -> serde_json::Value {
@@ -332,6 +350,7 @@ fn rect_node_schema() -> serde_json::Value {
         "description": "A filled, axis-aligned rectangle.",
         "properties": {
             "id": node_id_schema(),
+            "translate": translate_schema(),
             "kind": { "const": "rect", "description": "Node type discriminator." },
             "x": { "type": "number", "description": "Left edge X coordinate in pixels, from the canvas's top-left corner." },
             "y": { "type": "number", "description": "Top edge Y coordinate in pixels, from the canvas's top-left corner." },
@@ -350,6 +369,7 @@ fn ellipse_node_schema() -> serde_json::Value {
         "description": "A filled ellipse (or circle, when rx equals ry).",
         "properties": {
             "id": node_id_schema(),
+            "translate": translate_schema(),
             "kind": { "const": "ellipse", "description": "Node type discriminator." },
             "cx": { "type": "number", "description": "Center X coordinate in pixels, from the canvas's top-left corner." },
             "cy": { "type": "number", "description": "Center Y coordinate in pixels, from the canvas's top-left corner." },
@@ -368,6 +388,7 @@ fn line_node_schema() -> serde_json::Value {
         "description": "A straight line segment between two points.",
         "properties": {
             "id": node_id_schema(),
+            "translate": translate_schema(),
             "kind": { "const": "line", "description": "Node type discriminator." },
             "x1": { "type": "number", "description": "Start point X coordinate in pixels, from the canvas's top-left corner." },
             "y1": { "type": "number", "description": "Start point Y coordinate in pixels, from the canvas's top-left corner." },
@@ -387,6 +408,7 @@ fn path_node_schema() -> serde_json::Value {
         "description": "A filled polygon rendered as a triangle fan from its first point, in the order given.",
         "properties": {
             "id": node_id_schema(),
+            "translate": translate_schema(),
             "kind": { "const": "path", "description": "Node type discriminator." },
             "points": {
                 "type": "array",
@@ -408,6 +430,7 @@ fn text_node_schema() -> serde_json::Value {
         "description": "A run of text rendered with the renderer's built-in font.",
         "properties": {
             "id": node_id_schema(),
+            "translate": translate_schema(),
             "kind": { "const": "text", "description": "Node type discriminator." },
             "x": { "type": "number", "description": "Left edge X coordinate in pixels, from the canvas's top-left corner, where the first glyph starts." },
             "y": { "type": "number", "description": "Y coordinate in pixels, from the canvas's top-left corner, positioning the top of the text's em-square (not its baseline)." },
@@ -426,6 +449,7 @@ fn image_node_schema() -> serde_json::Value {
         "description": "A raster image drawn scaled to fit an axis-aligned box.",
         "properties": {
             "id": node_id_schema(),
+            "translate": translate_schema(),
             "kind": { "const": "image", "description": "Node type discriminator." },
             "x": { "type": "number", "description": "Left edge X coordinate in pixels, from the canvas's top-left corner." },
             "y": { "type": "number", "description": "Top edge Y coordinate in pixels, from the canvas's top-left corner." },
@@ -477,7 +501,7 @@ fn keyframe_schema() -> serde_json::Value {
 /// `{"kind": "color", "value": [r, g, b, a]}`.
 fn animated_property_schema() -> serde_json::Value {
     serde_json::json!({
-        "description": "The animated property. `kind` selects which property is animated and determines the shape of `value`: \"opacity\" (a single 0.0-1.0 number) or \"color\" (an [r, g, b, a] array).",
+        "description": "The animated property. `kind` selects which property is animated and determines the shape of `value`: \"opacity\" (a single 0.0-1.0 number), \"color\" (an [r, g, b, a] array), or \"translate\" (a [dx, dy] array).",
         "oneOf": [
             {
                 "type": "object",
@@ -497,6 +521,22 @@ fn animated_property_schema() -> serde_json::Value {
                 "properties": {
                     "kind": { "const": "color" },
                     "value": color_schema("Target color at this keyframe.")
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "value"],
+                "description": "Animates the target node's position by setting its `translate` offset (see the node schema's `translate` field). This sets the absolute [dx, dy] offset at this keyframe -- it is not an additive delta on top of other keyframes.",
+                "properties": {
+                    "kind": { "const": "translate" },
+                    "value": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "Target [dx, dy] pixel offset at this keyframe. Values are unconstrained (any finite number)."
+                    }
                 }
             }
         ]
@@ -1044,6 +1084,22 @@ mod tests {
             kinds,
             vec!["rect", "ellipse", "line", "path", "text", "image"]
         );
+        for branch in node_branches {
+            let translate_description = branch["properties"]["translate"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(translate_description.contains("offset"));
+        }
+
+        let property_branches = scene_schema["properties"]["timeline"]["properties"]["keyframes"]
+            ["items"]["properties"]["property"]["oneOf"]
+            .as_array()
+            .unwrap();
+        let property_kinds: Vec<_> = property_branches
+            .iter()
+            .map(|branch| branch["properties"]["kind"]["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(property_kinds, vec!["opacity", "color", "translate"]);
 
         let patch_tool = named_scene_tool("patch_scene");
         let patch_schema = &patch_tool["inputSchema"]["properties"]["patch"];
@@ -1082,7 +1138,7 @@ mod tests {
             "version": SCENE_VERSION_V1,
             "canvas": { "width": 64, "height": 64, "background": [0.0, 0.0, 0.0, 1.0] },
             "nodes": [
-                { "id": "r", "kind": "rect", "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0, "color": [1.0, 0.0, 0.0, 1.0] },
+                { "id": "r", "kind": "rect", "translate": [2.0, -3.0], "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0, "color": [1.0, 0.0, 0.0, 1.0] },
                 { "id": "e", "kind": "ellipse", "cx": 5.0, "cy": 5.0, "rx": 2.0, "ry": 2.0, "color": [0.0, 1.0, 0.0, 1.0] },
                 { "id": "l", "kind": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 10.0, "thickness": 1.0, "color": [0.0, 0.0, 1.0, 1.0] },
                 { "id": "p", "kind": "path", "points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}, {"x": 0.0, "y": 1.0}], "color": [1.0, 1.0, 0.0, 1.0] },
@@ -1091,7 +1147,8 @@ mod tests {
             ],
             "timeline": { "fps": 30, "duration_ms": 1000, "keyframes": [
                 { "at_ms": 0, "target": "r", "property": { "kind": "opacity", "value": 1.0 } },
-                { "at_ms": 500, "target": "r", "property": { "kind": "color", "value": [1.0, 1.0, 1.0, 1.0] } }
+                { "at_ms": 500, "target": "r", "property": { "kind": "color", "value": [1.0, 1.0, 1.0, 1.0] } },
+                { "at_ms": 500, "target": "r", "property": { "kind": "translate", "value": [12.0, 8.0] } }
             ]},
             "effect": { "shader": "fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> { return color; }" }
         });
