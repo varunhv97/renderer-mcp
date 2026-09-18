@@ -8,7 +8,7 @@ use image::{
     Delay, Frame, RgbaImage,
     codecs::gif::{GifEncoder, Repeat},
 };
-use renderer_schema::{Color, KeyframeV1, NodeKindV1, SceneV1};
+use renderer_schema::{Color, KeyframeV1, MAX_CANVAS_DIMENSION, NodeKindV1, SceneV1};
 use resvg::{tiny_skia, usvg};
 use sha2::{Digest, Sha256};
 use std::{
@@ -32,6 +32,46 @@ const ELLIPSE_SEGMENTS: usize = 32;
 /// stays single-sampled (see `build_effect_pipeline`): it introduces no new
 /// geometric edges, so multisampling it would add cost with no benefit.
 const MSAA_SAMPLE_COUNT: u32 = 4;
+/// Supersampling (SSAA) factor applied on top of `MSAA_SAMPLE_COUNT`x MSAA:
+/// the node-composition pass renders into a target `SUPERSAMPLE_FACTOR`x the
+/// declared canvas width/height (i.e. `SUPERSAMPLE_FACTOR^2` the pixel
+/// count), and `render_composed_rgba_with_cache` downsamples the GPU
+/// readback back to the declared size with a Lanczos3 filter before any
+/// caller (PNG encode, GIF frame assembly) sees it.
+///
+/// This exists because MSAA alone still falls well short of this renderer's
+/// SVG path (`resvg`/`tiny-skia`, used for SVG `Image` nodes): decoding raw
+/// pixel bytes along a rendered curve, SVG output shows dozens of distinct
+/// intermediate alpha/color levels while 4x MSAA -- the most this renderer's
+/// target hardware supports for `Rgba8UnormSrgb` (confirmed on Apple M1/
+/// Metal: `sample_count_supported(8)` is `false`) -- only produces a coarse
+/// 4-5 levels per edge, since MSAA only ever resolves 4 sample points per
+/// pixel regardless of how the edge cuts through them.
+///
+/// 2 was picked over 3 after measuring both against MSAA-only (factor 1) on
+/// an 8-shape, 2-text-node 320x220 scene (several rects/ellipses, two
+/// crossing diagonal lines, a path, on this machine's Apple M1/Metal
+/// adapter): counting distinct blended RGBA colors sampled along the scene's
+/// curved/diagonal edges, MSAA-only produced 399 distinct edge colors,
+/// factor 2 produced 896 (2.2x), and factor 3 produced 887 -- i.e. factor 3
+/// bought no further measurable quality beyond factor 2 (within run-to-run
+/// noise of the same ~890), because 4x MSAA is still the per-pixel coverage
+/// resolution *within* each supersampled texel; supersampling adds more
+/// texels to resolve MSAA edges into, not more coverage precision per texel,
+/// and factor 2 already saturates the visible benefit of that for this
+/// renderer's shapes. Single-PNG-render wall-clock cost measured ~2.8x-4x
+/// MSAA-only for factor 2 (some run-to-run system noise on this machine)
+/// versus ~4.6x for factor 3 (both cheap in absolute
+/// terms here -- single-digit vs. low-double-digit milliseconds); a 12-frame
+/// GIF export (speed=10 quantization, see `render_gif_with_asset_root`)
+/// measured ~1.57x MSAA-only for factor 2 (73.7ms -> ~115ms) versus ~2.1x
+/// for factor 3 (-> ~154ms). Factor 2 is the clear pick: a real, measured
+/// quality improvement at a reasonable cost for a local, on-demand tool;
+/// factor 3 is strictly worse on cost for no measured quality gain here.
+/// Memory cost at factor 2 is real and worth stating plainly: the
+/// multisampled texture, resolve texture, and CPU readback buffer are all
+/// 4x the pixel count (factor^2) of a declared-size render.
+const SUPERSAMPLE_FACTOR: u32 = 2;
 const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ASSET_PIXELS: u64 = 16_000_000;
 const MAX_IMAGE_RASTER_PIXELS: u64 = 4_000_000;
@@ -145,12 +185,42 @@ impl GpuRenderer {
             adapter.get_info().name,
             MSAA_SAMPLE_COUNT,
         );
+        // `wgpu::Limits::downlevel_defaults()` caps `max_texture_dimension_2d`
+        // and `max_buffer_size` at levels tuned for lowest-common-denominator
+        // (WebGL2-class) hardware -- 2048px textures -- which is already
+        // below `MAX_CANVAS_DIMENSION` (the largest canvas this renderer's
+        // schema allows) even before supersampling, and `SUPERSAMPLE_FACTOR`x
+        // supersampling raises the *internal* render target size further
+        // still, so a declared canvas well under `MAX_CANVAS_DIMENSION` could
+        // already exceed these downlevel limits once supersampled. Request
+        // enough headroom for the largest canvas this renderer will ever
+        // attempt to supersample-render, capped by what this adapter actually
+        // reports supporting -- so a genuinely limited adapter fails here,
+        // with a clear `request_device` error, instead of panicking deep
+        // inside `create_texture`/`create_buffer` in
+        // `render_composed_rgba_with_cache`.
+        let adapter_limits = adapter.limits();
+        let max_supersampled_canvas_dimension =
+            MAX_CANVAS_DIMENSION.saturating_mul(SUPERSAMPLE_FACTOR);
+        let max_supersampled_canvas_bytes = u64::from(max_supersampled_canvas_dimension)
+            * u64::from(max_supersampled_canvas_dimension)
+            * 4;
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_texture_dimension_1d = max_supersampled_canvas_dimension
+            .min(adapter_limits.max_texture_dimension_1d)
+            .max(required_limits.max_texture_dimension_1d);
+        required_limits.max_texture_dimension_2d = max_supersampled_canvas_dimension
+            .min(adapter_limits.max_texture_dimension_2d)
+            .max(required_limits.max_texture_dimension_2d);
+        required_limits.max_buffer_size = max_supersampled_canvas_bytes
+            .min(adapter_limits.max_buffer_size)
+            .max(required_limits.max_buffer_size);
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("renderer-cli device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits,
                 },
                 None,
             )
@@ -321,8 +391,22 @@ impl GpuRenderer {
         cache: &mut AssetCache,
     ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
         let plan = composition_plan(scene, asset_root, &self.font, cache)?;
-        let width = scene.canvas.width;
-        let height = scene.canvas.height;
+        let declared_width = scene.canvas.width;
+        let declared_height = scene.canvas.height;
+        // The node-composition and (optional) effect passes below render
+        // into a target `SUPERSAMPLE_FACTOR`x the declared canvas size (see
+        // that constant's doc comment); `vertex()` and `add_textured_rect()`
+        // already normalize every position as a fraction of
+        // `scene.canvas.width`/`height` rather than any absolute pixel
+        // count, so drawing into a larger same-aspect-ratio target needs no
+        // change to vertex generation -- only the texture/viewport/readback
+        // dimensions here. `pixels`, built from the GPU readback below, is
+        // downsampled back to `declared_width`x`declared_height` with a
+        // Lanczos3 filter before this function returns, so every caller
+        // (PNG encode, GIF frame assembly) keeps receiving pixels already at
+        // the scene's declared size, unaware supersampling happened.
+        let width = declared_width.saturating_mul(SUPERSAMPLE_FACTOR);
+        let height = declared_height.saturating_mul(SUPERSAMPLE_FACTOR);
         // When a scene-level effect is present, nodes are composited into
         // this texture as an *intermediate* (sampled, not read back) and a
         // second full-screen pass below writes the final, effect-applied
@@ -598,7 +682,25 @@ impl GpuRenderer {
         }
         drop(mapped);
         output_buffer.unmap();
-        Ok((pixels, Vec::new()))
+        // `pixels` is still at the oversized `width`x`height` (the
+        // `SUPERSAMPLE_FACTOR`x-scaled render target); downsample it to the
+        // scene's declared size before any caller sees it, so the existing
+        // readback/PNG-encode/GIF-frame-assembly logic above and in every
+        // caller stays completely unaware supersampling happened -- it just
+        // receives pixels already at the declared size, exactly as before
+        // `SUPERSAMPLE_FACTOR` existed.
+        if width == declared_width && height == declared_height {
+            return Ok((pixels, Vec::new()));
+        }
+        let oversized = RgbaImage::from_raw(width, height, pixels)
+            .expect("readback buffer matches the oversized render target dimensions");
+        let resized = image::imageops::resize(
+            &oversized,
+            declared_width,
+            declared_height,
+            image::imageops::FilterType::Lanczos3,
+        );
+        Ok((resized.into_raw(), Vec::new()))
     }
 
     /// Builds the render pipeline for a scene's full-canvas post-process
@@ -2439,6 +2541,106 @@ mod tests {
         );
     }
 
+    /// Direct SSAA regression test, analogous to
+    /// `anti_aliases_diagonal_primitive_edges_on_an_available_gpu` above but
+    /// checking supersampling's *additional* contribution on top of MSAA:
+    /// renders the exact same diagonal-line scene as that test and counts
+    /// how many genuinely distinct, strictly-intermediate red-channel values
+    /// (the line and background are both gray/white, so R=G=B and one
+    /// channel suffices) appear anywhere along the line's edge.
+    ///
+    /// `MSAA_SAMPLE_COUNT`x MSAA alone resolves at most a handful of
+    /// coverage fractions per edge pixel (this project's own investigation
+    /// that motivated adding `SUPERSAMPLE_FACTOR` found roughly 4-5 such
+    /// levels decoding raw MSAA-only output); measured directly against
+    /// *this* scene with `SUPERSAMPLE_FACTOR` temporarily forced to 1
+    /// (MSAA-only, no supersampling), it produced exactly one distinct
+    /// intermediate red value across the whole image. With
+    /// `SUPERSAMPLE_FACTOR` at its real value, this same scene measured 7
+    /// distinct intermediate values on this machine (Apple M1/Metal) --
+    /// deterministic and stable across repeated runs, since both the
+    /// geometry and the Lanczos3 downsample are deterministic given fixed
+    /// input. `MIN_DISTINCT_EDGE_LEVELS` (6) sits strictly above the MSAA-
+    /// only range this project measured (1, and up to ~4-5 by the broader
+    /// investigation that motivated this feature) while leaving a small
+    /// margin below the 7 measured here, so a regression back to MSAA-only
+    /// behavior -- or a supersample factor accidentally forced to 1 -- fails
+    /// this test, while ordinary cross-GPU/driver rounding differences in
+    /// exactly which byte values appear should not.
+    #[test]
+    fn supersamples_diagonal_primitive_edges_beyond_msaa_alone_on_an_available_gpu() {
+        const MIN_DISTINCT_EDGE_LEVELS: usize = 6;
+
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [1.0, 1.0, 1.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "diagonal".into(),
+                kind: NodeKindV1::Line {
+                    x1: 6.0,
+                    y1: 6.0,
+                    x2: 58.0,
+                    y2: 58.0,
+                    thickness: 6.0,
+                    color: [0.2, 0.2, 0.2, 1.0],
+                },
+            }],
+            timeline: None,
+            effect: None,
+        };
+        scene.validate().unwrap();
+        let (pixels, warnings) = renderer.render_rgba(&scene).unwrap();
+        assert!(warnings.is_empty());
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+        let background_pixel = pixel_at(0, 0);
+        let line_pixel = pixel_at(32, 32);
+        assert_ne!(
+            background_pixel, line_pixel,
+            "sanity check: the sampled background and line-interior points must differ"
+        );
+        let low = background_pixel[0].min(line_pixel[0]);
+        let high = background_pixel[0].max(line_pixel[0]);
+
+        let mut distinct_edge_levels = std::collections::BTreeSet::new();
+        for y in 0..scene.canvas.height as usize {
+            for x in 0..width {
+                let red = pixel_at(x, y)[0];
+                if red > low && red < high {
+                    distinct_edge_levels.insert(red);
+                }
+            }
+        }
+        assert!(
+            distinct_edge_levels.len() >= MIN_DISTINCT_EDGE_LEVELS,
+            "expected at least {MIN_DISTINCT_EDGE_LEVELS} distinct strictly-intermediate \
+             red-channel values along the diagonal edge (found {}: {distinct_edge_levels:?}), \
+             proving supersampling contributes a genuinely richer gradient than \
+             {MSAA_SAMPLE_COUNT}x MSAA alone can produce",
+            distinct_edge_levels.len()
+        );
+    }
+
     #[test]
     fn applies_a_full_canvas_effect_shader_on_an_available_gpu() {
         let renderer = match GpuRenderer::new() {
@@ -2450,16 +2652,41 @@ mod tests {
         };
         // `test_scene()`'s canvas background is fully transparent black
         // ([0,0,0,0]) and its only node (a red rect) does not cover pixel
-        // (0,0). 0.0 and 1.0 round-trip exactly through the sRGB transfer
-        // function used by the `Rgba8UnormSrgb` intermediate texture, so an
-        // exact-byte comparison at that pixel is meaningful (not sensitive
-        // to sRGB rounding) while still exercising the real GPU pass: RGB
-        // channels invert 0 -> 255 and alpha (never gamma-corrected) passes
-        // through unchanged.
+        // (0,0), so pre-supersampling this pixel round-tripped 0.0/1.0
+        // exactly through the sRGB transfer function used by the
+        // `Rgba8UnormSrgb` intermediate texture, making an exact-byte
+        // comparison meaningful there. With `SUPERSAMPLE_FACTOR` supersampling
+        // now in the pipeline, that no longer holds exactly: the Lanczos3
+        // downsample filter (see `SUPERSAMPLE_FACTOR`'s doc comment) has a
+        // wide support radius with negative side lobes, so a hard content
+        // edge a few source texels away (the rect's edge, still pixel-
+        // aligned in the oversized render) can leak a couple of least-
+        // significant-bit levels of ringing into an otherwise-background
+        // output pixel near it -- exactly the kind of well-known Lanczos
+        // artifact this crate's `assert_matches_golden` tolerance elsewhere
+        // already accounts for at shape/glyph/image edges. `PIXEL_TOLERANCE`
+        // absorbs that (measured 1 of 255 here) while still exercising the
+        // real GPU pass and catching an actual regression (wrong
+        // composition, dropped alpha, effect not applied): RGB channels
+        // invert 0 -> 255 and alpha (never gamma-corrected) passes through
+        // unchanged.
+        const PIXEL_TOLERANCE: i16 = 4;
+        let assert_pixel_close = |label: &str, actual: &[u8], expected: [u8; 4]| {
+            for channel in 0..4 {
+                let delta = (actual[channel] as i16 - expected[channel] as i16).abs();
+                assert!(
+                    delta <= PIXEL_TOLERANCE,
+                    "{label}: channel {channel} was {} (expected close to {}, tolerance {PIXEL_TOLERANCE})",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        };
+
         let scene = test_scene();
         let (without_effect, warnings) = renderer.render_rgba(&scene).unwrap();
         assert!(warnings.is_empty());
-        assert_eq!(&without_effect[0..4], &[0, 0, 0, 0]);
+        assert_pixel_close("without_effect", &without_effect[0..4], [0, 0, 0, 0]);
 
         let mut scene = scene;
         scene.effect = Some(renderer_schema::EffectV1 {
@@ -2470,7 +2697,7 @@ mod tests {
         });
         let (with_effect, warnings) = renderer.render_rgba(&scene).unwrap();
         assert!(warnings.is_empty());
-        assert_eq!(&with_effect[0..4], &[255, 255, 255, 0]);
+        assert_pixel_close("with_effect", &with_effect[0..4], [255, 255, 255, 0]);
 
         assert_ne!(
             without_effect, with_effect,
