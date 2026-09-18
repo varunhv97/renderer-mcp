@@ -122,6 +122,14 @@ impl CanvasV1 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NodeV1 {
     pub id: String,
+    /// Additive x/y offset applied on top of this node's own coordinates at
+    /// render time (e.g. for `Rect`, effectively `(x + translate[0], y +
+    /// translate[1])`). Uniform across every node kind -- unlike `x`/`y`/
+    /// `cx`/`cy`/etc., which differ per shape -- so it lives here on `NodeV1`
+    /// rather than inside `NodeKindV1`. Defaults to `[0.0, 0.0]` so every
+    /// existing scene document with no `translate` field is unaffected.
+    #[serde(default)]
+    pub translate: [f32; 2],
     #[serde(flatten)]
     pub kind: NodeKindV1,
 }
@@ -283,6 +291,7 @@ impl TimelineV1 {
             match frame.property {
                 AnimatedPropertyV1::Opacity(value) => validate_unit_interval(value)?,
                 AnimatedPropertyV1::Color(color) => validate_color(color)?,
+                AnimatedPropertyV1::Translate(value) => validate_finite_pair(value)?,
             }
         }
         Ok(())
@@ -303,6 +312,7 @@ pub struct KeyframeV1 {
 pub enum AnimatedPropertyV1 {
     Opacity(f32),
     Color(Color),
+    Translate([f32; 2]),
 }
 
 /// A bounded, typed scene mutation. Applying all operations is atomic.
@@ -355,6 +365,8 @@ pub enum SceneValidationError {
     InvalidPositiveValue(&'static str),
     #[error("colors must contain finite values from 0.0 through 1.0")]
     InvalidColor,
+    #[error("translate values must be finite")]
+    InvalidTranslate,
     #[error("paths require at least three points")]
     InvalidPath,
     #[error("path has {actual} points; maximum is {maximum}")]
@@ -407,6 +419,18 @@ fn validate_unit_interval(value: f32) -> Result<(), SceneValidationError> {
     }
 }
 
+/// Validates an unconstrained `[f32; 2]` offset (e.g. `translate`): both
+/// components must be finite, but -- unlike opacity or color -- there is no
+/// range restriction, consistent with how a `Rect`'s `x`/`y` aren't
+/// range-restricted today either.
+fn validate_finite_pair(value: [f32; 2]) -> Result<(), SceneValidationError> {
+    if value.iter().all(|component| component.is_finite()) {
+        Ok(())
+    } else {
+        Err(SceneValidationError::InvalidTranslate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +445,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "box".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 0.0,
                     y: 0.0,
@@ -513,6 +538,7 @@ mod tests {
         value.nodes = vec![
             NodeV1 {
                 id: "ellipse".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Ellipse {
                     cx: 4.0,
                     cy: 4.0,
@@ -523,6 +549,7 @@ mod tests {
             },
             NodeV1 {
                 id: "line".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Line {
                     x1: 0.0,
                     y1: 0.0,
@@ -534,6 +561,7 @@ mod tests {
             },
             NodeV1 {
                 id: "path".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Path {
                     points: vec![
                         PointV1 { x: 0.0, y: 0.0 },
@@ -545,6 +573,7 @@ mod tests {
             },
             NodeV1 {
                 id: "text".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Text {
                     x: 0.0,
                     y: 0.0,
@@ -555,6 +584,7 @@ mod tests {
             },
             NodeV1 {
                 id: "image".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Image {
                     x: 0.0,
                     y: 0.0,
@@ -792,5 +822,68 @@ mod tests {
                 .into(),
         });
         assert_eq!(value.validate(), Ok(()));
+    }
+
+    #[test]
+    fn accepts_a_valid_translate_keyframe() {
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: "box".into(),
+                property: AnimatedPropertyV1::Translate([12.5, -7.0]),
+            }],
+        });
+        assert_eq!(value.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_a_non_finite_translate_keyframe_value() {
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: "box".into(),
+                property: AnimatedPropertyV1::Translate([f32::NAN, 0.0]),
+            }],
+        });
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidTranslate)
+        );
+
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: "box".into(),
+                property: AnimatedPropertyV1::Translate([0.0, f32::INFINITY]),
+            }],
+        });
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidTranslate)
+        );
+    }
+
+    #[test]
+    fn node_translate_defaults_to_zero_when_absent_from_json() {
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64},
+            "nodes": [{
+                "id": "box", "kind": "rect",
+                "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                "color": [1.0, 1.0, 1.0, 1.0]
+            }]
+        }"#;
+        let parsed: SceneV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.nodes[0].translate, [0.0, 0.0]);
     }
 }

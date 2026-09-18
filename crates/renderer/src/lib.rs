@@ -1991,6 +1991,7 @@ fn vertices_for_scene(scene: &SceneV1) -> (Vec<Vertex>, Vec<String>) {
 }
 
 fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1, scene: &SceneV1) {
+    let [dx, dy] = node.translate;
     match &node.kind {
         NodeKindV1::Rect {
             x,
@@ -1999,7 +2000,9 @@ fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1,
             height,
             color,
         } => {
-            add_rect(vertices, *x, *y, *width, *height, *color, scene);
+            let x = *x + dx;
+            let y = *y + dy;
+            add_rect(vertices, x, y, *width, *height, *color, scene);
         }
         NodeKindV1::Ellipse {
             cx,
@@ -2008,7 +2011,9 @@ fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1,
             ry,
             color,
         } => {
-            add_ellipse(vertices, *cx, *cy, *rx, *ry, *color, scene);
+            let cx = *cx + dx;
+            let cy = *cy + dy;
+            add_ellipse(vertices, cx, cy, *rx, *ry, *color, scene);
         }
         NodeKindV1::Line {
             x1,
@@ -2018,9 +2023,20 @@ fn add_node_vertices(vertices: &mut Vec<Vertex>, node: &renderer_schema::NodeV1,
             thickness,
             color,
         } => {
-            add_line(vertices, [*x1, *y1], [*x2, *y2], *thickness, *color, scene);
+            let start = [*x1 + dx, *y1 + dy];
+            let end = [*x2 + dx, *y2 + dy];
+            add_line(vertices, start, end, *thickness, *color, scene);
         }
-        NodeKindV1::Path { points, color } => add_path(vertices, points, *color, scene),
+        NodeKindV1::Path { points, color } => {
+            let translated: Vec<_> = points
+                .iter()
+                .map(|point| renderer_schema::PointV1 {
+                    x: point.x + dx,
+                    y: point.y + dy,
+                })
+                .collect();
+            add_path(vertices, &translated, *color, scene);
+        }
         NodeKindV1::Text { .. } | NodeKindV1::Image { .. } => {}
     }
 }
@@ -2055,8 +2071,10 @@ fn composition_plan(
                 size,
                 color,
             } => {
+                let x = *x + node.translate[0];
+                let y = *y + node.translate[1];
                 validate_text_raster(node.id.as_str(), text, *size, scene)?;
-                let mut cursor_x = *x;
+                let mut cursor_x = x;
                 let mut previous = None;
                 for character in text.chars() {
                     if let Some(left) = previous {
@@ -2108,7 +2126,7 @@ fn composition_plan(
                     add_textured_rect(
                         &mut plan.textured_vertices,
                         cursor_x + metrics.xmin as f32,
-                        *y + (*size - metrics.height as f32 - metrics.ymin as f32),
+                        y + (*size - metrics.height as f32 - metrics.ymin as f32),
                         metrics.width as f32,
                         metrics.height as f32,
                         *color,
@@ -2129,6 +2147,8 @@ fn composition_plan(
                 height,
                 source,
             } => {
+                let x = *x + node.translate[0];
+                let y = *y + node.translate[1];
                 let target_width = bounded_image_dimension(*width, "width")?;
                 let target_height = bounded_image_dimension(*height, "height")?;
                 ensure_target_image_dimensions(target_width, target_height, source)?;
@@ -2196,8 +2216,8 @@ fn composition_plan(
                 let start = plan.textured_vertices.len() as u32;
                 add_textured_rect(
                     &mut plan.textured_vertices,
-                    *x,
-                    *y,
+                    x,
+                    y,
                     *width,
                     *height,
                     [1.0; 4],
@@ -2311,8 +2331,10 @@ fn composition_plan_analytic(
                 size,
                 color,
             } => {
+                let x = *x + node.translate[0];
+                let y = *y + node.translate[1];
                 validate_text_raster(node.id.as_str(), text, *size, scene)?;
-                let mut cursor_x = *x;
+                let mut cursor_x = x;
                 let mut previous = None;
                 for character in text.chars() {
                     if let Some(left) = previous {
@@ -2361,7 +2383,7 @@ fn composition_plan_analytic(
                     add_textured_rect(
                         &mut plan.textured_vertices,
                         cursor_x + metrics.xmin as f32,
-                        *y + (*size - metrics.height as f32 - metrics.ymin as f32),
+                        y + (*size - metrics.height as f32 - metrics.ymin as f32),
                         metrics.width as f32,
                         metrics.height as f32,
                         *color,
@@ -2382,6 +2404,8 @@ fn composition_plan_analytic(
                 height,
                 source,
             } => {
+                let x = *x + node.translate[0];
+                let y = *y + node.translate[1];
                 let target_width = bounded_image_dimension(*width, "width")?;
                 let target_height = bounded_image_dimension(*height, "height")?;
                 ensure_target_image_dimensions(target_width, target_height, source)?;
@@ -2442,8 +2466,8 @@ fn composition_plan_analytic(
                 let start = plan.textured_vertices.len() as u32;
                 add_textured_rect(
                     &mut plan.textured_vertices,
-                    *x,
-                    *y,
+                    x,
+                    y,
                     *width,
                     *height,
                     [1.0; 4],
@@ -2455,8 +2479,15 @@ fn composition_plan_analytic(
                 });
             }
             NodeKindV1::Path { points, color } => {
+                let translated: Vec<_> = points
+                    .iter()
+                    .map(|point| renderer_schema::PointV1 {
+                        x: point.x + node.translate[0],
+                        y: point.y + node.translate[1],
+                    })
+                    .collect();
                 let start = plan.path_vertices.len() as u32;
-                add_path(&mut plan.path_vertices, points, *color, scene);
+                add_path(&mut plan.path_vertices, &translated, *color, scene);
                 let end = plan.path_vertices.len() as u32;
                 if start != end {
                     if let Some(AnalyticDrawCommand::Path(range)) = plan.commands.last_mut() {
@@ -2473,11 +2504,13 @@ fn composition_plan_analytic(
                 height,
                 color,
             } => {
+                let x = *x + node.translate[0];
+                let y = *y + node.translate[1];
                 let start = plan.analytic_vertices.len() as u32;
                 add_rect_analytic(
                     &mut plan.analytic_vertices,
-                    *x,
-                    *y,
+                    x,
+                    y,
                     *width,
                     *height,
                     *color,
@@ -2496,16 +2529,10 @@ fn composition_plan_analytic(
                 ry,
                 color,
             } => {
+                let cx = *cx + node.translate[0];
+                let cy = *cy + node.translate[1];
                 let start = plan.analytic_vertices.len() as u32;
-                add_ellipse_analytic(
-                    &mut plan.analytic_vertices,
-                    *cx,
-                    *cy,
-                    *rx,
-                    *ry,
-                    *color,
-                    scene,
-                );
+                add_ellipse_analytic(&mut plan.analytic_vertices, cx, cy, *rx, *ry, *color, scene);
                 push_analytic_range(
                     &mut plan.commands,
                     start,
@@ -2520,11 +2547,13 @@ fn composition_plan_analytic(
                 thickness,
                 color,
             } => {
+                let start_point = [*x1 + node.translate[0], *y1 + node.translate[1]];
+                let end_point = [*x2 + node.translate[0], *y2 + node.translate[1]];
                 let start = plan.analytic_vertices.len() as u32;
                 add_line_analytic(
                     &mut plan.analytic_vertices,
-                    [*x1, *y1],
-                    [*x2, *y2],
+                    start_point,
+                    end_point,
                     *thickness,
                     *color,
                     scene,
@@ -2996,6 +3025,20 @@ fn scene_at(scene: &SceneV1, at_ms: u32) -> SceneV1 {
         ) {
             color[3] *= opacity;
         }
+        let translate_keyframes: Vec<_> = timeline
+            .keyframes
+            .iter()
+            .filter(|frame| {
+                frame.target == node.id
+                    && matches!(
+                        frame.property,
+                        renderer_schema::AnimatedPropertyV1::Translate(_)
+                    )
+            })
+            .collect();
+        if let Some(value) = interpolate_translate(&translate_keyframes, at_ms) {
+            node.translate = value;
+        }
     }
     output
 }
@@ -3046,6 +3089,19 @@ fn interpolate_opacity(frames: &[&KeyframeV1], at_ms: u32) -> Option<f32> {
         .collect();
     interpolate(&values, at_ms, |left, right, progress| {
         left + (right - left) * progress
+    })
+}
+
+fn interpolate_translate(frames: &[&KeyframeV1], at_ms: u32) -> Option<[f32; 2]> {
+    let values: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame.property {
+            renderer_schema::AnimatedPropertyV1::Translate(value) => Some((frame.at_ms, value)),
+            _ => None,
+        })
+        .collect();
+    interpolate(&values, at_ms, |left, right, progress| {
+        std::array::from_fn(|index| left[index] + (right[index] - left[index]) * progress)
     })
 }
 
@@ -3547,6 +3603,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "box".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 0.0,
                     y: 0.0,
@@ -3575,6 +3632,7 @@ mod tests {
         scene.nodes.extend([
             NodeV1 {
                 id: "ellipse".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Ellipse {
                     cx: 20.0,
                     cy: 20.0,
@@ -3585,6 +3643,7 @@ mod tests {
             },
             NodeV1 {
                 id: "line".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Line {
                     x1: 0.0,
                     y1: 0.0,
@@ -3596,6 +3655,7 @@ mod tests {
             },
             NodeV1 {
                 id: "path".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Path {
                     points: vec![
                         renderer_schema::PointV1 { x: 0.0, y: 0.0 },
@@ -3607,6 +3667,7 @@ mod tests {
             },
             NodeV1 {
                 id: "text".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Text {
                     x: 0.0,
                     y: 0.0,
@@ -3617,6 +3678,7 @@ mod tests {
             },
             NodeV1 {
                 id: "vector".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 16.0,
                     y: 1.0,
@@ -3627,6 +3689,7 @@ mod tests {
             },
             NodeV1 {
                 id: "image".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Image {
                     x: 0.0,
                     y: 0.0,
@@ -3692,6 +3755,37 @@ mod tests {
     }
 
     #[test]
+    fn interpolates_translate_keyframes() {
+        let mut scene = test_scene();
+        scene.timeline = Some(renderer_schema::TimelineV1 {
+            fps: 2,
+            duration_ms: 1_000,
+            keyframes: vec![
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Translate([0.0, 0.0]),
+                },
+                KeyframeV1 {
+                    at_ms: 1_000,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Translate([20.0, -10.0]),
+                },
+            ],
+        });
+        assert_eq!(scene_at(&scene, 0).nodes[0].translate, [0.0, 0.0]);
+        assert_eq!(scene_at(&scene, 500).nodes[0].translate, [10.0, -5.0]);
+        assert_eq!(scene_at(&scene, 1_000).nodes[0].translate, [20.0, -10.0]);
+        assert_eq!(interpolate_translate(&[], 0), None);
+        let opacity = KeyframeV1 {
+            at_ms: 0,
+            target: "box".into(),
+            property: renderer_schema::AnimatedPropertyV1::Opacity(1.0),
+        };
+        assert_eq!(interpolate_translate(&[&opacity], 0), None);
+    }
+
+    #[test]
     fn multiplies_interpolated_color_alpha_by_opacity() {
         let mut scene = test_scene();
         scene.timeline = Some(renderer_schema::TimelineV1 {
@@ -3722,6 +3816,315 @@ mod tests {
         );
     }
 
+    /// Direct geometric-movement proof for `Rect` translate keyframes,
+    /// through the default MSAA+supersampling `composition_plan` pipeline:
+    /// renders the same scene at two `at_ms` values on either side of a
+    /// translate keyframe pair, decodes real GPU output at both times, and
+    /// asserts the rect's white fill genuinely appears at a *different*
+    /// pixel location at each time -- not just that rendering succeeded.
+    /// Sample points are chosen well inside each rect position (away from
+    /// anti-aliased edges) and far enough apart that the two rect positions
+    /// never overlap, so a false pass from coincidental pixel overlap is not
+    /// possible.
+    #[test]
+    fn translate_keyframes_move_a_rect_node_to_a_different_pixel_location_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [0.0, 0.0, 0.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "box".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Rect {
+                    x: 4.0,
+                    y: 4.0,
+                    width: 10.0,
+                    height: 10.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            }],
+            timeline: Some(renderer_schema::TimelineV1 {
+                fps: 2,
+                duration_ms: 1_000,
+                keyframes: vec![
+                    KeyframeV1 {
+                        at_ms: 0,
+                        target: "box".into(),
+                        property: renderer_schema::AnimatedPropertyV1::Translate([0.0, 0.0]),
+                    },
+                    KeyframeV1 {
+                        at_ms: 1_000,
+                        target: "box".into(),
+                        property: renderer_schema::AnimatedPropertyV1::Translate([30.0, 30.0]),
+                    },
+                ],
+            }),
+            effect: None,
+        };
+        scene.validate().unwrap();
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |pixels: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let start = scene_at(&scene, 0);
+        start.validate().unwrap();
+        let (start_pixels, start_warnings) = renderer.render_rgba(&start).unwrap();
+        assert!(start_warnings.is_empty());
+
+        let end = scene_at(&scene, 1_000);
+        end.validate().unwrap();
+        let (end_pixels, end_warnings) = renderer.render_rgba(&end).unwrap();
+        assert!(end_warnings.is_empty());
+
+        let original_center = (9, 9);
+        let translated_center = (39, 39);
+        let background = pixel_at(&start_pixels, 0, 0);
+        let white = [255, 255, 255, 255];
+        assert_eq!(background, [0, 0, 0, 255]);
+
+        assert_eq!(
+            pixel_at(&start_pixels, original_center.0, original_center.1),
+            white,
+            "at at_ms=0 the rect should render at its declared (untranslated) location"
+        );
+        assert_eq!(
+            pixel_at(&start_pixels, translated_center.0, translated_center.1),
+            background,
+            "at at_ms=0 the translated location should still be background"
+        );
+
+        assert_eq!(
+            pixel_at(&end_pixels, translated_center.0, translated_center.1),
+            white,
+            "at at_ms=1000 the rect should have moved to the translated location"
+        );
+        assert_eq!(
+            pixel_at(&end_pixels, original_center.0, original_center.1),
+            background,
+            "at at_ms=1000 the original location should be background again since the rect moved away"
+        );
+    }
+
+    /// Same geometric-movement proof as the `Rect` test above, but for a
+    /// `Path` node -- whose translate offset is structurally different
+    /// (applied to every point in a list, not a single x/y pair), so this
+    /// specifically proves that case was not missed.
+    #[test]
+    fn translate_keyframes_move_a_path_node_to_a_different_pixel_location_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [0.0, 0.0, 0.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "triangle".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Path {
+                    points: vec![
+                        renderer_schema::PointV1 { x: 10.0, y: 10.0 },
+                        renderer_schema::PointV1 { x: 30.0, y: 10.0 },
+                        renderer_schema::PointV1 { x: 10.0, y: 30.0 },
+                    ],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            }],
+            timeline: Some(renderer_schema::TimelineV1 {
+                fps: 2,
+                duration_ms: 1_000,
+                keyframes: vec![
+                    KeyframeV1 {
+                        at_ms: 0,
+                        target: "triangle".into(),
+                        property: renderer_schema::AnimatedPropertyV1::Translate([0.0, 0.0]),
+                    },
+                    KeyframeV1 {
+                        at_ms: 1_000,
+                        target: "triangle".into(),
+                        property: renderer_schema::AnimatedPropertyV1::Translate([25.0, 25.0]),
+                    },
+                ],
+            }),
+            effect: None,
+        };
+        scene.validate().unwrap();
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |pixels: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let start = scene_at(&scene, 0);
+        start.validate().unwrap();
+        let (start_pixels, start_warnings) = renderer.render_rgba(&start).unwrap();
+        assert!(start_warnings.is_empty());
+
+        let end = scene_at(&scene, 1_000);
+        end.validate().unwrap();
+        let (end_pixels, end_warnings) = renderer.render_rgba(&end).unwrap();
+        assert!(end_warnings.is_empty());
+
+        // Sample points well inside the triangle's interior (away from its
+        // anti-aliased hypotenuse edge) for the untranslated and translated
+        // positions.
+        let original_interior = (14, 14);
+        let translated_interior = (39, 39);
+        let background = pixel_at(&start_pixels, 0, 0);
+        let white = [255, 255, 255, 255];
+        assert_eq!(background, [0, 0, 0, 255]);
+
+        assert_eq!(
+            pixel_at(&start_pixels, original_interior.0, original_interior.1),
+            white,
+            "at at_ms=0 the path should render at its declared (untranslated) points"
+        );
+        assert_eq!(
+            pixel_at(&start_pixels, translated_interior.0, translated_interior.1),
+            background,
+            "at at_ms=0 the translated location should still be background"
+        );
+
+        assert_eq!(
+            pixel_at(&end_pixels, translated_interior.0, translated_interior.1),
+            white,
+            "at at_ms=1000 every point in the path should have shifted by the translate offset"
+        );
+        assert_eq!(
+            pixel_at(&end_pixels, original_interior.0, original_interior.1),
+            background,
+            "at at_ms=1000 the original location should be background again since the path moved away"
+        );
+    }
+
+    /// Lighter-touch confirmation that the experimental analytic-AA
+    /// composition pipeline (`composition_plan_analytic` /
+    /// `render_rgba_analytic_aa`) also applies `translate` -- reusing the
+    /// same scene/keyframes as the default-pipeline `Rect` proof above so
+    /// the two pipelines are checked against literally the same geometry,
+    /// without needing the same exhaustive per-shape-kind coverage as the
+    /// default path.
+    #[test]
+    fn translate_keyframes_move_a_rect_node_under_analytic_aa_on_an_available_gpu() {
+        let renderer = match GpuRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("GPU renderer unavailable during this test: {error}");
+                return;
+            }
+        };
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 64,
+                height: 64,
+                background: [0.0, 0.0, 0.0, 1.0],
+            },
+            nodes: vec![NodeV1 {
+                id: "box".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Rect {
+                    x: 4.0,
+                    y: 4.0,
+                    width: 10.0,
+                    height: 10.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            }],
+            timeline: Some(renderer_schema::TimelineV1 {
+                fps: 2,
+                duration_ms: 1_000,
+                keyframes: vec![
+                    KeyframeV1 {
+                        at_ms: 0,
+                        target: "box".into(),
+                        property: renderer_schema::AnimatedPropertyV1::Translate([0.0, 0.0]),
+                    },
+                    KeyframeV1 {
+                        at_ms: 1_000,
+                        target: "box".into(),
+                        property: renderer_schema::AnimatedPropertyV1::Translate([30.0, 30.0]),
+                    },
+                ],
+            }),
+            effect: None,
+        };
+        scene.validate().unwrap();
+
+        let width = scene.canvas.width as usize;
+        let pixel_at = |pixels: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let index = (y * width + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        };
+
+        let start = scene_at(&scene, 0);
+        start.validate().unwrap();
+        let (start_pixels, start_warnings) = renderer.render_rgba_analytic_aa(&start).unwrap();
+        assert!(start_warnings.is_empty());
+
+        let end = scene_at(&scene, 1_000);
+        end.validate().unwrap();
+        let (end_pixels, end_warnings) = renderer.render_rgba_analytic_aa(&end).unwrap();
+        assert!(end_warnings.is_empty());
+
+        let original_center = (9, 9);
+        let translated_center = (39, 39);
+        let background = pixel_at(&start_pixels, 0, 0);
+        let white = [255, 255, 255, 255];
+
+        assert_eq!(
+            pixel_at(&start_pixels, original_center.0, original_center.1),
+            white,
+            "analytic-AA path: at at_ms=0 the rect should render at its declared location"
+        );
+        assert_eq!(
+            pixel_at(&end_pixels, translated_center.0, translated_center.1),
+            white,
+            "analytic-AA path: at at_ms=1000 the rect should have moved to the translated location"
+        );
+        assert_eq!(
+            pixel_at(&end_pixels, original_center.0, original_center.1),
+            background,
+            "analytic-AA path: at at_ms=1000 the original location should be background again"
+        );
+    }
+
     #[test]
     fn accepts_only_png_render_paths() {
         assert!(ensure_png_output_path(Path::new("scene.png")).is_ok());
@@ -3741,6 +4144,7 @@ mod tests {
         let mut scene = test_scene();
         scene.nodes.push(NodeV1 {
             id: "zero".into(),
+            translate: [0.0, 0.0],
             kind: NodeKindV1::Line {
                 x1: 1.0,
                 y1: 1.0,
@@ -3867,6 +4271,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "diagonal".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Line {
                     x1: 6.0,
                     y1: 6.0,
@@ -3974,6 +4379,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "diagonal".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Line {
                     x1: 6.0,
                     y1: 6.0,
@@ -4398,6 +4804,7 @@ mod tests {
         scene.nodes = vec![
             NodeV1 {
                 id: "text".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Text {
                     x: 1.0,
                     y: 1.0,
@@ -4408,6 +4815,7 @@ mod tests {
             },
             NodeV1 {
                 id: "vector-between".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 16.0,
                     y: 1.0,
@@ -4418,6 +4826,7 @@ mod tests {
             },
             NodeV1 {
                 id: "image".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Image {
                     x: 20.0,
                     y: 20.0,
@@ -4428,6 +4837,7 @@ mod tests {
             },
             NodeV1 {
                 id: "image-again".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Image {
                     x: 24.0,
                     y: 20.0,
@@ -4459,6 +4869,7 @@ mod tests {
         let mut primitives = test_scene();
         primitives.nodes.push(NodeV1 {
             id: "second-box".into(),
+            translate: [0.0, 0.0],
             kind: NodeKindV1::Rect {
                 x: 12.0,
                 y: 1.0,
@@ -4522,6 +4933,7 @@ mod tests {
 
         scene.nodes = vec![NodeV1 {
             id: "oversized-text".into(),
+            translate: [0.0, 0.0],
             kind: NodeKindV1::Text {
                 x: 0.0,
                 y: 0.0,
@@ -4684,6 +5096,7 @@ mod tests {
             // Keyframed: this is the only thing that differs frame to frame.
             NodeV1 {
                 id: "animated-box".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 1.0,
                     y: 1.0,
@@ -4695,6 +5108,7 @@ mod tests {
             // Static across every frame: no keyframe targets it.
             NodeV1 {
                 id: "label".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Text {
                     x: 2.0,
                     y: 10.0,
@@ -4706,6 +5120,7 @@ mod tests {
             // Static across every frame: no keyframe targets it.
             NodeV1 {
                 id: "logo".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Image {
                     x: 20.0,
                     y: 20.0,
@@ -4812,6 +5227,7 @@ mod tests {
         scene.nodes = vec![
             NodeV1 {
                 id: "animated-box".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 1.0,
                     y: 1.0,
@@ -4822,6 +5238,7 @@ mod tests {
             },
             NodeV1 {
                 id: "label".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Text {
                     x: 2.0,
                     y: 10.0,
@@ -4832,6 +5249,7 @@ mod tests {
             },
             NodeV1 {
                 id: "logo".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Image {
                     x: 20.0,
                     y: 20.0,
@@ -4912,6 +5330,7 @@ mod tests {
             nodes: vec![
                 NodeV1 {
                     id: "rect".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Rect {
                         x: 2.0,
                         y: 2.0,
@@ -4922,6 +5341,7 @@ mod tests {
                 },
                 NodeV1 {
                     id: "ellipse".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Ellipse {
                         cx: 30.0,
                         cy: 10.0,
@@ -4932,6 +5352,7 @@ mod tests {
                 },
                 NodeV1 {
                     id: "line".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Line {
                         x1: 4.0,
                         y1: 30.0,
@@ -4943,6 +5364,7 @@ mod tests {
                 },
                 NodeV1 {
                     id: "path".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Path {
                         points: vec![
                             renderer_schema::PointV1 { x: 45.0, y: 5.0 },
@@ -4954,6 +5376,7 @@ mod tests {
                 },
                 NodeV1 {
                     id: "text".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Text {
                         x: 4.0,
                         y: 44.0,
@@ -4964,6 +5387,7 @@ mod tests {
                 },
                 NodeV1 {
                     id: "logo".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Image {
                         x: 44.0,
                         y: 44.0,
@@ -5109,6 +5533,7 @@ mod tests {
                 // Bottom: a big opaque red square covering the whole canvas.
                 NodeV1 {
                     id: "background-rect".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Rect {
                         x: 0.0,
                         y: 0.0,
@@ -5121,6 +5546,7 @@ mod tests {
                 // must fully occlude the red rect beneath it.
                 NodeV1 {
                     id: "middle-path".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Path {
                         points: vec![
                             renderer_schema::PointV1 { x: 0.0, y: 0.0 },
@@ -5136,6 +5562,7 @@ mod tests {
                 // still loads (not clears) the prior Path pass's output.
                 NodeV1 {
                     id: "top-rect".into(),
+                    translate: [0.0, 0.0],
                     kind: NodeKindV1::Rect {
                         x: 8.0,
                         y: 8.0,
@@ -5223,6 +5650,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "diagonal".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Line {
                     x1: 6.0,
                     y1: 6.0,
@@ -5264,6 +5692,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "shallow-diagonal".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Line {
                     x1: 4.0,
                     y1: 20.0,
@@ -5537,6 +5966,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "box".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 1.0,
                     y: 1.0,

@@ -843,6 +843,7 @@ mod tests {
             },
             nodes: vec![NodeV1 {
                 id: "box".into(),
+                translate: [0.0, 0.0],
                 kind: NodeKindV1::Rect {
                     x: 0.0,
                     y: 0.0,
@@ -912,6 +913,7 @@ mod tests {
                     operations: vec![PatchOperationV1::UpsertNode {
                         node: NodeV1 {
                             id: "image".into(),
+                            translate: [0.0, 0.0],
                             kind: NodeKindV1::Image {
                                 x: 0.0,
                                 y: 0.0,
@@ -952,6 +954,7 @@ mod tests {
         let mut oversized = scene();
         oversized.nodes.push(NodeV1 {
             id: "large".into(),
+            translate: [0.0, 0.0],
             kind: NodeKindV1::Text {
                 x: 0.0,
                 y: 0.0,
@@ -1145,6 +1148,7 @@ mod tests {
                         PatchOperationV1::UpsertNode {
                             node: NodeV1 {
                                 id: "box".into(),
+                                translate: [0.0, 0.0],
                                 kind: NodeKindV1::Rect {
                                     x: 0.0,
                                     y: 0.0,
