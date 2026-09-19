@@ -12,7 +12,6 @@ use renderer_schema::{
     Color, EffectV1, FillV1, GradientV1, KeyframeV1, MAX_CANVAS_DIMENSION, NodeKindV1, SceneV1,
 };
 use resvg::{tiny_skia, usvg};
-use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
@@ -26,6 +25,7 @@ use wgpu::util::DeviceExt;
 
 mod error;
 mod limits;
+mod util;
 
 pub use error::{RenderError, RenderedImage};
 use limits::{
@@ -33,6 +33,7 @@ use limits::{
     MAX_GPU_TEXTURE_DIMENSION, MAX_IMAGE_RASTER_PIXELS, MAX_TEXT_BYTES, MAX_TEXT_GLYPHS,
     MAX_TEXT_RASTER_PIXELS, SVG_RASTER_TIME_BUDGET,
 };
+use util::*;
 
 const ELLIPSE_SEGMENTS: usize = 32;
 /// Arc tessellation resolution for one rounded rect corner (a 90-degree
@@ -3348,26 +3349,6 @@ fn vertex(x: f32, y: f32, color: Color, scene: &SceneV1) -> Vertex {
     }
 }
 
-fn to_wgpu_color(color: Color) -> wgpu::Color {
-    wgpu::Color {
-        r: color[0] as f64,
-        g: color[1] as f64,
-        b: color[2] as f64,
-        a: color[3] as f64,
-    }
-}
-
-fn align_to(value: u32, alignment: u32) -> u32 {
-    value.div_ceil(alignment) * alignment
-}
-
-fn hash_file(path: &Path) -> Result<String, RenderError> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(fs::read(path).map_err(RenderError::OutputRead)?)
-    ))
-}
-
 /// Passed to `color_quant::NeuQuant` as its `samplefac` (range `[1, 30]`,
 /// lower is higher quality and slower). Matches the speed the old per-frame
 /// `image`-crate path used: speed 1 (that crate's default) explicitly
@@ -3582,18 +3563,6 @@ fn write_gif_frames<W: Write>(
             .map_err(RenderError::GifEncoding)?;
     }
     Ok(())
-}
-
-fn ensure_png_output_path(output: &Path) -> Result<(), RenderError> {
-    if output
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
-    {
-        Ok(())
-    } else {
-        Err(RenderError::InvalidPngOutputPath(output.into()))
-    }
 }
 
 fn scene_at(scene: &SceneV1, at_ms: u32) -> SceneV1 {
