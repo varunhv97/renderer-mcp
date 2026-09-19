@@ -39,6 +39,90 @@ and compare the result against a normal `render` (no flag) of the same
 input; `.gif` output works too. Not currently wired into the daemon, named
 scenes, or MCP — CLI-only, for local comparison.
 
+## Installation
+
+Requirements:
+
+- A recent stable Rust toolchain (the workspace uses edition 2024, so Rust 1.85
+  or newer).
+- A GPU adapter that [wgpu](https://wgpu.rs) can use: Metal on macOS, Vulkan on
+  Linux, or DX12 on Windows. Rendering runs on the GPU, so a headless machine
+  or container without one cannot render.
+
+Build from source:
+
+```sh
+git clone https://github.com/varunhv97/renderer-mcp.git
+cd renderer-mcp
+cargo build --release
+```
+
+This produces `target/release/renderer` (the CLI) and
+`target/release/renderer-mcp` (the MCP server). To put both on your `PATH`
+instead, install them into `~/.cargo/bin`:
+
+```sh
+cargo install --path crates/cli
+cargo install --path crates/mcp
+```
+
+Check that rendering works:
+
+```sh
+renderer render --input examples/basic.scene.json --output out.png
+renderer show out.png
+```
+
+To use it from an MCP-capable agent such as Claude Code, start the daemon and
+register the server (the daemon is only required for the named-scene tools; see
+[MCP server](#mcp-server) for the full tool list):
+
+```sh
+renderer daemon serve --endpoint 127.0.0.1:9472
+
+claude mcp add renderer \
+  --env RENDERER_DAEMON_ENDPOINT=127.0.0.1:9472 \
+  -- /absolute/path/to/renderer-mcp
+```
+
+Restart the agent so it picks the server up. After rebuilding, restart the
+daemon too: a long-running `daemon serve` keeps running the old code.
+
+## Supported terminals and limitations
+
+`renderer show` and the MCP `show_image` tool display the result inline when the
+terminal supports a real graphics protocol, and open it in an external viewer
+otherwise. Details are in [Inline terminal preview](#inline-terminal-preview).
+
+| Environment | How the image is shown | Animated GIFs |
+| --- | --- | --- |
+| [cmux](https://cmux.dev) | Native file-preview panel | Animate natively |
+| Kitty, WezTerm | Kitty graphics protocol | Animate natively |
+| Ghostty | Kitty graphics protocol | Simulated by re-sending frames; `show` keeps running until `--loops` is exhausted |
+| iTerm2 | iTerm2 inline images (OSC 1337) | iTerm2 decodes and loops the GIF itself |
+| Apple Terminal.app and any other terminal | Opens the OS default viewer (`open` on macOS, `xdg-open` on Linux) | Handled by the viewer |
+| Windows | No viewer is launched; the image path is printed | -- |
+
+Known limitations:
+
+- There is no text or ANSI fallback. A terminal without a graphics protocol gets
+  the system viewer, not a blocky approximation.
+- The protocol is auto-detected from environment variables. Use
+  `--protocol kitty|iterm2` (CLI) or `protocol` (MCP) to override it.
+- When the process has no controlling terminal of its own (for example when an
+  agent spawns it as a detached subprocess), it always uses the system viewer
+  and never writes escape sequences to a terminal it does not own.
+- Use through tmux, screen, or SSH has not been tested. Graphics escape
+  sequences may not pass through those layers.
+- Rendering needs a GPU adapter; there is no software fallback for headless
+  machines.
+- The named-scene MCP tools need a running daemon. `render_scene` and
+  `show_image` do not.
+- The daemon client has a fixed 5 second timeout, so a very large or long
+  animated export can fail with a connection error instead of finishing.
+- The daemon binds loopback addresses only, and scenes can reference local
+  assets only. Remote asset fetching is intentionally not supported.
+
 ## Development
 
 ```sh
