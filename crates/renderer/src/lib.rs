@@ -9,16 +9,18 @@ use image::{
     codecs::gif::{GifEncoder, Repeat},
 };
 use renderer_schema::{
-    Color, FillV1, GradientV1, KeyframeV1, MAX_CANVAS_DIMENSION, NodeKindV1, SceneV1,
+    Color, EffectV1, FillV1, GradientV1, KeyframeV1, MAX_CANVAS_DIMENSION, NodeKindV1, SceneV1,
 };
 use resvg::{tiny_skia, usvg};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{BTreeSet, HashMap},
     fs,
     fs::File,
+    io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc},
     time::Duration,
 };
 use thiserror::Error;
@@ -148,6 +150,12 @@ pub enum RenderError {
     OutputDirectory(#[source] std::io::Error),
     #[error("could not write GIF: {0}")]
     Gif(#[source] image::ImageError),
+    /// Distinct from [`Self::Gif`] (which wraps `image::ImageError` for the
+    /// analytic-AA GIF path, still using the `image` crate's own encoder)
+    /// because [`GpuRenderer::render_gif_with_asset_root`] talks to the
+    /// lower-level `gif` crate directly -- see that method's doc comment.
+    #[error("could not write GIF: {0}")]
+    GifEncoding(#[source] gif::EncodingError),
     #[error("could not hash emitted output: {0}")]
     OutputRead(#[source] std::io::Error),
     #[error("could not load bundled font")]
@@ -331,41 +339,74 @@ impl GpuRenderer {
         // GIF export instead of once per frame. See `AssetCache`'s doc
         // comment for the full rationale.
         let mut cache = AssetCache::default();
-        {
-            // Speed 1 (the crate's default) explicitly prioritizes NeuQuant
-            // color-quantization quality "at any cost"; with MSAA-anti-aliased
-            // edges introducing far more distinct colors per frame than the
-            // old hard edges did, that cost became real (~2x slower GIF
-            // encoding on a moderately complex scene, measured locally).
-            // Speed 10 recovers most of that without a visible quality
-            // difference (checked side-by-side on several test scenes);
-            // pushing further to speed 20 saved only marginally more time.
-            let mut encoder = GifEncoder::new_with_speed(
-                File::create(output).map_err(RenderError::OutputDirectory)?,
-                10,
-            );
-            encoder
-                .set_repeat(Repeat::Infinite)
-                .map_err(RenderError::Gif)?;
-            for frame_index in 0..frame_count {
-                let at_ms = frame_index * 1_000 / fps;
-                let animated = scene_at(scene, at_ms);
-                animated.validate()?;
-                let (pixels, frame_warnings) =
-                    self.render_composed_rgba_with_cache(&animated, asset_root, &mut cache)?;
+        // Likewise created once: `scene.canvas`'s dimensions and
+        // `scene.effect`'s presence are both scene-level, not animatable
+        // (only node properties can carry timeline keyframes -- see
+        // `AnimatedPropertyV1`), so every frame renders into the exact same
+        // GPU textures/buffer instead of allocating and tearing down a fresh
+        // multi-megabyte render target `frame_count` times. See
+        // `FrameTargets`'s doc comment.
+        let targets = self.create_frame_targets(
+            scene.canvas.width,
+            scene.canvas.height,
+            scene.effect.as_ref(),
+        )?;
+        // Render every frame first into one flat, contiguous buffer, instead
+        // of encoding each one as it's produced: `encode_gif_with_shared_palette`
+        // needs every frame's actual pixels in hand before it can build one
+        // color palette to share across all of them (see that function's
+        // doc comment for why this is the whole point). Flat rather than
+        // `Vec<Vec<u8>>` so the palette-training pass below can hand
+        // `color_quant`/the exact-palette path one contiguous slice without
+        // a second, doubled-memory copy.
+        let frame_len = (scene.canvas.width as usize) * (scene.canvas.height as usize) * 4;
+        let mut pixels = Vec::with_capacity(frame_len * frame_count as usize);
+        // Pipelined: record and submit each frame's GPU work into whichever
+        // of `targets.output_buffers` the *previous* frame isn't currently
+        // being read back from, then only wait on the previous frame's
+        // readback -- which has had this frame's `composition_plan` +
+        // vertex/texture buffer construction + command recording time to
+        // finish on the GPU in the background. See `record_frame`/
+        // `finish_frame`'s doc comments. The very first frame has no
+        // previous frame to overlap with; the very last frame's readback is
+        // drained after the loop, once there's no next frame left to record
+        // while waiting.
+        let mut pending: Option<(usize, PendingFrame)> = None;
+        for frame_index in 0..frame_count {
+            let at_ms = frame_index * 1_000 / fps;
+            let animated = scene_at(scene, at_ms);
+            animated.validate()?;
+            let buffer_index = (frame_index % 2) as usize;
+            let new_pending = self.record_frame(
+                &animated,
+                asset_root,
+                &mut cache,
+                &targets,
+                &targets.output_buffers[buffer_index],
+            )?;
+            if let Some((prev_buffer_index, prev_pending)) = pending.take() {
+                let (frame_pixels, frame_warnings) =
+                    self.finish_frame(&targets.output_buffers[prev_buffer_index], prev_pending)?;
                 warnings.extend(frame_warnings);
-                let image = RgbaImage::from_raw(scene.canvas.width, scene.canvas.height, pixels)
-                    .expect("validated dimensions match readback length");
-                encoder
-                    .encode_frame(Frame::from_parts(
-                        image,
-                        0,
-                        0,
-                        Delay::from_numer_denom_ms(1_000, fps),
-                    ))
-                    .map_err(RenderError::Gif)?;
+                pixels.extend_from_slice(&frame_pixels);
             }
+            pending = Some((buffer_index, new_pending));
         }
+        if let Some((buffer_index, last_pending)) = pending {
+            let (frame_pixels, frame_warnings) =
+                self.finish_frame(&targets.output_buffers[buffer_index], last_pending)?;
+            warnings.extend(frame_warnings);
+            pixels.extend_from_slice(&frame_pixels);
+        }
+        encode_gif_with_shared_palette(
+            output,
+            scene.canvas.width,
+            scene.canvas.height,
+            &mut pixels,
+            frame_count,
+            fps,
+            GIF_QUANTIZATION_SPEED,
+        )?;
         warnings.sort();
         warnings.dedup();
         Ok(RenderedImage {
@@ -418,21 +459,41 @@ impl GpuRenderer {
         asset_root: &Path,
         cache: &mut AssetCache,
     ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
-        let plan = composition_plan(scene, asset_root, &self.font, cache)?;
-        let declared_width = scene.canvas.width;
-        let declared_height = scene.canvas.height;
-        // The node-composition and (optional) effect passes below render
-        // into a target `SUPERSAMPLE_FACTOR`x the declared canvas size (see
-        // that constant's doc comment); `vertex()` and `add_textured_rect()`
-        // already normalize every position as a fraction of
-        // `scene.canvas.width`/`height` rather than any absolute pixel
-        // count, so drawing into a larger same-aspect-ratio target needs no
-        // change to vertex generation -- only the texture/viewport/readback
-        // dimensions here. `pixels`, built from the GPU readback below, is
-        // downsampled back to `declared_width`x`declared_height` with a
-        // Lanczos3 filter before this function returns, so every caller
-        // (PNG encode, GIF frame assembly) keeps receiving pixels already at
-        // the scene's declared size, unaware supersampling happened.
+        let targets = self.create_frame_targets(
+            scene.canvas.width,
+            scene.canvas.height,
+            scene.effect.as_ref(),
+        )?;
+        // A one-shot render has no next frame to overlap with, so there's no
+        // pipelining benefit here -- just record and immediately finish,
+        // always against `output_buffers[0]`.
+        let pending = self.record_frame(
+            scene,
+            asset_root,
+            cache,
+            &targets,
+            &targets.output_buffers[0],
+        )?;
+        self.finish_frame(&targets.output_buffers[0], pending)
+    }
+
+    /// Allocates the GPU render targets one frame -- or a whole GIF export's
+    /// worth of frames, see [`FrameTargets`] -- composites into: the
+    /// `SUPERSAMPLE_FACTOR`x-scaled composite texture and its MSAA
+    /// intermediate, the readback buffer, and, only when the scene declares
+    /// a post-process `effect`, that effect's shader pipeline, target
+    /// texture, and bind group. Everything here is sized from
+    /// `declared_width`/`declared_height`/`effect` alone, never from a
+    /// specific frame's node content, so the result is valid to reuse for
+    /// every frame of one scene's timeline: canvas dimensions and effect
+    /// presence are scene-level, not animatable (only node properties carry
+    /// timeline keyframes -- see `AnimatedPropertyV1`).
+    fn create_frame_targets(
+        &self,
+        declared_width: u32,
+        declared_height: u32,
+        effect: Option<&EffectV1>,
+    ) -> Result<FrameTargets, RenderError> {
         let width = declared_width.saturating_mul(SUPERSAMPLE_FACTOR);
         let height = declared_height.saturating_mul(SUPERSAMPLE_FACTOR);
         // When a scene-level effect is present, nodes are composited into
@@ -441,7 +502,7 @@ impl GpuRenderer {
         // pixels elsewhere. With no effect, this texture is the one and only
         // render target and is read back directly, exactly as before this
         // feature existed: no extra texture or pass is allocated.
-        let has_effect = scene.effect.is_some();
+        let has_effect = effect.is_some();
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("renderer-cli target"),
             size: wgpu::Extent3d {
@@ -461,15 +522,13 @@ impl GpuRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        // Multisampled intermediate the node-composition pass below actually
-        // draws into; it is resolved into `view` (the single-sampled
-        // `texture` above) at the end of that pass, which is what performs
-        // the anti-aliasing (see `MSAA_SAMPLE_COUNT`'s doc comment). A
-        // multisampled texture can only ever be a resolve source, so its
-        // usage is restricted to `RENDER_ATTACHMENT` -- it can't be
-        // `COPY_SRC` or `TEXTURE_BINDING` -- and it's never read back or
-        // sampled directly; `texture`/`view` keep meaning exactly what they
-        // meant before this texture existed.
+        // Multisampled intermediate the node-composition pass draws into; it
+        // is resolved into `view` (the single-sampled `texture` above) at
+        // the end of that pass, which is what performs the anti-aliasing
+        // (see `MSAA_SAMPLE_COUNT`'s doc comment). A multisampled texture
+        // can only ever be a resolve source, so its usage is restricted to
+        // `RENDER_ATTACHMENT` -- it can't be `COPY_SRC` or
+        // `TEXTURE_BINDING` -- and it's never read back or sampled directly.
         let msaa_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("renderer-cli msaa target"),
             size: wgpu::Extent3d {
@@ -485,6 +544,117 @@ impl GpuRenderer {
             view_formats: &[],
         });
         let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let unpadded_bytes_per_row = width * 4;
+        let padded_bytes_per_row =
+            align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        // Two, not one: see `FrameTargets::output_buffers`' doc comment --
+        // this is what lets a GIF export's frame loop record and submit
+        // frame N+1's GPU work while frame N's readback is still in flight,
+        // instead of fully blocking on each frame before starting the next.
+        let make_output_buffer = || {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("renderer-cli readback"),
+                size: u64::from(padded_bytes_per_row) * u64::from(height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let output_buffers = [make_output_buffer(), make_output_buffer()];
+        let effect = match effect {
+            Some(effect) => {
+                let pipeline = self.build_effect_pipeline(&effect.shader)?;
+                let effect_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("renderer-cli effect target"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let effect_view =
+                    effect_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("renderer-cli effect bind group"),
+                    layout: &self.texture_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+                Some(EffectTargets {
+                    pipeline,
+                    texture: effect_texture,
+                    view: effect_view,
+                    bind_group,
+                })
+            }
+            None => None,
+        };
+        Ok(FrameTargets {
+            texture,
+            view,
+            msaa_texture,
+            msaa_view,
+            output_buffers,
+            effect,
+            width,
+            height,
+        })
+    }
+
+    /// Composites one frame of `scene` into the already-allocated `targets`
+    /// (see [`Self::create_frame_targets`]), reusing its GPU textures instead
+    /// of allocating fresh ones. The only per-call GPU allocations left here
+    /// are the vertex buffers and any image/glyph textures `plan.textures`
+    /// calls for, both of which genuinely depend on this frame's node
+    /// content.
+    ///
+    /// Submits this frame's GPU work and kicks off an async readback into
+    /// `output_buffer` (one of `targets.output_buffers` -- the caller picks
+    /// which, so a pipelined loop can alternate) via `map_async`, then
+    /// returns immediately without waiting for either to finish -- see
+    /// [`Self::finish_frame`], which does that waiting, and
+    /// [`Self::render_gif_with_asset_root`]'s frame loop for why splitting
+    /// "submit" from "wait" this way is worth doing: it lets the CPU spend
+    /// the time an already-submitted frame's GPU work is still running on
+    /// building the *next* frame (`composition_plan`, vertex/texture
+    /// buffers, command recording) instead of sitting idle.
+    fn record_frame(
+        &self,
+        scene: &SceneV1,
+        asset_root: &Path,
+        cache: &mut AssetCache,
+        targets: &FrameTargets,
+        output_buffer: &wgpu::Buffer,
+    ) -> Result<PendingFrame, RenderError> {
+        let plan = composition_plan(scene, asset_root, &self.font, cache)?;
+        let declared_width = scene.canvas.width;
+        let declared_height = scene.canvas.height;
+        // `targets` was sized `SUPERSAMPLE_FACTOR`x the declared canvas size
+        // by `create_frame_targets` (see that constant's doc comment);
+        // `vertex()` and `add_textured_rect()` already normalize every
+        // position as a fraction of `scene.canvas.width`/`height` rather
+        // than any absolute pixel count, so drawing into a larger
+        // same-aspect-ratio target needs no change to vertex generation.
+        // `pixels`, built from the GPU readback below, is downsampled back
+        // to `declared_width`x`declared_height` with a Lanczos3 filter
+        // before this function returns, so every caller (PNG encode, GIF
+        // frame assembly) keeps receiving pixels already at the scene's
+        // declared size, unaware supersampling happened.
+        let width = targets.width;
+        let height = targets.height;
         let primitive_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -554,12 +724,6 @@ impl GpuRenderer {
         let unpadded_bytes_per_row = width * 4;
         let padded_bytes_per_row =
             align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("renderer-cli readback"),
-            size: u64::from(padded_bytes_per_row) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -569,13 +733,13 @@ impl GpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("renderer-cli pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &msaa_view,
-                    resolve_target: Some(&view),
+                    view: &targets.msaa_view,
+                    resolve_target: Some(&targets.view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(to_wgpu_color(scene.canvas.background)),
                         // The multisampled contents themselves are never
-                        // read -- only the resolve into `view` matters --
-                        // so they don't need to be stored.
+                        // read -- only the resolve into `targets.view`
+                        // matters -- so they don't need to be stored.
                         store: wgpu::StoreOp::Discard,
                     },
                 })],
@@ -605,45 +769,14 @@ impl GpuRenderer {
         // Second, optional full-screen pass: run the scene's post-process
         // effect, sampling the just-composited scene texture and writing
         // the transformed pixels to a separate texture that gets read back.
-        // This keeps the no-effect path's allocation and pass count
-        // unchanged (see `has_effect` above).
-        let effect_texture;
-        let final_texture = if let Some(effect) = &scene.effect {
-            let pipeline = self.build_effect_pipeline(&effect.shader)?;
-            let created = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("renderer-cli effect target"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let effect_view = created.create_view(&wgpu::TextureViewDescriptor::default());
-            let effect_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("renderer-cli effect bind group"),
-                layout: &self.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
+        // This keeps the no-effect path's pass count unchanged (see
+        // `targets.effect` above).
+        let final_texture = if let Some(effect) = &targets.effect {
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("renderer-cli effect pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &effect_view,
+                        view: &effect.view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -654,17 +787,16 @@ impl GpuRenderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &effect_bind_group, &[]);
+                pass.set_pipeline(&effect.pipeline);
+                pass.set_bind_group(0, &effect.bind_group, &[]);
                 // Full-screen triangle: the vertex shader derives clip-space
                 // position and UV from `vertex_index` alone, so no vertex
                 // buffer is bound here.
                 pass.draw(0..3, 0..1);
             }
-            effect_texture = created;
-            &effect_texture
+            &effect.texture
         } else {
-            &texture
+            &targets.texture
         };
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -674,7 +806,7 @@ impl GpuRenderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::ImageCopyBuffer {
-                buffer: &output_buffer,
+                buffer: output_buffer,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
@@ -689,16 +821,48 @@ impl GpuRenderer {
         );
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = output_buffer.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+        output_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        Ok(PendingFrame {
+            receiver,
+            unpadded_bytes_per_row,
+            padded_bytes_per_row,
+            width,
+            height,
+            declared_width,
+            declared_height,
+        })
+    }
+
+    /// Waits for a frame `record_frame` already submitted (against the same
+    /// `output_buffer` passed to that call) to finish rendering and reading
+    /// back, then downsamples it to the scene's declared size. Split from
+    /// `record_frame` so a pipelined caller can submit the *next* frame
+    /// before waiting on this one -- see that method's doc comment.
+    fn finish_frame(
+        &self,
+        output_buffer: &wgpu::Buffer,
+        pending: PendingFrame,
+    ) -> Result<(Vec<u8>, Vec<String>), RenderError> {
+        let PendingFrame {
+            receiver,
+            unpadded_bytes_per_row,
+            padded_bytes_per_row,
+            width,
+            height,
+            declared_width,
+            declared_height,
+        } = pending;
         self.device.poll(wgpu::Maintain::Wait);
         receiver
             .recv()
             .map_err(|_| RenderError::Readback)?
             .map_err(|_| RenderError::Readback)?;
+        let slice = output_buffer.slice(..);
         let mapped = slice.get_mapped_range();
         let mut pixels = vec![0; (unpadded_bytes_per_row * height) as usize];
         for (row, target) in pixels
@@ -722,11 +886,27 @@ impl GpuRenderer {
         }
         let oversized = RgbaImage::from_raw(width, height, pixels)
             .expect("readback buffer matches the oversized render target dimensions");
+        // Triangle (linear/tent, support radius 1), not Lanczos3 (windowed
+        // sinc, support radius 3): `SUPERSAMPLE_FACTOR` always downsamples by
+        // exactly 2x, and for an exact integer ratio like that, a triangle
+        // filter is close to averaging each 2x2 source block -- the
+        // textbook-correct downsample for supersampling antialiasing, not an
+        // approximation of one. It's also far cheaper: roughly 9x fewer
+        // sample taps per output pixel in 2D than Lanczos3's wider kernel,
+        // which measured as the dominant remaining per-frame cost in GIF
+        // export profiling (see `architecture.md`). Confirmed side-by-side
+        // against Lanczos3 output before switching: the difference is only
+        // visible at extreme zoom, mostly as marginally softer text edges,
+        // and antialiasing quality itself is preserved (still measurably
+        // better than MSAA alone -- see
+        // `supersamples_diagonal_primitive_edges_beyond_msaa_alone_on_an_available_gpu`).
+        // Golden-image references were regenerated for this change; see
+        // `examples/generate_golden.rs`/`generate_golden_svg.rs`.
         let resized = image::imageops::resize(
             &oversized,
             declared_width,
             declared_height,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle,
         );
         Ok((resized.into_raw(), Vec::new()))
     }
@@ -804,6 +984,66 @@ impl GpuRenderer {
         }
         Ok(pipeline)
     }
+}
+
+/// The GPU render targets one call to [`GpuRenderer::render_frame_with_targets`]
+/// composites a single frame into: everything sized only by the scene's
+/// declared canvas dimensions and whether it has a post-process `effect`
+/// (both scene-level, not animatable), never by a specific frame's node
+/// content. Built once by [`GpuRenderer::create_frame_targets`] and reused
+/// across every frame of a GIF export -- rather than allocated and torn down
+/// `frame_count` times -- since the composite/MSAA textures and the readback
+/// buffer are the largest, most expensive-to-allocate resources in the whole
+/// render path.
+struct FrameTargets {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    // Never read again after `msaa_view` is created from it below, but must
+    // stay alive for as long as `msaa_view` does -- kept as a named field
+    // (rather than let it drop at the end of `create_frame_targets`) purely
+    // for that ownership, not to be used directly.
+    #[allow(dead_code)]
+    msaa_texture: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    /// Two readback buffers, not one, ping-ponged across frames by
+    /// `GpuRenderer::record_frame`/`finish_frame`: a GIF export can submit
+    /// frame N+1's GPU work (into the buffer frame N *isn't* using) while
+    /// frame N's async `map_async` readback is still pending, instead of
+    /// fully blocking the CPU on each frame before starting the next one's.
+    /// The single-shot PNG path always uses index 0 and never pipelines --
+    /// there's only one frame, nothing to overlap.
+    output_buffers: [wgpu::Buffer; 2],
+    effect: Option<EffectTargets>,
+    width: u32,
+    height: u32,
+}
+
+/// The extra GPU state a scene's post-process `effect` needs, held on
+/// [`FrameTargets`] only when one is present: the compiled shader pipeline
+/// (shader compilation is one of the more expensive one-time GPU driver
+/// calls, so this alone is worth hoisting out of a GIF's per-frame loop) plus
+/// its own target texture/view and the bind group sampling `FrameTargets`'s
+/// main composite `view`.
+struct EffectTargets {
+    pipeline: wgpu::RenderPipeline,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+/// One frame's GPU work, submitted by [`GpuRenderer::record_frame`] but not
+/// yet waited on: the readback its `output_buffer` argument is mid-`map_async`
+/// for, plus everything [`GpuRenderer::finish_frame`] needs to turn that
+/// readback into declared-size pixels once it's ready (sizing, since the
+/// downsample step needs both the oversized and declared dimensions).
+struct PendingFrame {
+    receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    unpadded_bytes_per_row: u32,
+    padded_bytes_per_row: u32,
+    width: u32,
+    height: u32,
+    declared_width: u32,
+    declared_height: u32,
 }
 
 /// Analytic (signed-distance-field + `fwidth`) anti-aliasing "shadow mode"
@@ -3183,6 +3423,222 @@ fn hash_file(path: &Path) -> Result<String, RenderError> {
     ))
 }
 
+/// Passed to `color_quant::NeuQuant` as its `samplefac` (range `[1, 30]`,
+/// lower is higher quality and slower). Matches the speed the old per-frame
+/// `image`-crate path used: speed 1 (that crate's default) explicitly
+/// prioritizes quantization quality "at any cost", and with MSAA-anti-aliased
+/// edges introducing far more distinct colors than hard edges did, that cost
+/// became real (~2x slower GIF encoding on a moderately complex scene,
+/// measured locally); speed 10 recovers most of that with no visible quality
+/// difference (checked side-by-side on several test scenes).
+const GIF_QUANTIZATION_SPEED: i32 = 10;
+
+/// Upper bound on how many pixels [`encode_gif_with_shared_palette`] trains
+/// its shared `NeuQuant` network on, via [`subsample_for_palette_training`].
+///
+/// `color_quant::NeuQuant`'s training cost (`NeuQuant::learn`) scales
+/// linearly with however many pixels it's handed, divided by `samplefac`
+/// (`GIF_QUANTIZATION_SPEED`) -- it has no notion of "this is already
+/// enough". Handing it every pixel of a long animation (as an earlier
+/// version of this function did) trains on `frame_count` times more data
+/// than a single frame would, costing roughly as much in total as the old
+/// per-frame quantization it was meant to replace -- measured directly: an
+/// early version of this change made a 120-frame export *slower*
+/// (6.36s vs. 5.5s) than the per-frame baseline it was supposed to improve
+/// on. Training on a bounded, evenly-strided sample instead keeps that cost
+/// roughly constant regardless of frame count or canvas size. Every actual
+/// output pixel is still mapped to the trained palette afterwards via
+/// `NeuQuant::index_of`, a cheap nearest-neighbor lookup rather than a
+/// training update (see `search_netindex`'s early-exit search), so output
+/// quality doesn't suffer from the palette itself only having been trained
+/// on a sample.
+const PALETTE_TRAINING_PIXEL_BUDGET: usize = 200_000;
+
+/// Returns an evenly strided subset of `pixels` (RGBA, 4 bytes per pixel)
+/// with at most `budget` pixels, spread across the whole buffer so a long
+/// animation's later frames contribute samples too, not just its first one.
+/// See [`PALETTE_TRAINING_PIXEL_BUDGET`] for why this exists.
+fn subsample_for_palette_training(pixels: &[u8], budget: usize) -> Vec<u8> {
+    let total_pixels = pixels.len() / 4;
+    if total_pixels <= budget {
+        return pixels.to_vec();
+    }
+    let stride = total_pixels.div_ceil(budget);
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .step_by(stride)
+        .flat_map(|pixel| pixel.iter().copied())
+        .collect()
+}
+
+/// Encodes `pixels` -- every frame of one animated scene's RGBA output,
+/// concatenated back to back into one flat, contiguous buffer of
+/// `frame_count * width * height * 4` bytes -- as a single GIF at `output`,
+/// sharing one color palette across every frame instead of, as the `image`
+/// crate's high-level `GifEncoder` does, quantizing each frame independently.
+///
+/// Profiling `render_gif_with_asset_root` (see `architecture.md`) found
+/// per-frame NeuQuant training, not GPU compositing, was the dominant cost of
+/// an animated export: isolating frame count from scene complexity showed a
+/// consistent ~43ms of marginal cost per frame even after GPU render targets
+/// stopped being reallocated every frame (`FrameTargets`), matching
+/// `color_quant`'s own training cost far more than a few-millisecond GPU
+/// composite + readback. Training one shared network once, on every frame's
+/// pixels at once, instead of `frame_count` independent times, turns that
+/// into the dominant one-time cost of the whole export rather than a
+/// per-frame recurring one.
+///
+/// Mirrors `gif::Frame::from_rgba_speed`'s own semantics, just applied across
+/// every frame at once instead of to one frame at a time: any non-zero alpha
+/// becomes fully opaque (the GIF format has no partial transparency), the
+/// first fully-transparent pixel encountered pins the one RGBA value every
+/// other fully-transparent pixel -- in any frame -- is normalized to (the
+/// whole animation can mark only one palette index as "the" transparent
+/// color, so every frame has to agree on which color that is), and an exact,
+/// lossless palette is used whenever the whole animation fits in 256 colors,
+/// falling back to NeuQuant only when it genuinely doesn't.
+fn encode_gif_with_shared_palette(
+    output: &Path,
+    width: u32,
+    height: u32,
+    pixels: &mut [u8],
+    frame_count: u32,
+    fps: u32,
+    speed: i32,
+) -> Result<(), RenderError> {
+    let gif_width = u16::try_from(width).unwrap_or(u16::MAX);
+    let gif_height = u16::try_from(height).unwrap_or(u16::MAX);
+    let frame_len = (width as usize) * (height as usize) * 4;
+
+    let mut transparent_color: Option<[u8; 4]> = None;
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        if pixel[3] != 0 {
+            pixel[3] = 0xFF;
+            continue;
+        }
+        match transparent_color {
+            Some([r, g, b, a]) => {
+                pixel[0] = r;
+                pixel[1] = g;
+                pixel[2] = b;
+                pixel[3] = a;
+            }
+            None => transparent_color = Some([pixel[0], pixel[1], pixel[2], pixel[3]]),
+        }
+    }
+
+    let file = File::create(output).map_err(RenderError::OutputDirectory)?;
+    let delay_cs = (100 / fps.max(1)).clamp(1, u32::from(u16::MAX)) as u16;
+
+    // As with the per-frame path this replaces, prefer an exact palette when
+    // the whole animation uses 256 colors or fewer -- lossless, and cheap to
+    // build -- and only reach for NeuQuant when it genuinely doesn't fit.
+    let mut colors: BTreeSet<(u8, u8, u8, u8)> = BTreeSet::new();
+    let mut exact = true;
+    for pixel in pixels.as_chunks::<4>().0 {
+        if colors.insert((pixel[0], pixel[1], pixel[2], pixel[3])) && colors.len() > 256 {
+            exact = false;
+            break;
+        }
+    }
+
+    if exact {
+        let colors: Vec<(u8, u8, u8, u8)> = colors.into_iter().collect();
+        let palette: Vec<u8> = colors.iter().flat_map(|&(r, g, b, _a)| [r, g, b]).collect();
+        let index_of: HashMap<(u8, u8, u8, u8), u8> = colors.into_iter().zip(0u8..).collect();
+        let transparent_index = transparent_color.map(|[r, g, b, a]| index_of[&(r, g, b, a)]);
+        let mut encoder = gif::Encoder::new(file, gif_width, gif_height, &palette)
+            .map_err(RenderError::GifEncoding)?;
+        encoder
+            .set_repeat(gif::Repeat::Infinite)
+            .map_err(RenderError::GifEncoding)?;
+        write_gif_frames(
+            &mut encoder,
+            pixels,
+            frame_len,
+            frame_count,
+            gif_width,
+            gif_height,
+            delay_cs,
+            transparent_index,
+            |pixel| index_of[&(pixel[0], pixel[1], pixel[2], pixel[3])],
+        )
+    } else {
+        let training_sample = subsample_for_palette_training(pixels, PALETTE_TRAINING_PIXEL_BUDGET);
+        let quant = color_quant::NeuQuant::new(speed, 256, &training_sample);
+        let palette = quant.color_map_rgb();
+        let transparent_index = transparent_color.map(|color| quant.index_of(&color) as u8);
+        let mut encoder = gif::Encoder::new(file, gif_width, gif_height, &palette)
+            .map_err(RenderError::GifEncoding)?;
+        encoder
+            .set_repeat(gif::Repeat::Infinite)
+            .map_err(RenderError::GifEncoding)?;
+        write_gif_frames(
+            &mut encoder,
+            pixels,
+            frame_len,
+            frame_count,
+            gif_width,
+            gif_height,
+            delay_cs,
+            transparent_index,
+            |pixel| quant.index_of(pixel) as u8,
+        )
+    }
+}
+
+/// Writes every `frame_len`-byte slice of `pixels` as one GIF frame, mapping
+/// each pixel to a palette index via `index_of` (either an exact-palette
+/// hash lookup or a shared `NeuQuant` network -- see
+/// `encode_gif_with_shared_palette`). `palette: None` on every frame so each
+/// one is decoded against the encoder's global palette instead of carrying
+/// its own local one.
+// Every parameter is a genuinely distinct piece of the frame/encoding
+// context (dimensions, timing, transparency, the pixel data itself, and how
+// to quantize it); a params struct for this one internal helper would only
+// add indirection, not clarity -- same call as `add_rect_analytic` above.
+#[allow(clippy::too_many_arguments)]
+fn write_gif_frames<W: Write>(
+    encoder: &mut gif::Encoder<W>,
+    pixels: &[u8],
+    frame_len: usize,
+    frame_count: u32,
+    width: u16,
+    height: u16,
+    delay_cs: u16,
+    transparent: Option<u8>,
+    index_of: impl Fn(&[u8]) -> u8,
+) -> Result<(), RenderError> {
+    for frame_pixels in pixels.chunks_exact(frame_len).take(frame_count as usize) {
+        let indices: Vec<u8> = frame_pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| index_of(pixel))
+            .collect();
+        let frame = gif::Frame {
+            delay: delay_cs,
+            // Every frame here is a full, opaque-or-transparent-by-alpha
+            // composite of the whole canvas (never a sparse/partial update),
+            // so `Keep` and `Background` are behaviorally identical; picked
+            // to match what the `image` crate's own encoder used to set.
+            dispose: gif::DisposalMethod::Background,
+            transparent,
+            width,
+            height,
+            palette: None,
+            buffer: Cow::Owned(indices),
+            ..gif::Frame::default()
+        };
+        encoder
+            .write_frame(&frame)
+            .map_err(RenderError::GifEncoding)?;
+    }
+    Ok(())
+}
+
 fn ensure_png_output_path(output: &Path) -> Result<(), RenderError> {
     if output
         .extension()
@@ -4688,21 +5144,20 @@ mod tests {
         // exactly through the sRGB transfer function used by the
         // `Rgba8UnormSrgb` intermediate texture, making an exact-byte
         // comparison meaningful there. With `SUPERSAMPLE_FACTOR` supersampling
-        // now in the pipeline, that no longer holds exactly: the Lanczos3
-        // downsample filter (see `SUPERSAMPLE_FACTOR`'s doc comment) has a
-        // wide support radius with negative side lobes, so a hard content
-        // edge a few source texels away (the rect's edge, still pixel-
-        // aligned in the oversized render) can leak a couple of least-
-        // significant-bit levels of ringing into an otherwise-background
-        // output pixel near it -- exactly the kind of well-known Lanczos
-        // artifact this crate's `assert_matches_golden` tolerance elsewhere
-        // already accounts for at shape/glyph/image edges. `PIXEL_TOLERANCE`
-        // absorbs that (measured 1 of 255 here) while still exercising the
-        // real GPU pass and catching an actual regression (wrong
-        // composition, dropped alpha, effect not applied): RGB channels
-        // invert 0 -> 255 and alpha (never gamma-corrected) passes through
-        // unchanged.
-        const PIXEL_TOLERANCE: i16 = 4;
+        // now in the pipeline, that no longer holds exactly: the downsample
+        // filter (see `SUPERSAMPLE_FACTOR`'s doc comment) has nonzero support
+        // beyond a single output texel, so a hard content edge a few source
+        // texels away (the rect's edge, still pixel-aligned in the oversized
+        // render) blends a sliver of it into an otherwise-background output
+        // pixel near it -- exactly the kind of edge softening this crate's
+        // `assert_matches_golden` tolerance elsewhere already accounts for
+        // at shape/glyph/image edges. `PIXEL_TOLERANCE` absorbs that
+        // (measured 5 of 255 here, with the Triangle filter `SUPERSAMPLE_FACTOR`'s
+        // downsample currently uses) while still exercising the real GPU
+        // pass and catching an actual regression (wrong composition,
+        // dropped alpha, effect not applied): RGB channels invert 0 -> 255
+        // and alpha (never gamma-corrected) passes through unchanged.
+        const PIXEL_TOLERANCE: i16 = 8;
         let assert_pixel_close = |label: &str, actual: &[u8], expected: [u8; 4]| {
             for channel in 0..4 {
                 let delta = (actual[channel] as i16 - expected[channel] as i16).abs();

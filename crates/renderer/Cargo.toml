@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+color_quant.workspace = true
 fontdue.workspace = true
+gif.workspace = true
 image.workspace = true
 pollster.workspace = true
 renderer-schema = { path = "../schema" }
