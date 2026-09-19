@@ -1,3 +1,4 @@
+mod analytic;
 mod frame;
 mod render;
 
