@@ -9,7 +9,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        include:
+          - os: macos-latest
+          - os: ubuntu-latest
+          # Windows CI uses the WARP software adapter, which runs out of GPU
+          # memory ("Not enough memory left") when the many GPU tests each
+          # create a device at the same time, so run tests one at a time.
+          - os: windows-latest
+            test_args: "-- --test-threads=1"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,5 +32,5 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo llvm-cov --workspace --all-targets --all-features --fail-under-lines 65
+      - run: cargo test --workspace ${{ matrix.test_args }}
+      - run: cargo llvm-cov --workspace --all-targets --all-features --fail-under-lines 65 ${{ matrix.test_args }}
