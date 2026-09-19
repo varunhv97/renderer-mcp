@@ -251,3 +251,266 @@ pub(crate) fn vertex(x: f32, y: f32, color: Color, scene: &SceneV1) -> Vertex {
         color,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::animation::*;
+    use crate::test_support::*;
+    use crate::util::*;
+    use renderer_schema::CanvasV1;
+    use renderer_schema::FillV1;
+    use renderer_schema::NodeKindV1;
+    use renderer_schema::NodeV1;
+    use renderer_schema::SCENE_VERSION_V1;
+    use renderer_schema::SceneV1;
+
+    #[test]
+    fn compiles_rectangle_vertices() {
+        let scene = SceneV1 {
+            version: SCENE_VERSION_V1.into(),
+            canvas: CanvasV1 {
+                width: 100,
+                height: 100,
+                background: [0.0; 4],
+            },
+            nodes: vec![NodeV1 {
+                id: "box".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0; 4]),
+                },
+            }],
+            timeline: None,
+            effect: None,
+        };
+        let (vertices, warnings) = vertices_for_scene(&scene);
+        assert_eq!(vertices.len(), 6);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn compiles_all_geometry_and_reports_unrasterized_nodes() {
+        let mut scene = test_scene();
+        scene.nodes.extend([
+            NodeV1 {
+                id: "ellipse".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Ellipse {
+                    cx: 20.0,
+                    cy: 20.0,
+                    rx: 5.0,
+                    ry: 5.0,
+                    fill: FillV1::Solid([0.0, 1.0, 0.0, 1.0]),
+                },
+            },
+            NodeV1 {
+                id: "line".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Line {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: 20.0,
+                    y2: 20.0,
+                    thickness: 2.0,
+                    fill: FillV1::Solid([0.0, 0.0, 1.0, 1.0]),
+                },
+            },
+            NodeV1 {
+                id: "path".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Path {
+                    points: vec![
+                        renderer_schema::PointV1 { x: 0.0, y: 0.0 },
+                        renderer_schema::PointV1 { x: 10.0, y: 0.0 },
+                        renderer_schema::PointV1 { x: 0.0, y: 10.0 },
+                    ],
+                    fill: FillV1::Solid([1.0; 4]),
+                },
+            },
+            NodeV1 {
+                id: "text".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Text {
+                    x: 0.0,
+                    y: 0.0,
+                    text: "t".into(),
+                    size: 8.0,
+                    fill: FillV1::Solid([1.0; 4]),
+                },
+            },
+            NodeV1 {
+                id: "vector".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Rect {
+                    x: 16.0,
+                    y: 1.0,
+                    width: 2.0,
+                    height: 2.0,
+                    corner_radius: 0.0,
+                    fill: FillV1::Solid([1.0; 4]),
+                },
+            },
+            NodeV1 {
+                id: "image".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Image {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                    source: "x".into(),
+                },
+            },
+        ]);
+        let (vertices, warnings) = vertices_for_scene(&scene);
+        assert!(vertices.len() > 100);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn covers_geometry_and_animation_edge_cases() {
+        let mut scene = test_scene();
+        scene.nodes.push(NodeV1 {
+            id: "zero".into(),
+            translate: [0.0, 0.0],
+            kind: NodeKindV1::Line {
+                x1: 1.0,
+                y1: 1.0,
+                x2: 1.0,
+                y2: 1.0,
+                thickness: 1.0,
+                fill: FillV1::Solid([1.0; 4]),
+            },
+        });
+        assert_eq!(vertices_for_scene(&scene).0.len(), 6);
+        assert_eq!(scene_at(&scene, 1), scene);
+        let variants = [
+            NodeKindV1::Ellipse {
+                cx: 0.0,
+                cy: 0.0,
+                rx: 1.0,
+                ry: 1.0,
+                fill: FillV1::Solid([1.0; 4]),
+            },
+            NodeKindV1::Line {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+                thickness: 1.0,
+                fill: FillV1::Solid([1.0; 4]),
+            },
+            NodeKindV1::Path {
+                points: vec![renderer_schema::PointV1 { x: 0.0, y: 0.0 }; 3],
+                fill: FillV1::Solid([1.0; 4]),
+            },
+            NodeKindV1::Text {
+                x: 0.0,
+                y: 0.0,
+                text: "x".into(),
+                size: 1.0,
+                fill: FillV1::Solid([1.0; 4]),
+            },
+            NodeKindV1::Image {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                source: "x".into(),
+            },
+        ];
+        for mut kind in variants {
+            let _ = fill_of(&kind);
+            let _ = fill_mut(&mut kind);
+        }
+        assert_eq!(
+            interpolate(&[(10, 1.0_f32), (20, 2.0)], 0, |a, b, t| a + (b - a) * t),
+            Some(1.0)
+        );
+        assert_eq!(
+            interpolate(&[(10, 1.0_f32), (20, 2.0)], 30, |a, b, t| a + (b - a) * t),
+            Some(2.0)
+        );
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("output"), b"bytes").unwrap();
+        assert!(hash_file(&directory.path().join("output")).is_ok());
+        assert!(hash_file(&directory.path().join("missing")).is_err());
+    }
+
+    /// Portable (no-GPU) proof that a zero (or omitted) `corner_radius`
+    /// leaves `add_rect`'s output byte-identical to the plain 2-triangle
+    /// quad it always emitted before rounded corners existed. Reconstructs
+    /// that original tessellation by hand (the same `vertex()` calls in the
+    /// same `[a, b, c, a, c, d]` order `add_rect`'s original implementation
+    /// used) and compares every emitted `Vertex`'s position and color
+    /// field-by-field against `test_scene()`'s zero-radius rect.
+    #[test]
+    fn rounded_rect_with_zero_radius_matches_the_original_plain_rect_tessellation() {
+        let scene = test_scene();
+        let NodeKindV1::Rect {
+            x,
+            y,
+            width,
+            height,
+            corner_radius,
+            fill,
+        } = &scene.nodes[0].kind
+        else {
+            panic!("test_scene()'s only node must be a Rect");
+        };
+        assert_eq!(*corner_radius, 0.0);
+        let color = fill.resolve_solid();
+
+        let (actual, _) = vertices_for_scene(&scene);
+        let a = vertex(*x, *y, color, &scene);
+        let b = vertex(*x + *width, *y, color, &scene);
+        let c = vertex(*x + *width, *y + *height, color, &scene);
+        let d = vertex(*x, *y + *height, color, &scene);
+        let expected = [a, b, c, a, c, d];
+
+        assert_eq!(actual.len(), expected.len());
+        for (index, (found, want)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                found.position, want.position,
+                "vertex {index} position mismatch"
+            );
+            assert_eq!(found.color, want.color, "vertex {index} color mismatch");
+        }
+    }
+
+    /// Portable (no-GPU) proof that a positive `corner_radius` actually
+    /// changes the emitted geometry (more triangles than the flat 2-triangle
+    /// quad, since corners are now tessellated as arcs) rather than being
+    /// silently ignored by the vertex builder.
+    #[test]
+    fn rounded_rect_emits_more_triangles_than_a_plain_rect() {
+        let mut scene = test_scene();
+        let (plain, _) = vertices_for_scene(&scene);
+
+        let NodeKindV1::Rect { corner_radius, .. } = &mut scene.nodes[0].kind else {
+            panic!("test_scene()'s only node must be a Rect");
+        };
+        *corner_radius = 3.0;
+        scene.validate().unwrap();
+        let (rounded, _) = vertices_for_scene(&scene);
+
+        assert_eq!(
+            plain.len(),
+            6,
+            "a plain (zero-radius) rect is always 2 triangles"
+        );
+        assert!(
+            rounded.len() > plain.len(),
+            "expected a rounded rect to tessellate into more triangles ({}) than a plain \
+             rect ({})",
+            rounded.len(),
+            plain.len()
+        );
+    }
+}

@@ -142,3 +142,123 @@ pub(crate) fn interpolate<T: Copy>(
     }
     Some(sorted.last().unwrap_or(&first).1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use renderer_schema::FillV1;
+    use renderer_schema::KeyframeV1;
+
+    #[test]
+    fn interpolates_color_and_opacity_keyframes() {
+        let mut scene = test_scene();
+        scene.timeline = Some(renderer_schema::TimelineV1 {
+            fps: 2,
+            duration_ms: 1_000,
+            keyframes: vec![
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Color([0.0, 0.0, 0.0, 1.0]),
+                },
+                KeyframeV1 {
+                    at_ms: 1_000,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Color([1.0, 1.0, 1.0, 1.0]),
+                },
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Opacity(0.0),
+                },
+                KeyframeV1 {
+                    at_ms: 1_000,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Opacity(1.0),
+                },
+            ],
+        });
+        let at_middle = scene_at(&scene, 500);
+        assert_eq!(
+            fill_of(&at_middle.nodes[0].kind),
+            Some(FillV1::Solid([0.5, 0.5, 0.5, 0.5]))
+        );
+        assert_eq!(interpolate_color(&[], 0), None);
+        assert_eq!(interpolate_opacity(&[], 0), None);
+        let opacity = KeyframeV1 {
+            at_ms: 0,
+            target: "box".into(),
+            property: renderer_schema::AnimatedPropertyV1::Opacity(1.0),
+        };
+        let color = KeyframeV1 {
+            at_ms: 0,
+            target: "box".into(),
+            property: renderer_schema::AnimatedPropertyV1::Color([1.0; 4]),
+        };
+        assert_eq!(interpolate_color(&[&opacity], 0), None);
+        assert_eq!(interpolate_opacity(&[&color], 0), None);
+    }
+
+    #[test]
+    fn interpolates_translate_keyframes() {
+        let mut scene = test_scene();
+        scene.timeline = Some(renderer_schema::TimelineV1 {
+            fps: 2,
+            duration_ms: 1_000,
+            keyframes: vec![
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Translate([0.0, 0.0]),
+                },
+                KeyframeV1 {
+                    at_ms: 1_000,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Translate([20.0, -10.0]),
+                },
+            ],
+        });
+        assert_eq!(scene_at(&scene, 0).nodes[0].translate, [0.0, 0.0]);
+        assert_eq!(scene_at(&scene, 500).nodes[0].translate, [10.0, -5.0]);
+        assert_eq!(scene_at(&scene, 1_000).nodes[0].translate, [20.0, -10.0]);
+        assert_eq!(interpolate_translate(&[], 0), None);
+        let opacity = KeyframeV1 {
+            at_ms: 0,
+            target: "box".into(),
+            property: renderer_schema::AnimatedPropertyV1::Opacity(1.0),
+        };
+        assert_eq!(interpolate_translate(&[&opacity], 0), None);
+    }
+
+    #[test]
+    fn multiplies_interpolated_color_alpha_by_opacity() {
+        let mut scene = test_scene();
+        scene.timeline = Some(renderer_schema::TimelineV1 {
+            fps: 2,
+            duration_ms: 1_000,
+            keyframes: vec![
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Color([1.0, 0.0, 0.0, 0.0]),
+                },
+                KeyframeV1 {
+                    at_ms: 1_000,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Color([1.0, 0.0, 0.0, 1.0]),
+                },
+                KeyframeV1 {
+                    at_ms: 0,
+                    target: "box".into(),
+                    property: renderer_schema::AnimatedPropertyV1::Opacity(0.5),
+                },
+            ],
+        });
+        let at_middle = scene_at(&scene, 500);
+        assert_eq!(
+            fill_of(&at_middle.nodes[0].kind),
+            Some(FillV1::Solid([1.0, 0.0, 0.0, 0.25]))
+        );
+    }
+}

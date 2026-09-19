@@ -34,3 +34,30 @@ pub(crate) fn ensure_png_output_path(output: &Path) -> Result<(), RenderError> {
         Err(RenderError::InvalidPngOutputPath(output.into()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::*;
+    use std::path::Path;
+
+    #[test]
+    fn aligns_copy_rows() {
+        assert_eq!(align_to(256, 256), 256);
+        assert_eq!(align_to(260, 256), 512);
+    }
+
+    #[test]
+    fn accepts_only_png_render_paths() {
+        assert!(ensure_png_output_path(Path::new("scene.png")).is_ok());
+        assert!(ensure_png_output_path(Path::new("scene.PNG")).is_ok());
+        assert!(matches!(
+            ensure_png_output_path(Path::new("scene.gif")),
+            Err(RenderError::InvalidPngOutputPath(_))
+        ));
+        assert!(matches!(
+            ensure_png_output_path(Path::new("scene")),
+            Err(RenderError::InvalidPngOutputPath(_))
+        ));
+    }
+}
