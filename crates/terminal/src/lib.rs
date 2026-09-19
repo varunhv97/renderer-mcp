@@ -857,22 +857,30 @@ fn render_ansi_frame(image: &RgbaImage, truecolor: bool) -> (Vec<u8>, usize) {
     let width = image.width();
     let height = image.height();
     let rows = height.div_ceil(2) as usize;
+    let dithered_indices = (!truecolor).then(|| dither_image_to_ansi256(image));
     let mut out = Vec::new();
     for row in 0..rows {
         let top_y = (row * 2) as u32;
         let bottom_y = top_y + 1;
         for x in 0..width {
-            let (tr, tg, tb) = composite_over_background(*image.get_pixel(x, top_y));
-            let (br, bg, bb) = if bottom_y < height {
-                composite_over_background(*image.get_pixel(x, bottom_y))
-            } else {
-                (tr, tg, tb)
-            };
             let cell = if truecolor {
+                let (tr, tg, tb) = composite_over_background(*image.get_pixel(x, top_y));
+                let (br, bg, bb) = if bottom_y < height {
+                    composite_over_background(*image.get_pixel(x, bottom_y))
+                } else {
+                    (tr, tg, tb)
+                };
                 format!("\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg};{bb}m\u{2580}")
             } else {
-                let fg = quantize_to_ansi256(tr, tg, tb);
-                let bg = quantize_to_ansi256(br, bg, bb);
+                let indices = dithered_indices
+                    .as_ref()
+                    .expect("dithered_indices is Some whenever truecolor is false");
+                let fg = indices[(top_y * width + x) as usize];
+                let bg = if bottom_y < height {
+                    indices[(bottom_y * width + x) as usize]
+                } else {
+                    fg
+                };
                 format!("\x1b[38;5;{fg}m\x1b[48;5;{bg}m\u{2580}")
             };
             out.extend_from_slice(cell.as_bytes());
@@ -880,6 +888,103 @@ fn render_ansi_frame(image: &RgbaImage, truecolor: bool) -> (Vec<u8>, usize) {
         out.extend_from_slice(b"\x1b[0m\n");
     }
     (out, rows)
+}
+
+/// Quantizes a whole image to 256-color-palette indices (row-major, one per
+/// source pixel) using Floyd-Steinberg error diffusion, for the 256-color
+/// ANSI fallback (see [`render_ansi_frame`]). Reduces visible color banding
+/// in gradients: the color cube's per-channel resolution is coarse (six
+/// levels), so a smooth gradient otherwise renders as a small number of
+/// sharp, visible steps. Each pixel's quantization error (the difference
+/// between its true color and the palette color actually chosen) is
+/// carried forward into its not-yet-processed neighbors (right, below-left,
+/// below, below-right, in the standard 7/3/5/1-sixteenths weighting), so
+/// the error averages out visually instead of accumulating into a hard
+/// edge. Deliberately *not* ordered (Bayer-matrix) dithering, which was
+/// tried first and rejected: a repeating fixed-size threshold tile produces
+/// an obvious, regular checkerboard pattern across a *smoothly* varying
+/// gradient specifically, since the same tile positions cross the same
+/// quantization boundary over and over across a wide area -- confirmed by
+/// rendering both and comparing. Error diffusion's error pattern isn't
+/// tied to a fixed grid, so it reads as fine, non-repeating texture
+/// instead. Operates on full source-pixel rows/columns rather than the
+/// coarser two-source-rows-per-terminal-row half-block grid, since a
+/// correct diffusion pattern depends on each pixel's true immediate
+/// neighbors.
+fn dither_image_to_ansi256(image: &RgbaImage) -> Vec<u8> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let mut working: Vec<[f32; 3]> = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                let (r, g, b) = composite_over_background(*image.get_pixel(x as u32, y as u32));
+                [f32::from(r), f32::from(g), f32::from(b)]
+            })
+        })
+        .collect();
+    let mut indices = vec![0u8; width * height];
+
+    for y in 0..height {
+        for x in 0..width {
+            let position = y * width + x;
+            let clamped = working[position].map(|channel| channel.clamp(0.0, 255.0));
+            let palette_index =
+                quantize_to_ansi256(clamped[0] as u8, clamped[1] as u8, clamped[2] as u8);
+            indices[position] = palette_index;
+
+            let (ar, ag, ab) = ansi256_to_rgb(palette_index);
+            let error = [
+                clamped[0] - f32::from(ar),
+                clamped[1] - f32::from(ag),
+                clamped[2] - f32::from(ab),
+            ];
+            let mut diffuse = |dx: i32, dy: i32, weight: f32| {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || ny < 0 || nx as usize >= width || ny as usize >= height {
+                    return;
+                }
+                let neighbor = ny as usize * width + nx as usize;
+                for channel in 0..3 {
+                    working[neighbor][channel] += error[channel] * weight;
+                }
+            };
+            diffuse(1, 0, 7.0 / 16.0);
+            diffuse(-1, 1, 3.0 / 16.0);
+            diffuse(0, 1, 5.0 / 16.0);
+            diffuse(1, 1, 1.0 / 16.0);
+        }
+    }
+    indices
+}
+
+/// The six per-channel levels of the xterm 256-color palette's 6x6x6 RGB
+/// cube (indices 16-231), shared by [`quantize_to_ansi256`] and its inverse
+/// [`ansi256_to_rgb`].
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// The inverse of [`quantize_to_ansi256`]: the actual RGB color a given
+/// xterm 256-color palette index displays as. Used by
+/// [`dither_image_to_ansi256`] to compute how much quantization error to
+/// diffuse to a pixel's neighbors. Indices 0-15 (the theme-dependent basic
+/// colors, never produced by `quantize_to_ansi256`) resolve to black, since
+/// no reliable fixed RGB exists for them and diffusing error against a
+/// palette index this function never actually emits doesn't need to be
+/// meaningful.
+fn ansi256_to_rgb(index: u8) -> (u8, u8, u8) {
+    if (16..=231).contains(&index) {
+        let offset = u32::from(index - 16);
+        let level = |value: u32| CUBE_LEVELS[value as usize];
+        (
+            level(offset / 36),
+            level((offset % 36) / 6),
+            level(offset % 6),
+        )
+    } else if index >= 232 {
+        let value = 8 + 10 * u32::from(index - 232);
+        (value as u8, value as u8, value as u8)
+    } else {
+        (0, 0, 0)
+    }
 }
 
 /// Quantizes a 24-bit RGB color to the nearest xterm 256-color palette
@@ -894,12 +999,11 @@ fn render_ansi_frame(image: &RgbaImage, truecolor: bool) -> (Vec<u8>, usize) {
 /// quantization targets: their actual displayed RGB values vary by
 /// terminal theme, so there's nothing reliable to quantize against.
 fn quantize_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
-    const CUBE_LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
     let nearest_level = |value: u8| -> usize {
         CUBE_LEVELS
             .iter()
             .enumerate()
-            .min_by_key(|(_, level)| (*level - i32::from(value)).abs())
+            .min_by_key(|(_, level)| (i32::from(**level) - i32::from(value)).abs())
             .map(|(index, _)| index)
             .expect("CUBE_LEVELS is non-empty")
     };
@@ -913,9 +1017,9 @@ fn quantize_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
         i32::from(r),
         i32::from(g),
         i32::from(b),
-        CUBE_LEVELS[ri],
-        CUBE_LEVELS[gi],
-        CUBE_LEVELS[bi],
+        i32::from(CUBE_LEVELS[ri]),
+        i32::from(CUBE_LEVELS[gi]),
+        i32::from(CUBE_LEVELS[bi]),
     );
 
     // 24-step grayscale ramp: index 232 is level 8, index 255 is level 238,
@@ -1810,6 +1914,63 @@ mod tests {
         assert!(text.contains("\x1b[38;5;"));
         assert!(text.contains("\x1b[48;5;"));
         assert!(text.ends_with("\x1b[0m\n"));
+    }
+
+    #[test]
+    fn ansi256_to_rgb_is_the_exact_inverse_of_quantize_to_ansi256_for_cube_corners() {
+        assert_eq!(ansi256_to_rgb(196), (255, 0, 0));
+        assert_eq!(ansi256_to_rgb(46), (0, 255, 0));
+        assert_eq!(ansi256_to_rgb(21), (0, 0, 255));
+    }
+
+    #[test]
+    fn ansi256_to_rgb_reconstructs_the_grayscale_ramp() {
+        assert_eq!(ansi256_to_rgb(232), (8, 8, 8));
+        assert_eq!(ansi256_to_rgb(255), (238, 238, 238));
+    }
+
+    #[test]
+    fn dither_image_to_ansi256_renders_a_smooth_gradient_with_more_distinct_steps_than_naive_quantization()
+     {
+        // A flat 256x1 image, one color per column, spanning between two
+        // cube levels that straddle a hard quantization boundary. Naive
+        // per-pixel quantization (no dithering) can only ever produce the
+        // handful of indices the color cube actually has between those two
+        // colors; error diffusion, spreading each pixel's rounding error
+        // into its right-hand neighbor, should be able to select from a
+        // wider effective range by alternating between the two nearest
+        // indices in proportions that track the true intermediate value --
+        // producing more than just those two flat bands.
+        let mut image = RgbaImage::new(256, 1);
+        for x in 0..256u32 {
+            image.put_pixel(x, 0, Rgba([x as u8, 0, 0, 255]));
+        }
+        let dithered = dither_image_to_ansi256(&image);
+        let naive: Vec<u8> = (0..256u32)
+            .map(|x| {
+                let level = x as u8;
+                quantize_to_ansi256(level, 0, 0)
+            })
+            .collect();
+        let dithered_distinct: std::collections::HashSet<_> = dithered.iter().collect();
+        let naive_distinct: std::collections::HashSet<_> = naive.iter().collect();
+        assert!(
+            dithered_distinct.len() >= naive_distinct.len(),
+            "dithering should never reduce the number of distinct palette indices used \
+             (naive: {naive_distinct:?}, dithered: {dithered_distinct:?})"
+        );
+        // And the dithered result should differ from the naive one
+        // somewhere -- otherwise dithering did nothing at all.
+        assert_ne!(dithered, naive);
+    }
+
+    #[test]
+    fn dither_image_to_ansi256_handles_a_single_pixel_image() {
+        let mut image = RgbaImage::new(1, 1);
+        image.put_pixel(0, 0, Rgba([10, 20, 30, 255]));
+        let indices = dither_image_to_ansi256(&image);
+        assert_eq!(indices.len(), 1);
+        assert!((0..=255).contains(&indices[0]));
     }
 
     #[test]
