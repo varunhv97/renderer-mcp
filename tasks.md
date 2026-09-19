@@ -8,6 +8,8 @@
 
 - `renderer-mcp` starts its own daemon when none answers at `RENDERER_DAEMON_ENDPOINT` (or when it's unset), so users no longer have to run `daemon serve` first. Scenes in that daemon end with the MCP session; see `architecture.md`.
 
+- `.github/workflows/release.yml`: pushing a `vX.Y.Z` tag (must match the workspace version) builds `renderer` + `renderer-mcp` for aarch64/x86_64 macOS, x86_64 Linux and x86_64 Windows, and publishes them with `SHA256SUMS.txt` as a GitHub release. Binaries are unsigned/unnotarized (macOS users must clear the quarantine flag); untested on real runners until the first tag is pushed.
+
 ## Open
 - `CLIENT_IO_TIMEOUT` (`crates/daemon/src/lib.rs:43`) is still a hardcoded 5s read/write timeout on `DaemonClient`. Very large/long animated exports can still blow past it and fail with a raw `os error 35` instead of a clear timeout message, though the shared-palette + Triangle-filter fixes (below) raised the ceiling of what fits considerably (a scene that needed retiming to 60f/12fps now fits at its original 120f/24fps, with room to spare). Consider making it configurable or raising it.
 - The `renderer` binary at `target/debug/` can drift out of sync with `crates/schema` (e.g. missing newer fields like `corner_radius`) if a long-running `daemon serve` process isn't restarted after a rebuild. Worth a startup version/capability check, or at least a note in the README.

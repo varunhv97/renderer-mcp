@@ -9,10 +9,29 @@ draw something, look at it, and iterate.
 
 ## Install
 
-You need a recent stable Rust toolchain (Rust 1.85 or newer) and a GPU that
-[wgpu](https://wgpu.rs) can use: Metal on macOS, Vulkan on Linux, or DX12 on
-Windows. There is no software fallback, so a headless machine without a GPU
-cannot render.
+Either way you need a GPU that [wgpu](https://wgpu.rs) can use: Metal on macOS,
+Vulkan on Linux, or DX12 on Windows. There is no software fallback, so a
+headless machine without a GPU cannot render.
+
+### Prebuilt binary
+
+Download the archive for your platform from the
+[Releases page](https://github.com/varunhv97/renderer-mcp/releases): macOS
+(Apple silicon or Intel), Linux x86_64, or Windows x86_64. Extract it and put
+`renderer` and `renderer-mcp` somewhere on your `PATH`.
+
+The binaries are not code-signed. On macOS, clear the download quarantine flag
+once, or Gatekeeper will refuse to run them:
+
+```sh
+xattr -d com.apple.quarantine renderer renderer-mcp
+```
+
+`SHA256SUMS.txt` on each release lets you verify the download.
+
+### Build from source
+
+This needs a recent stable Rust toolchain (Rust 1.85 or newer).
 
 ```sh
 git clone https://github.com/varunhv97/renderer-mcp.git
