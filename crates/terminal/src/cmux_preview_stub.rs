@@ -1,13 +1,5 @@
 use crate::error::TerminalError;
-use base64::Engine;
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder, ImageFormat, RgbaImage};
-use is_terminal::IsTerminal;
-use std::fs;
-use std::io::{Cursor, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
-use std::time::Duration;
+use std::path::Path;
 
 pub(crate) fn try_show(_path: &Path) -> Result<Option<&'static str>, TerminalError> {
     Ok(None)
