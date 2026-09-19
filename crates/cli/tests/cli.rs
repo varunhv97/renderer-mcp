@@ -525,6 +525,9 @@ fn show_rejects_ansi_as_a_protocol_value() {
 /// placed first on `PATH` stands in for the real one so this doesn't pop
 /// an actual GUI window during the test run, and lets the test confirm it
 /// was invoked with the right path.
+// Unix only: the stand-in opener is a `#!/bin/sh` script made executable with
+// unix permissions.
+#[cfg(unix)]
 #[test]
 fn show_opens_the_system_viewer_when_no_known_protocol_is_detected() {
     let directory = tempfile::tempdir().unwrap();
