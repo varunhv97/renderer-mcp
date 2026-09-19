@@ -715,18 +715,42 @@ pub fn serve_with_metrics_dir(
             None
         }
     });
-    // One thread per connection: `RendererDaemon` is cheap to clone (two
-    // `Arc`s), so a slow request (an animated GIF export can take seconds)
-    // only blocks the connection that made it, not every other in-flight
-    // MCP/CLI call against this daemon.
+    accept_loop(&listener, &daemon, metrics.as_ref());
+    Ok(())
+}
+
+/// Starts a daemon on a background thread of the calling process and returns
+/// the address it is listening on, so a host program (the MCP server) can
+/// offer named scenes without the user running `daemon serve` themselves.
+///
+/// `endpoint` may use port 0 to let the OS pick a free port; the address
+/// actually bound is what's returned. The listener is bound and the GPU
+/// renderer created *before* this returns, so a missing GPU adapter or an
+/// address already in use is reported here, synchronously, rather than
+/// surfacing later as a confusing connection failure. Session metrics are
+/// left off: an embedded daemon runs in whatever directory the host was
+/// launched from, and shouldn't scatter `.renderer/metrics` files there.
+pub fn spawn_embedded(endpoint: SocketAddr) -> Result<SocketAddr, DaemonError> {
+    ensure_loopback(endpoint)?;
+    let listener = TcpListener::bind(endpoint).map_err(DaemonError::Bind)?;
+    let bound = listener.local_addr().map_err(DaemonError::Bind)?;
+    let daemon = RendererDaemon::new()?;
+    thread::spawn(move || accept_loop(&listener, &daemon, None));
+    Ok(bound)
+}
+
+/// One thread per connection: `RendererDaemon` is cheap to clone (two
+/// `Arc`s), so a slow request (an animated GIF export can take seconds) only
+/// blocks the connection that made it, not every other in-flight MCP/CLI
+/// call against this daemon.
+fn accept_loop(listener: &TcpListener, daemon: &RendererDaemon, metrics: Option<&MetricsRecorder>) {
     for mut stream in listener.incoming().flatten() {
         let daemon = daemon.clone();
-        let metrics = metrics.clone();
+        let metrics = metrics.cloned();
         thread::spawn(move || {
             let _ = handle_connection(&daemon, &mut stream, metrics.as_ref());
         });
     }
-    Ok(())
 }
 
 fn handle_connection(
@@ -1455,6 +1479,24 @@ mod tests {
         if !ready {
             return;
         }
+        assert!(matches!(
+            client.call(DaemonRequest::Health),
+            Ok(DaemonResult::Health)
+        ));
+    }
+
+    #[test]
+    fn spawn_embedded_serves_on_an_os_chosen_loopback_port() {
+        assert!(matches!(
+            spawn_embedded("192.168.1.1:0".parse().unwrap()),
+            Err(DaemonError::NonLoopbackEndpoint(_))
+        ));
+        // No GPU adapter here means `spawn_embedded` fails before serving.
+        let Ok(endpoint) = spawn_embedded("127.0.0.1:0".parse().unwrap()) else {
+            return;
+        };
+        assert_ne!(endpoint.port(), 0);
+        let client = DaemonClient::new(endpoint).unwrap();
         assert!(matches!(
             client.call(DaemonRequest::Health),
             Ok(DaemonResult::Health)

@@ -293,3 +293,92 @@ fn renders_inline_image_through_the_mcp_executable() {
         response.contains("\"type\":\"image\"") || response.contains("no compatible GPU adapter")
     );
 }
+
+/// Runs one `renderer-mcp` session that creates a named scene and reads it back
+/// through the named-scene tools, with `RENDERER_DAEMON_ENDPOINT` set to
+/// `endpoint` (or removed for `None`). Returns the two tool-call response
+/// lines, or `None` when this machine has no GPU adapter for the built-in
+/// daemon to use.
+fn create_then_get_scene(endpoint: Option<&str>) -> Option<Vec<String>> {
+    let scene = serde_json::json!({
+        "version": "renderer.scene.v1",
+        "canvas": { "width": 8, "height": 8, "background": [0.0, 0.0, 0.0, 1.0] },
+        "nodes": []
+    });
+    let call = |id: u32, name: &str, arguments: serde_json::Value| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        })
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_renderer-mcp"));
+    match endpoint {
+        Some(endpoint) => command.env("RENDERER_DAEMON_ENDPOINT", endpoint),
+        None => command.env_remove("RENDERER_DAEMON_ENDPOINT"),
+    };
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(
+        input,
+        "{}",
+        call(
+            1,
+            "create_scene",
+            serde_json::json!({ "scene_id": "embedded", "scene": scene })
+        )
+    )
+    .unwrap();
+    writeln!(
+        input,
+        "{}",
+        call(
+            2,
+            "get_scene",
+            serde_json::json!({ "scene_id": "embedded" })
+        )
+    )
+    .unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    let lines: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 2, "expected two responses, got {lines:?}");
+    if lines[0].contains("could not start a built-in renderer daemon") {
+        return None;
+    }
+    Some(lines)
+}
+
+#[test]
+fn named_scene_tools_start_a_built_in_daemon_when_no_endpoint_is_set() {
+    let Some(lines) = create_then_get_scene(None) else {
+        return;
+    };
+    assert!(lines[0].contains("revision"), "create_scene: {}", lines[0]);
+    assert!(
+        lines[1].contains("embedded") && lines[1].contains("renderer.scene.v1"),
+        "get_scene should see the scene create_scene stored: {}",
+        lines[1]
+    );
+}
+
+#[test]
+fn named_scene_tools_start_a_built_in_daemon_on_a_configured_endpoint_nothing_serves() {
+    let Ok(picker) = std::net::TcpListener::bind("127.0.0.1:0") else {
+        return;
+    };
+    let endpoint = picker.local_addr().unwrap().to_string();
+    drop(picker);
+    let Some(lines) = create_then_get_scene(Some(&endpoint)) else {
+        return;
+    };
+    assert!(lines[0].contains("revision"), "create_scene: {}", lines[0]);
+    assert!(lines[1].contains("embedded"), "get_scene: {}", lines[1]);
+}

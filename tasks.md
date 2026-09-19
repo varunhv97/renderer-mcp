@@ -6,6 +6,8 @@
 
 - MCP `initialize` now sends `SERVER_INSTRUCTIONS` (`crates/mcp/src/main.rs`) telling agents to ALWAYS call `show_image` on the output path after `render_scene`/`render_named_scene`/`export_named_gif`. Clients only read it at server start, so restart/reconnect `renderer-mcp` after rebuilding.
 
+- `renderer-mcp` starts its own daemon when none answers at `RENDERER_DAEMON_ENDPOINT` (or when it's unset), so users no longer have to run `daemon serve` first. Scenes in that daemon end with the MCP session; see `architecture.md`.
+
 ## Open
 - `CLIENT_IO_TIMEOUT` (`crates/daemon/src/lib.rs:43`) is still a hardcoded 5s read/write timeout on `DaemonClient`. Very large/long animated exports can still blow past it and fail with a raw `os error 35` instead of a clear timeout message, though the shared-palette + Triangle-filter fixes (below) raised the ceiling of what fits considerably (a scene that needed retiming to 60f/12fps now fits at its original 120f/24fps, with room to spare). Consider making it configurable or raising it.
 - The `renderer` binary at `target/debug/` can drift out of sync with `crates/schema` (e.g. missing newer fields like `corner_radius`) if a long-running `daemon serve` process isn't restarted after a rebuild. Worth a startup version/capability check, or at least a note in the README.

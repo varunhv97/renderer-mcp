@@ -13,7 +13,7 @@ agent → `renderer-mcp` (stdio JSON-RPC) → `daemon` (127.0.0.1, in-memory nam
 
 The MCP `initialize` response carries `instructions` telling agents to auto-open every rendered image/GIF via `show_image`.
 
-`render_scene` and `show_image` work without a daemon; every other MCP tool needs one running and reachable via `RENDERER_DAEMON_ENDPOINT`.
+`render_scene` and `show_image` work without a daemon. The named-scene tools use the daemon at `RENDERER_DAEMON_ENDPOINT` if one answers there; otherwise `renderer-mcp` starts one itself on a background thread (`renderer_daemon::spawn_embedded`, resolved in `resolve_daemon_endpoint`), on the configured address or a free loopback port. That embedded daemon lives and dies with the MCP process and writes no metrics files.
 
 ## Known constraint: daemon client I/O timeout
 `DaemonClient` hardcodes a 5s read/write timeout (`CLIENT_IO_TIMEOUT`, `crates/daemon/src/lib.rs:43`). `export_named_gif` (and any daemon round trip) on a scene with enough frames/canvas area can exceed this before the daemon finishes rendering + GIF-encoding + responding, failing with `daemon connection failed: Resource temporarily unavailable (os error 35)` rather than a clean timeout error.

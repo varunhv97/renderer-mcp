@@ -37,8 +37,19 @@ renderer show out.png
 
 ## Use it from an agent
 
-Start the daemon, then register the MCP server. The daemon is only needed for
-the named-scene tools; `render_scene` and `show_image` work without it.
+Register the MCP server. That's all: named scenes work out of the box, because
+`renderer-mcp` starts its own renderer daemon the first time one is needed.
+
+```sh
+claude mcp add renderer -- /absolute/path/to/renderer-mcp
+```
+
+Restart the agent so it picks the server up.
+
+The built-in daemon lives and dies with the agent session, so its scenes are
+gone when the session ends. To keep scenes around, or to share one daemon
+between the CLI and your agent, run it yourself and point the server at it. If
+nothing is listening there yet, `renderer-mcp` starts one on that address:
 
 ```sh
 renderer daemon serve --endpoint 127.0.0.1:9472
@@ -48,13 +59,13 @@ claude mcp add renderer \
   -- /absolute/path/to/renderer-mcp
 ```
 
-Restart the agent so it picks the server up. After rebuilding, restart the
-daemon too: a running `daemon serve` keeps the old code.
+After rebuilding, restart a daemon you started yourself: it keeps running the
+old code.
 
 Typical flow: `create_scene`, optionally `patch_scene`, then `export_named_gif`
 (or `render_named_scene` for a still), then `show_image`.
 
-| Tool | Needs daemon | What it does |
+| Tool | Uses a daemon | What it does |
 | --- | --- | --- |
 | `render_scene` | no | One-shot render of an inline scene to PNG |
 | `create_scene`, `get_scene`, `replace_scene`, `patch_scene`, `destroy_scene` | yes | Manage a named scene that stays alive in the daemon |

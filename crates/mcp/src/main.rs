@@ -3,11 +3,10 @@
 //! Exposes RendererCli to LLM/agent clients over the Model Context
 //! Protocol: `render_scene` renders directly (in-process, via
 //! `renderer_daemon::RendererDaemon`, lazily created on first use), while
-//! the named-scene tools (`create_scene`, `patch_scene`, ...) instead
-//! require `RENDERER_DAEMON_ENDPOINT` and talk to a separately-running
-//! `renderer daemon serve` over TCP via `renderer_daemon::DaemonClient` --
-//! that split is why only the latter path can fail with "endpoint
-//! required" rather than starting its own daemon. Tool JSON Schemas below
+//! the named-scene tools (`create_scene`, `patch_scene`, ...) instead talk to
+//! a daemon over TCP via `renderer_daemon::DaemonClient` -- the one named by
+//! `RENDERER_DAEMON_ENDPOINT` if it's running, else one this process starts
+//! itself (see `resolve_daemon_endpoint`). Tool JSON Schemas below
 //! are kept field-for-field in sync with `renderer_schema`'s types by hand
 //! (see `scene_schema` and friends), since MCP has no way to derive one
 //! from the Rust types directly. `show_image` instead delegates entirely
@@ -15,7 +14,9 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageFormat, ImageReader};
-use renderer_daemon::{DaemonClient, DaemonRequest, DaemonResult, RenderResult, RendererDaemon};
+use renderer_daemon::{
+    DaemonClient, DaemonRequest, DaemonResult, RenderResult, RendererDaemon, spawn_embedded,
+};
 use renderer_schema::{
     MAX_CANVAS_DIMENSION, MAX_EFFECT_SHADER_BYTES, MAX_NODES, MAX_PATCH_OPERATIONS,
     MAX_PATH_POINTS, SCENE_VERSION_V1, ScenePatchV1, SceneV1,
@@ -26,6 +27,7 @@ use std::{
     io::{self, BufRead, Read, Write},
     net::SocketAddr,
     path::PathBuf,
+    sync::Mutex,
 };
 
 const MAX_OUTPUT_PATH_BYTES: usize = 4 * 1024;
@@ -101,7 +103,7 @@ fn scene_id_param_schema() -> serde_json::Value {
 fn named_scene_tool(name: &str) -> serde_json::Value {
     let (description, required, properties) = match name {
         "create_scene" => (
-            "Create a named scene in RENDERER_DAEMON_ENDPOINT so it can be referenced by scene_id in later calls (render_named_scene, patch_scene, replace_scene, export_named_gif, get_scene, destroy_scene) instead of resending the full scene document each time. scene_id is a caller-chosen label unrelated to anything inside the scene document; the daemon does not inspect it beyond using it as a lookup key.",
+            "Create a named scene in the renderer daemon (RENDERER_DAEMON_ENDPOINT if set and running, otherwise a built-in daemon started on demand) so it can be referenced by scene_id in later calls (render_named_scene, patch_scene, replace_scene, export_named_gif, get_scene, destroy_scene) instead of resending the full scene document each time. scene_id is a caller-chosen label unrelated to anything inside the scene document; the daemon does not inspect it beyond using it as a lookup key.",
             serde_json::json!(["scene_id", "scene"]),
             serde_json::json!({
                 "scene_id": scene_id_param_schema(),
@@ -784,6 +786,44 @@ fn call_tool(
     inline_render_response(output, rendered.into())
 }
 
+/// The address of the daemon backing the named-scene tools, started on demand.
+///
+/// `RENDERER_DAEMON_ENDPOINT`, when set, names a daemon shared with the CLI and
+/// other clients; it's used as-is if it answers. Otherwise -- variable unset,
+/// or set but nothing is listening yet -- this process starts its own daemon
+/// on a background thread: on the configured address if there is one (so a
+/// fixed port keeps working), else on a free loopback port. That daemon lives
+/// only as long as this process, so its scenes go away with the MCP session.
+fn resolve_daemon_endpoint() -> Result<SocketAddr, String> {
+    static EMBEDDED: Mutex<Option<SocketAddr>> = Mutex::new(None);
+
+    let configured = match std::env::var("RENDERER_DAEMON_ENDPOINT") {
+        Ok(value) => Some(
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| "RENDERER_DAEMON_ENDPOINT must be a socket address")?,
+        ),
+        Err(_) => None,
+    };
+    if let Some(endpoint) = configured
+        && DaemonClient::new(endpoint)
+            .and_then(|client| client.call(DaemonRequest::Health))
+            .is_ok()
+    {
+        return Ok(endpoint);
+    }
+    let mut embedded = EMBEDDED.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(endpoint) = *embedded {
+        return Ok(endpoint);
+    }
+    let bind = configured.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = spawn_embedded(bind).map_err(|error| {
+        format!("could not start a built-in renderer daemon on {bind}: {error}")
+    })?;
+    *embedded = Some(endpoint);
+    Ok(endpoint)
+}
+
 fn call_named_scene_tool(
     name: &str,
     arguments: &serde_json::Value,
@@ -791,10 +831,7 @@ fn call_named_scene_tool(
     if name == "inspect_image" {
         return inspect_image(arguments);
     }
-    let endpoint: SocketAddr = std::env::var("RENDERER_DAEMON_ENDPOINT")
-        .map_err(|_| "RENDERER_DAEMON_ENDPOINT is required for named-scene tools")?
-        .parse()
-        .map_err(|_| "RENDERER_DAEMON_ENDPOINT must be a socket address")?;
+    let endpoint = resolve_daemon_endpoint()?;
     let client = DaemonClient::new(endpoint).map_err(|error| error.to_string())?;
     let scene_id = || {
         arguments
