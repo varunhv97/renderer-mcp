@@ -104,12 +104,15 @@ real graphics protocol, and open the OS viewer otherwise.
 | Kitty, WezTerm | Kitty graphics protocol | Animate natively |
 | Ghostty | Kitty graphics protocol | Simulated by re-sending frames |
 | iTerm2 | Inline images (OSC 1337) | iTerm2 loops the GIF itself |
-| Apple Terminal.app, anything else | OS default viewer (`open` on macOS, `xdg-open` on Linux) | Handled by the viewer |
+| Apple Terminal.app, anything else | **Not shown inline.** Opens the image in a separate window with the OS default viewer (`open` on macOS, `xdg-open` on Linux) | Handled by the viewer |
 | Windows | No viewer is launched; the path is printed | none |
 
 Limitations:
 
-- There is no text or ANSI fallback.
+- Only Kitty-protocol terminals, iTerm2, and cmux show images inline. Terminals
+  without one of those (including Terminal.app) get a separate viewer window.
+  There is no text or ANSI fallback: it was removed because the result was low
+  quality, and writing escape sequences into a terminal we don't own is unsafe.
 - Use through tmux, screen, or SSH has not been tested.
 - The daemon client has a fixed 5 second timeout, so a very large or long
   animated export can fail with a connection error.
