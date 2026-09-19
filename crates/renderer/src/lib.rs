@@ -10,13 +10,12 @@ use image::{
 use renderer_schema::{
     Color, EffectV1, FillV1, GradientV1, MAX_CANVAS_DIMENSION, NodeKindV1, SceneV1,
 };
-use resvg::{tiny_skia, usvg};
 use std::{
     collections::HashMap,
     fs,
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::mpsc,
 };
 use wgpu::util::DeviceExt;
 
@@ -25,6 +24,7 @@ mod error;
 mod gif;
 mod limits;
 mod shaders;
+mod svg;
 mod util;
 mod vertex;
 
@@ -34,9 +34,10 @@ use gif::*;
 use limits::{
     MAX_ASSET_BYTES, MAX_ASSET_PIXELS, MAX_COMPOSITION_TEXTURE_PIXELS, MAX_GLYPH_SIZE,
     MAX_GPU_TEXTURE_DIMENSION, MAX_IMAGE_RASTER_PIXELS, MAX_TEXT_BYTES, MAX_TEXT_GLYPHS,
-    MAX_TEXT_RASTER_PIXELS, SVG_RASTER_TIME_BUDGET,
+    MAX_TEXT_RASTER_PIXELS,
 };
 use shaders::*;
+use svg::*;
 use util::*;
 use vertex::*;
 
@@ -2933,148 +2934,6 @@ fn load_image(
     limits.max_alloc = Some(MAX_ASSET_PIXELS * 4);
     reader.limits(limits);
     Ok(reader.decode()?.to_rgba8())
-}
-
-/// Extension-based SVG detection, mirroring [`ensure_png_output_path`]'s
-/// case-insensitive extension check.
-fn has_svg_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
-}
-
-/// Cheap content sniff so a `.svg`-named file that is not actually SVG (or is
-/// empty/binary garbage) fails with a clear diagnostic instead of being
-/// handed to the XML parser. Mirrors the spirit of `image`'s own
-/// magic-byte format guessing for raster assets.
-fn looks_like_svg(bytes: &[u8]) -> bool {
-    let prefix_len = bytes.len().min(4096);
-    let Ok(prefix) = std::str::from_utf8(&bytes[..prefix_len]) else {
-        return false;
-    };
-    let trimmed = prefix.trim_start_matches('\u{feff}').trim_start();
-    trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") || trimmed.contains("<svg")
-}
-
-/// Rasterizes an SVG document to an `image::RgbaImage` of exactly
-/// `width`x`height` pixels.
-///
-/// Security posture (see `AGENTS.md`: "Resolve assets locally only; do not
-/// introduce implicit remote asset fetching"):
-///
-/// - `usvg` never performs network I/O of any kind (confirmed by reading the
-///   `usvg` 0.48 source: `ImageHrefResolver`'s doc comment states it plainly,
-///   and there is no HTTP client anywhere in its dependency tree).
-/// - The only way an SVG can reach outside this call is via `<image
-///   xlink:href="...">` (or a `<style>`/font-family reference, neither of
-///   which `usvg` resolves from the filesystem at all). `usvg`'s *default*
-///   string-href resolver treats the href as a filesystem path relative to
-///   `Options::resources_dir` -- but critically, `PathBuf::join` treats an
-///   *absolute* href as replacing the base entirely, so a default-configured
-///   `resources_dir` does NOT stop `<image href="/etc/passwd">` (or a `..`
-///   traversal) from escaping the asset root.
-///
-///   To close that off completely rather than merely "scope it", the
-///   `resolve_string` resolver below is replaced with one that returns
-///   `None` unconditionally: embedded `<image href="...">` references to
-///   *any* local file path are refused, full stop. Only self-contained
-///   `data:` URIs (handled by `resolve_data`, which never touches the
-///   filesystem) are honored for embedded images. This is strictly more
-///   restrictive than scoping to the asset root, so there is no residual
-///   path-escape risk from embedded image hrefs.
-/// - `fontdb` is left empty (the `system-fonts` cargo feature is disabled and
-///   `load_system_fonts()` is never called), so text glyph lookups cannot
-///   read arbitrary font files from the host either; SVGs with `<text>` will
-///   render without glyphs rather than pulling in system state.
-/// - Residual risk: `usvg` cannot be configured to refuse XML parsing
-///   entirely (that is the whole point of this function), and a
-///   sufficiently adversarial-but-under-the-node-limit document (e.g. many
-///   chained blur filters) could still be CPU-expensive to rasterize. That
-///   residual is bounded by `SVG_RASTER_TIME_BUDGET` below, on top of
-///   `usvg`'s own 1,000,000-node parse limit and the existing
-///   `MAX_ASSET_BYTES`/`MAX_IMAGE_RASTER_PIXELS`-derived output-size caps
-///   this function's caller already enforces.
-fn rasterize_svg(
-    data: &[u8],
-    asset_root: &Path,
-    source: &str,
-    width: u32,
-    height: u32,
-) -> Result<image::RgbaImage, RenderError> {
-    let data = Arc::new(data.to_vec());
-    let asset_root = asset_root.to_path_buf();
-    let source_label = source.to_string();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = rasterize_svg_blocking(&data, &asset_root, &source_label, width, height);
-        // The receiver may already be gone if we hit the timeout below; that
-        // is fine, the render result is simply dropped.
-        let _ = sender.send(result);
-    });
-    match receiver.recv_timeout(SVG_RASTER_TIME_BUDGET) {
-        Ok(result) => result,
-        Err(_) => Err(RenderError::Asset(format!(
-            "svg '{source}' exceeded the {}s rasterization time budget",
-            SVG_RASTER_TIME_BUDGET.as_secs()
-        ))),
-    }
-}
-
-fn rasterize_svg_blocking(
-    data: &[u8],
-    asset_root: &Path,
-    source: &str,
-    width: u32,
-    height: u32,
-) -> Result<image::RgbaImage, RenderError> {
-    let image_href_resolver = usvg::ImageHrefResolver {
-        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
-        resolve_string: Box::new(|_href: &str, _options: &usvg::Options| {
-            // Deliberately refuse every filesystem-path-shaped `href`: see
-            // the security-posture comment on `rasterize_svg` above.
-            None
-        }),
-    };
-    // `..Default::default()` leaves `fontdb` at `usvg::Options::default()`'s
-    // empty `fontdb::Database`: with the `system-fonts` cargo feature
-    // disabled and `load_system_fonts()` never called, no host font files
-    // are ever read (see the security-posture comment above).
-    let options = usvg::Options {
-        resources_dir: Some(asset_root.to_path_buf()),
-        image_href_resolver,
-        ..Default::default()
-    };
-    let tree = usvg::Tree::from_data(data, &options)
-        .map_err(|error| RenderError::Asset(format!("could not parse svg '{source}': {error}")))?;
-
-    let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or_else(|| {
-        RenderError::Asset(format!(
-            "svg '{source}' has an invalid raster target size {width}x{height}"
-        ))
-    })?;
-    let tree_size = tree.size();
-    let scale_x = if tree_size.width() > 0.0 {
-        width as f32 / tree_size.width()
-    } else {
-        1.0
-    };
-    let scale_y = if tree_size.height() > 0.0 {
-        height as f32 / tree_size.height()
-    } else {
-        1.0
-    };
-    let transform = tiny_skia::Transform::from_scale(scale_x, scale_y);
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-    // `Pixmap` stores premultiplied alpha internally; the rest of this
-    // renderer's textured-quad pipeline (and the `image` crate decode path
-    // above) works in straight alpha, so demultiply on the way out.
-    let rgba = pixmap.take_demultiplied();
-    image::RgbaImage::from_raw(width, height, rgba).ok_or_else(|| {
-        RenderError::Asset(format!(
-            "failed to assemble rasterized buffer for svg '{source}'"
-        ))
-    })
 }
 
 /// Emits a (optionally rounded, optionally gradient-filled) rect for the
