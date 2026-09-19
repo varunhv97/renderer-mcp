@@ -2,6 +2,9 @@ mod analytic;
 mod frame;
 mod render;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) use frame::*;
 
 use crate::{error::RenderError, pipelines::*};
