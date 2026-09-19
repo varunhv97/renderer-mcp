@@ -20,6 +20,15 @@
 - `animation.rs`, `gif.rs`, `util.rs`, `error.rs` -- keyframe interpolation, shared-palette GIF encoding, small helpers, error types.
 - Tests sit beside the code they cover (`mod tests`), with GPU/golden tests in `gpu/tests/` and shared helpers in `test_support.rs`.
 
+## Other crates' module layout
+
+Each crate's `lib.rs` (or `main.rs` for `mcp`) only declares modules and re-exports the public API; tests sit beside the code they cover.
+
+- `schema` -- `scene`, `node`, `fill`, `timeline`, `patch`, `limits`, `error`, `validate` (one versioned type family per module).
+- `daemon` -- `protocol` (wire types), `error`, `endpoint` (loopback check), `store` (revisioned scenes), `daemon` (`RendererDaemon`), `server` (TCP loop, `serve`, `spawn_embedded`), `client` (`DaemonClient`), `metrics`.
+- `terminal` -- `show` (`run`, `ShowRequest`/`ShowOutcome`), `protocol` (detection), `target` (tty/ancestor discovery, system viewer), `kitty`, `iterm2`, `frames`, `cmux_preview` (unix; `cmux_preview_stub.rs` elsewhere), `error`.
+- `mcp` -- `main.rs` (stdio loop, `respond`), `tools` (tool definitions), `schema` (JSON Schemas), `handlers` (tool calls, daemon endpoint), `output`, `inspect`.
+
 ## MCP call flow
 agent → `renderer-mcp` (stdio JSON-RPC) → `daemon` (127.0.0.1, in-memory named scenes, revisioned patches) → `renderer` (wgpu GPU pass) → `.renderer/output` (PNG/GIF + `metrics.jsonl`) → `renderer-terminal` → terminal/cmux preview.
 
@@ -28,7 +37,7 @@ The MCP `initialize` response carries `instructions` telling agents to auto-open
 `render_scene` and `show_image` work without a daemon. The named-scene tools use the daemon at `RENDERER_DAEMON_ENDPOINT` if one answers there; otherwise `renderer-mcp` starts one itself on a background thread (`renderer_daemon::spawn_embedded`, resolved in `resolve_daemon_endpoint`), on the configured address or a free loopback port. That embedded daemon lives and dies with the MCP process and writes no metrics files.
 
 ## Known constraint: daemon client I/O timeout
-`DaemonClient` hardcodes a 5s read/write timeout (`CLIENT_IO_TIMEOUT`, `crates/daemon/src/lib.rs:43`). `export_named_gif` (and any daemon round trip) on a scene with enough frames/canvas area can exceed this before the daemon finishes rendering + GIF-encoding + responding, failing with `daemon connection failed: Resource temporarily unavailable (os error 35)` rather than a clean timeout error.
+`DaemonClient` hardcodes a 5s read/write timeout (`CLIENT_IO_TIMEOUT`, `crates/daemon/src/client.rs`). `export_named_gif` (and any daemon round trip) on a scene with enough frames/canvas area can exceed this before the daemon finishes rendering + GIF-encoding + responding, failing with `daemon connection failed: Resource temporarily unavailable (os error 35)` rather than a clean timeout error.
 
 Measured on this machine: a 1000x420 canvas, 120-frame (24fps, 5s) timeline took ~5.5s end-to-end via the CLI's one-shot renderer — already over the daemon-path budget. Dropping to 60 frames (12fps) brought a full `export_named_gif` round trip in comfortably under 5s.
 

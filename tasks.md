@@ -10,8 +10,10 @@
 
 - `.github/workflows/release.yml`: pushing a `vX.Y.Z` tag (must match the workspace version) builds `renderer` + `renderer-mcp` for aarch64/x86_64 macOS, x86_64 Linux and x86_64 Windows, and publishes them with `SHA256SUMS.txt` as a GitHub release. Binaries are unsigned/unnotarized (macOS users must clear the quarantine flag); untested on real runners until the first tag is pushed.
 
+- All crates (schema, renderer, daemon, terminal, mcp) are split into focused modules as pure reorganizations; outputs, fingerprints, and public API verified unchanged. See `architecture.md`.
+
 ## Open
-- `CLIENT_IO_TIMEOUT` (`crates/daemon/src/lib.rs:43`) is still a hardcoded 5s read/write timeout on `DaemonClient`. Very large/long animated exports can still blow past it and fail with a raw `os error 35` instead of a clear timeout message, though the shared-palette + Triangle-filter fixes (below) raised the ceiling of what fits considerably (a scene that needed retiming to 60f/12fps now fits at its original 120f/24fps, with room to spare). Consider making it configurable or raising it.
+- `CLIENT_IO_TIMEOUT` (`crates/daemon/src/client.rs`) is still a hardcoded 5s read/write timeout on `DaemonClient`. Very large/long animated exports can still blow past it and fail with a raw `os error 35` instead of a clear timeout message, though the shared-palette + Triangle-filter fixes (below) raised the ceiling of what fits considerably (a scene that needed retiming to 60f/12fps now fits at its original 120f/24fps, with room to spare). Consider making it configurable or raising it.
 - The `renderer` binary at `target/debug/` can drift out of sync with `crates/schema` (e.g. missing newer fields like `corner_radius`) if a long-running `daemon serve` process isn't restarted after a rebuild. Worth a startup version/capability check, or at least a note in the README.
 - Pipelined frame submission (`record_frame`/`finish_frame`, double-buffered `FrameTargets::output_buffers`) is implemented and correct but measured zero speed benefit -- kept as a hedge in case per-frame CPU cost drops further and GPU-wait time starts to matter. If a future profiling pass confirms it's still dead weight, it's a reasonable candidate to simplify back out.
 
