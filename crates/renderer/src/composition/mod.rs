@@ -2,6 +2,9 @@ mod analytic;
 
 pub(crate) use analytic::*;
 
+#[cfg(test)]
+mod tests;
+
 use crate::{assets::*, error::RenderError, limits::*, tessellation::*, vertex::*};
 use fontdue::Font;
 use renderer_schema::{Color, NodeKindV1, SceneV1};
