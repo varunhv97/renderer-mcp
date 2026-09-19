@@ -1,6 +1,7 @@
+use super::{MSAA_SAMPLE_COUNT, SUPERSAMPLE_FACTOR};
 use crate::{
-    GpuRenderer, MSAA_SAMPLE_COUNT, SUPERSAMPLE_FACTOR, assets::AssetCache, composition::*,
-    error::RenderError, pipelines::effect_color_target, shaders::*, util::*,
+    GpuRenderer, assets::AssetCache, composition::*, error::RenderError,
+    pipelines::effect_color_target, shaders::*, util::*,
 };
 use image::RgbaImage;
 use renderer_schema::{EffectV1, SceneV1};

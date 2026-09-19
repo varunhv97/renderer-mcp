@@ -1,4 +1,4 @@
-use crate::{MSAA_SAMPLE_COUNT, shaders::*, vertex::*};
+use crate::{gpu::MSAA_SAMPLE_COUNT, shaders::*, vertex::*};
 
 pub(crate) fn create_pipelines(
     device: &wgpu::Device,

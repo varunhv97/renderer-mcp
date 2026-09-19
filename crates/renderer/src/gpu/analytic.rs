@@ -1,5 +1,6 @@
+use super::MSAA_SAMPLE_COUNT;
 use crate::{
-    GpuRenderer, MSAA_SAMPLE_COUNT,
+    GpuRenderer,
     animation::scene_at,
     assets::AssetCache,
     composition::*,
