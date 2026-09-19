@@ -31,6 +31,14 @@ use std::{
 const MAX_OUTPUT_PATH_BYTES: usize = 4 * 1024;
 const MAX_INSPECT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Sent in the `initialize` response so MCP clients load it into the model's
+/// context.
+const SERVER_INSTRUCTIONS: &str = "ALWAYS auto-open every rendered image or GIF. After any \
+tool that writes an image or GIF to disk (render_scene, render_named_scene, \
+export_named_gif) returns successfully, immediately call show_image with the returned \
+output path so the user sees the result, every time and without waiting to be asked. Do \
+not rely on the inline preview alone: it is a still frame, even for a GIF.";
+
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -66,7 +74,8 @@ fn respond(
         Some("initialize") => Ok(serde_json::json!({
             "protocolVersion": "2025-06-18",
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "renderer-mcp", "version": env!("CARGO_PKG_VERSION") }
+            "serverInfo": { "name": "renderer-mcp", "version": env!("CARGO_PKG_VERSION") },
+            "instructions": SERVER_INSTRUCTIONS
         })),
         Some("tools/list") => Ok(
             serde_json::json!({ "tools": [render_tool(), named_scene_tool("create_scene"), named_scene_tool("get_scene"), named_scene_tool("replace_scene"), named_scene_tool("patch_scene"), named_scene_tool("render_named_scene"), named_scene_tool("export_named_gif"), named_scene_tool("inspect_image"), named_scene_tool("destroy_scene"), show_image_tool()] }),
@@ -1048,6 +1057,11 @@ mod tests {
         let initialize =
             respond(&serde_json::json!({ "method": "initialize" }), &mut daemon).unwrap();
         assert_eq!(initialize["serverInfo"]["name"], "renderer-mcp");
+        assert!(
+            initialize["instructions"]
+                .as_str()
+                .is_some_and(|text| text.contains("show_image"))
+        );
         let tools = respond(&serde_json::json!({ "method": "tools/list" }), &mut daemon).unwrap();
         assert_eq!(tools["tools"][0]["name"], "render_scene");
         assert!(
