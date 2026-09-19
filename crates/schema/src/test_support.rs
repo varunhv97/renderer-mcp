@@ -1,4 +1,7 @@
-use crate::*;
+use crate::fill::FillV1;
+use crate::limits::SCENE_VERSION_V1;
+use crate::node::{NodeKindV1, NodeV1};
+use crate::scene::{CanvasV1, SceneV1, transparent};
 
 pub(crate) fn scene() -> SceneV1 {
     SceneV1 {

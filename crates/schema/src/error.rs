@@ -1,4 +1,9 @@
-use crate::limits::*;
+use crate::limits::MAX_PATCH_OPERATIONS;
+
+// Only referenced from intra-doc links on `SceneValidationError`.
+#[cfg(doc)]
+use crate::{ScenePatchV1, SceneV1};
+
 use thiserror::Error;
 
 /// Every way a [`SceneV1`] or [`ScenePatchV1`] can fail [`SceneV1::validate`]

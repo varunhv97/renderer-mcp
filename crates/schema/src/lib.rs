@@ -8,28 +8,21 @@
 //! single gate untrusted scene input (from a file, a daemon request, or an
 //! MCP tool call) must pass through before it reaches the renderer.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-
-mod limits;
-pub use limits::*;
 mod error;
-pub use error::*;
-
 mod fill;
-pub use fill::*;
-
-mod validate;
-use validate::*;
-
-mod timeline;
-pub use timeline::*;
+mod limits;
+mod node;
 mod patch;
-pub use patch::*;
+mod scene;
 #[cfg(test)]
 mod test_support;
+mod timeline;
+mod validate;
 
-mod node;
+pub use error::*;
+pub use fill::*;
+pub use limits::*;
 pub use node::*;
-mod scene;
+pub use patch::*;
 pub use scene::*;
+pub use timeline::*;

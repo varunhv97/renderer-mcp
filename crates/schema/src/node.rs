@@ -1,4 +1,8 @@
-use crate::*;
+use crate::error::SceneValidationError;
+use crate::fill::FillV1;
+use crate::limits::MAX_PATH_POINTS;
+use crate::validate::validate_positive;
+use serde::{Deserialize, Serialize};
 
 /// One visual element placed in a scene, identified by a scene-unique `id`
 /// and dispatching on `kind` (flattened from [`NodeKindV1`]) to one of six
@@ -161,6 +165,9 @@ pub struct PointV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SceneValidationError;
+    use crate::fill::FillV1;
+    use crate::scene::SceneV1;
     use crate::test_support::*;
 
     #[test]

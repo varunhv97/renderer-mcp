@@ -1,4 +1,9 @@
-use crate::*;
+use crate::error::SceneValidationError;
+use crate::fill::Color;
+use crate::limits::{MAX_ANIMATION_FRAMES, MAX_ANIMATION_PIXELS};
+use crate::validate::{validate_color, validate_finite_pair, validate_unit_interval};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Optional per-scene animation: a fixed frame rate and duration plus a list
 /// of keyframes. `fps`/`duration_ms` are validated together against
@@ -84,6 +89,8 @@ pub enum AnimatedPropertyV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SceneValidationError;
+    use crate::limits::MAX_CANVAS_DIMENSION;
     use crate::test_support::*;
 
     #[test]

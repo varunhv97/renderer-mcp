@@ -1,4 +1,11 @@
-use crate::*;
+use crate::error::SceneValidationError;
+use crate::fill::Color;
+use crate::limits::{MAX_CANVAS_DIMENSION, MAX_EFFECT_SHADER_BYTES, MAX_NODES, SCENE_VERSION_V1};
+use crate::node::NodeV1;
+use crate::timeline::TimelineV1;
+use crate::validate::validate_color;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// A complete, renderable scene: a canvas, a flat list of nodes (no
 /// grouping/hierarchy), and an optional animation timeline and post-process
@@ -118,7 +125,18 @@ pub(crate) fn transparent() -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SceneValidationError;
+    use crate::fill::FillV1;
+    use crate::limits::MAX_CANVAS_DIMENSION;
+    use crate::limits::MAX_EFFECT_SHADER_BYTES;
+    use crate::limits::MAX_NODES;
+    use crate::limits::MAX_PATH_POINTS;
+    use crate::node::NodeKindV1;
+    use crate::node::PointV1;
     use crate::test_support::*;
+    use crate::timeline::AnimatedPropertyV1;
+    use crate::timeline::KeyframeV1;
+    use crate::timeline::TimelineV1;
 
     #[test]
     fn validates_a_minimal_scene() {

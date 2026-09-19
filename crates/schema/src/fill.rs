@@ -1,4 +1,6 @@
-use crate::*;
+use crate::error::SceneValidationError;
+use crate::validate::validate_color;
+use serde::{Deserialize, Serialize};
 
 /// RGBA, each channel a finite float from 0.0 through 1.0 (see
 /// `validate_color`); values outside that range fail scene validation.
@@ -105,7 +107,7 @@ impl FillV1 {
     }
 }
 
-pub(crate) fn midpoint(a: Color, b: Color) -> Color {
+fn midpoint(a: Color, b: Color) -> Color {
     [
         (a[0] + b[0]) / 2.0,
         (a[1] + b[1]) / 2.0,
@@ -138,6 +140,9 @@ pub enum GradientV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SceneValidationError;
+    use crate::node::NodeKindV1;
+    use crate::scene::SceneV1;
     use crate::test_support::*;
 
     #[test]

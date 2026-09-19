@@ -1,4 +1,5 @@
-use crate::*;
+use crate::error::SceneValidationError;
+use crate::fill::Color;
 
 pub(crate) fn validate_positive(
     value: f32,

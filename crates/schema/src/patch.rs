@@ -1,4 +1,9 @@
-use crate::*;
+use crate::error::SceneValidationError;
+use crate::limits::MAX_PATCH_OPERATIONS;
+use crate::node::NodeV1;
+use crate::scene::CanvasV1;
+use crate::timeline::TimelineV1;
+use serde::{Deserialize, Serialize};
 
 /// A bounded, typed scene mutation. Applying all operations is atomic.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -35,6 +40,7 @@ pub enum PatchOperationV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SceneValidationError;
 
     #[test]
     fn validates_bounded_nonempty_patches() {
