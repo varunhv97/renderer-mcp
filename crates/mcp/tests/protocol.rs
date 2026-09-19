@@ -96,7 +96,7 @@ fn show_image_tool_schema_describes_its_parameters() {
         .iter()
         .map(|value| value.as_str().unwrap())
         .collect();
-    assert_eq!(protocol_values, ["auto", "kitty", "iterm2", "ansi"]);
+    assert_eq!(protocol_values, ["auto", "kitty", "iterm2"]);
 }
 
 /// `path` is required unless `clear` is true -- checked by the shared

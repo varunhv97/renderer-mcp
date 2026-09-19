@@ -4,12 +4,22 @@
 //! This crate is the single implementation behind both surfaces, per this
 //! project's founding "CLI and MCP expose the same capabilities" principle:
 //! terminal detection, a Kitty graphics protocol encoder with animation
-//! support, an iTerm2 OSC 1337 encoder, an ANSI 24-bit half-block fallback
-//! encoder with its own animation redraw loop, a process-ancestry
-//! tty-discovery mechanism for when the calling process has no controlling
-//! terminal of its own, and a `cmux_preview` submodule that talks to cmux's
-//! native file-preview feature over a JSON-RPC Unix socket when
-//! `$CMUX_SOCKET_PATH` is available.
+//! support, an iTerm2 OSC 1337 encoder, a process-ancestry tty-discovery
+//! mechanism for when the calling process has no controlling terminal of
+//! its own, a `cmux_preview` submodule that talks to cmux's native
+//! file-preview feature over a JSON-RPC Unix socket when
+//! `$CMUX_SOCKET_PATH` is available, and an `open_with_system_viewer`
+//! fallback (the OS's own default file opener, e.g. Preview.app via `open`
+//! on macOS) for every other case -- no Kitty/iTerm2 protocol support
+//! detected, or nowhere safely writable to send escape sequences to. There
+//! is deliberately no text-based (ANSI half-block) fallback: it only ever
+//! mattered for terminals supporting neither real graphics protocol (in
+//! practice, just Apple's Terminal.app), and building on real feedback
+//! this session -- three real bugs found live, then a fundamental quality
+//! ceiling (confirmed live: even Floyd-Steinberg dithering read as visible
+//! noise, not smoother color, at real terminal-cell resolution) -- a
+//! full-quality external viewer is a strictly better fallback than a
+//! blocky, palette-limited text approximation.
 //!
 //! The public entry point is [`run`]: build a [`ShowRequest`], call `run`,
 //! and render the returned [`ShowOutcome`] (or [`TerminalError`]) however
@@ -19,8 +29,7 @@
 
 use base64::Engine;
 use image::codecs::gif::GifDecoder;
-use image::imageops::FilterType;
-use image::{AnimationDecoder, ImageFormat, Rgba, RgbaImage};
+use image::{AnimationDecoder, ImageFormat, RgbaImage};
 use is_terminal::IsTerminal;
 use std::{
     fs,
@@ -36,17 +45,6 @@ use std::{
 const MAX_ANCESTOR_DEPTH: u32 = 32;
 /// Kitty graphics protocol payload chunk size, in base64-encoded bytes.
 const KITTY_CHUNK_LIMIT: usize = 4096;
-/// Fixed background the ANSI half-block fallback composites partially
-/// transparent pixels against, since terminal cells have no alpha channel of
-/// their own. Chosen to match typical dark terminal backgrounds -- there is
-/// no universally "correct" choice here, so a transparent pixel simply
-/// renders as this color rather than as the viewer's real terminal
-/// background.
-const ANSI_BACKGROUND: (u8, u8, u8) = (0, 0, 0);
-/// Fallback terminal size used when writing to a discovered ancestor tty
-/// device, where querying the real size isn't practical.
-const DEFAULT_TERMINAL_COLUMNS: u16 = 80;
-const DEFAULT_TERMINAL_ROWS: u16 = 24;
 /// Message reported (as [`ShowOutcome::message`], status `"no_terminal"`)
 /// when `run` is asked to clear and no terminal target can be found -- see
 /// [`no_terminal_message`] for the equivalent used when displaying an image.
@@ -88,7 +86,8 @@ pub struct ShowRequest {
     /// targeting a specific terminal session other than the caller's own.
     pub tty: Option<PathBuf>,
     /// Which terminal graphics protocol to use: `"auto"` (the default when
-    /// `None`), `"kitty"`, `"iterm2"`, or `"ansi"`.
+    /// `None`), `"kitty"`, or `"iterm2"`. Irrelevant whenever cmux or the
+    /// system-viewer fallback ends up being used instead -- see [`run`].
     pub protocol: Option<String>,
     /// Send only a delete/clear command (a Kitty delete-all-images command,
     /// or cmux's surface-close call) and stop, instead of displaying an
@@ -112,10 +111,9 @@ pub struct ShowRequest {
 pub struct ShowOutcome {
     pub status: &'static str,
     /// The protocol actually used: `"kitty"`, `"kitty-animation"`,
-    /// `"kitty-simulated"`, `"iterm2"`, `"ansi"`, `"ansi-simulated"`, or
-    /// `"cmux"`. `None` for the `"no_terminal"` status, and for a
-    /// terminal-protocol `"cleared"` (only a cmux clear reports a
-    /// protocol).
+    /// `"kitty-simulated"`, `"iterm2"`, `"cmux"`, or `"system_viewer"`.
+    /// `None` for the `"no_terminal"` status, and for a terminal-protocol
+    /// `"cleared"` (only a cmux clear reports a protocol).
     pub protocol: Option<String>,
     /// The image path this outcome concerns, when relevant (`"displayed"`
     /// and the `"no_terminal"` case reached while displaying an image).
@@ -155,7 +153,7 @@ pub enum TerminalError {
         path.display()
     )]
     UnsupportedImage { path: PathBuf },
-    #[error("unknown --protocol '{value}' (expected auto, kitty, iterm2, or ansi)")]
+    #[error("unknown --protocol '{value}' (expected auto, kitty, or iterm2)")]
     InvalidProtocol { value: String },
     #[error("could not open terminal device {}: {source}", path.display())]
     TtyOpen {
@@ -217,6 +215,18 @@ pub fn run(request: ShowRequest) -> Result<ShowOutcome, TerminalError> {
         });
     }
 
+    // Determine graphics-protocol capability purely from environment
+    // signals, independent of whether there's actually somewhere safe to
+    // write escape sequences to (that's resolved next). `None` means
+    // neither Kitty's nor iTerm2's protocol was detected -- Apple's
+    // Terminal.app included, since it implements neither -- in which case
+    // there's no text-based fallback to reach for any more; go straight to
+    // the system viewer.
+    let Some(protocol_choice) = resolve_protocol(request.protocol.as_deref().unwrap_or("auto"))?
+    else {
+        return Ok(system_viewer_or_no_terminal_outcome(path));
+    };
+
     let target = match resolve_terminal_target(request.tty.as_deref()) {
         TerminalResolution::NoTerminal => {
             return Ok(ShowOutcome {
@@ -227,20 +237,7 @@ pub fn run(request: ShowRequest) -> Result<ShowOutcome, TerminalError> {
             });
         }
         TerminalResolution::DiscoveredDevice => {
-            if open_with_system_viewer(&path) {
-                return Ok(ShowOutcome {
-                    status: "displayed",
-                    protocol: Some("system_viewer".to_string()),
-                    path: Some(path),
-                    message: Some(SYSTEM_VIEWER_MESSAGE.to_string()),
-                });
-            }
-            return Ok(ShowOutcome {
-                status: "no_terminal",
-                protocol: None,
-                message: Some(no_terminal_message(&path)),
-                path: Some(path),
-            });
+            return Ok(system_viewer_or_no_terminal_outcome(path));
         }
         TerminalResolution::Target(target) => target,
     };
@@ -250,19 +247,13 @@ pub fn run(request: ShowRequest) -> Result<ShowOutcome, TerminalError> {
         source,
     })?;
     let format = image::guess_format(&bytes).ok();
-    let protocol_choice = resolve_protocol(request.protocol.as_deref().unwrap_or("auto"))?;
     let mut sink = open_sink(&target)?;
 
     let protocol_name = match format {
-        Some(ImageFormat::Png) => show_png(&mut *sink, &path, &bytes, protocol_choice, &target)?,
-        Some(ImageFormat::Gif) => show_gif(
-            &mut *sink,
-            &path,
-            &bytes,
-            protocol_choice,
-            &target,
-            request.loops,
-        )?,
+        Some(ImageFormat::Png) => show_png(&mut *sink, &bytes, protocol_choice)?,
+        Some(ImageFormat::Gif) => {
+            show_gif(&mut *sink, &path, &bytes, protocol_choice, request.loops)?
+        }
         _ => return Err(TerminalError::UnsupportedImage { path }),
     };
 
@@ -272,6 +263,29 @@ pub fn run(request: ShowRequest) -> Result<ShowOutcome, TerminalError> {
         path: Some(path),
         message: None,
     })
+}
+
+/// Shared by both places `run` gives up on writing escape sequences
+/// anywhere (no known graphics-protocol terminal detected, or no tty this
+/// process can safely write into): try the OS's own default file opener
+/// instead, falling back to reporting `no_terminal` only if that itself
+/// isn't available (see [`open_with_system_viewer`]).
+fn system_viewer_or_no_terminal_outcome(path: PathBuf) -> ShowOutcome {
+    if open_with_system_viewer(&path) {
+        ShowOutcome {
+            status: "displayed",
+            protocol: Some("system_viewer".to_string()),
+            path: Some(path),
+            message: Some(SYSTEM_VIEWER_MESSAGE.to_string()),
+        }
+    } else {
+        ShowOutcome {
+            status: "no_terminal",
+            protocol: None,
+            message: Some(no_terminal_message(&path)),
+            path: Some(path),
+        }
+    }
 }
 
 /// `clear=true`: send only a Kitty-protocol delete-all-images command (or,
@@ -330,10 +344,8 @@ fn run_clear(tty: Option<&Path>) -> Result<ShowOutcome, TerminalError> {
 
 fn show_png(
     sink: &mut dyn Write,
-    path: &Path,
     bytes: &[u8],
     protocol: Protocol,
-    target: &TerminalTarget,
 ) -> Result<&'static str, TerminalError> {
     match protocol {
         Protocol::Kitty { .. } => {
@@ -346,21 +358,6 @@ fn show_png(
             sink.flush()?;
             Ok("iterm2")
         }
-        Protocol::Ansi { truecolor } => {
-            let decoded = image::load_from_memory(bytes)
-                .map_err(|source| TerminalError::Image {
-                    path: path.to_path_buf(),
-                    source,
-                })?
-                .to_rgba8();
-            let (columns, rows) = ansi_target_size(target);
-            let (width, height) = fit_dimensions(decoded.width(), decoded.height(), columns, rows);
-            let resized = image::imageops::resize(&decoded, width, height, FilterType::Triangle);
-            let (rendered, _rows) = render_ansi_frame(&resized, truecolor);
-            sink.write_all(&rendered)?;
-            sink.flush()?;
-            Ok("ansi")
-        }
     }
 }
 
@@ -369,7 +366,6 @@ fn show_gif(
     path: &Path,
     bytes: &[u8],
     protocol: Protocol,
-    target: &TerminalTarget,
     loops: Option<u32>,
 ) -> Result<&'static str, TerminalError> {
     match protocol {
@@ -396,26 +392,6 @@ fn show_gif(
                 Ok("kitty-simulated")
             }
         }
-        Protocol::Ansi { truecolor } => {
-            let frames = decode_gif_frames(path)?;
-            if frames.is_empty() {
-                return Err(TerminalError::UnsupportedImage {
-                    path: path.to_path_buf(),
-                });
-            }
-            let (columns, rows) = ansi_target_size(target);
-            let mut rendered_frames = Vec::with_capacity(frames.len());
-            let mut row_count = 0usize;
-            for (image, delay) in &frames {
-                let (width, height) = fit_dimensions(image.width(), image.height(), columns, rows);
-                let resized = image::imageops::resize(image, width, height, FilterType::Triangle);
-                let (rendered, rows_used) = render_ansi_frame(&resized, truecolor);
-                row_count = rows_used;
-                rendered_frames.push((rendered, *delay));
-            }
-            show_ansi_animation(sink, &rendered_frames, row_count, loops)?;
-            Ok("ansi-simulated")
-        }
     }
 }
 
@@ -423,58 +399,26 @@ fn show_gif(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
-    Kitty {
-        animation_capable: bool,
-    },
+    Kitty { animation_capable: bool },
     Iterm2,
-    /// `truecolor`: whether to emit 24-bit RGB escape codes
-    /// (`\x1b[38;2;r;g;bm`) or, when the terminal hasn't declared support
-    /// for those, quantized 256-color-palette codes (`\x1b[38;5;Nm`)
-    /// instead -- see `ansi_truecolor_supported` and
-    /// `quantize_to_ansi256`. Confirmed live this matters: Apple's
-    /// Terminal.app (`TERM=xterm-256color`, no `COLORTERM`) doesn't
-    /// understand the 24-bit form at all, and densely repeating it across
-    /// a whole image produced visibly garbled/incorrect output rather than
-    /// a clean "unsupported, ignored" no-op.
-    Ansi {
-        truecolor: bool,
-    },
 }
 
-fn resolve_protocol(value: &str) -> Result<Protocol, TerminalError> {
+/// `Ok(None)` means no known graphics-protocol terminal (`"auto"` only --
+/// an explicit `"kitty"`/`"iterm2"` choice always succeeds or is rejected
+/// outright): the caller should fall back to [`open_with_system_viewer`]
+/// rather than attempting a text-based approximation, which this crate
+/// deliberately no longer has (see the module doc comment for why).
+fn resolve_protocol(value: &str) -> Result<Option<Protocol>, TerminalError> {
     match value {
         "auto" => Ok(detect_protocol_auto(&env_lookup)),
-        "kitty" => Ok(Protocol::Kitty {
+        "kitty" => Ok(Some(Protocol::Kitty {
             animation_capable: kitty_animation_capable(&env_lookup),
-        }),
-        "iterm2" => Ok(Protocol::Iterm2),
-        "ansi" => Ok(Protocol::Ansi {
-            truecolor: ansi_truecolor_supported(&env_lookup),
-        }),
+        })),
+        "iterm2" => Ok(Some(Protocol::Iterm2)),
         other => Err(TerminalError::InvalidProtocol {
             value: other.to_string(),
         }),
     }
-}
-
-/// Whether the terminal has declared support for 24-bit RGB color codes,
-/// per the de facto `COLORTERM=truecolor`/`COLORTERM=24bit` convention
-/// (there is no ANSI-standardized way to query this). Terminals reached
-/// via the Kitty-protocol/iTerm2 paths above are known truecolor-capable
-/// by their own dedicated detection and never consult this; it exists
-/// specifically for whatever's left once those don't match -- Terminal.app
-/// among them, confirmed live to answer `false` here (empty `COLORTERM`).
-/// Defaulting to `false` (256-color) for anything that doesn't explicitly
-/// claim truecolor support is the safe choice: a 256-color approximation
-/// still looks correct on a genuinely truecolor terminal that simply
-/// forgot to set the variable, while unconditionally assuming truecolor
-/// support produces visibly broken output -- confirmed live -- on a
-/// terminal that actually lacks it.
-fn ansi_truecolor_supported(get: &dyn Fn(&str) -> Option<String>) -> bool {
-    matches!(
-        get("COLORTERM").as_deref(),
-        Some("truecolor") | Some("24bit")
-    )
 }
 
 fn env_lookup(name: &str) -> Option<String> {
@@ -505,17 +449,15 @@ fn kitty_animation_capable(get: &dyn Fn(&str) -> Option<String>) -> bool {
     eq("TERM_PROGRAM", "WezTerm") || eq("TERM", "xterm-kitty") || set("KITTY_WINDOW_ID")
 }
 
-fn detect_protocol_auto(get: &dyn Fn(&str) -> Option<String>) -> Protocol {
+fn detect_protocol_auto(get: &dyn Fn(&str) -> Option<String>) -> Option<Protocol> {
     if kitty_protocol_terminal(get) {
-        Protocol::Kitty {
+        Some(Protocol::Kitty {
             animation_capable: kitty_animation_capable(get),
-        }
+        })
     } else if get("TERM_PROGRAM").as_deref() == Some("iTerm.app") {
-        Protocol::Iterm2
+        Some(Protocol::Iterm2)
     } else {
-        Protocol::Ansi {
-            truecolor: ansi_truecolor_supported(get),
-        }
+        None
     }
 }
 
@@ -825,181 +767,6 @@ fn iterm2_transmit(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-// -- ANSI half-block fallback ---------------------------------------------
-
-/// Composites a possibly-transparent pixel over `ANSI_BACKGROUND` --
-/// terminal cells have no alpha channel, so partial transparency is
-/// approximated by alpha-blending against a fixed background color rather
-/// than the viewer's real (unknowable) terminal background.
-fn composite_over_background(pixel: Rgba<u8>) -> (u8, u8, u8) {
-    let [r, g, b, a] = pixel.0;
-    let alpha = f32::from(a) / 255.0;
-    let blend = |channel: u8, background: u8| -> u8 {
-        (f32::from(channel) * alpha + f32::from(background) * (1.0 - alpha)).round() as u8
-    };
-    (
-        blend(r, ANSI_BACKGROUND.0),
-        blend(g, ANSI_BACKGROUND.1),
-        blend(b, ANSI_BACKGROUND.2),
-    )
-}
-
-/// Renders one frame as upper-half-block rows: each terminal row covers two
-/// source pixel rows (foreground = top pixel, background = bottom pixel),
-/// reset at the end of each row. An odd final source row reuses the top
-/// pixel as its own bottom half. Returns the encoded bytes and the number
-/// of terminal rows they occupy (for cursor-repositioning during
-/// animation). `truecolor` selects 24-bit RGB codes (`\x1b[38;2;r;g;bm`)
-/// or, for a terminal that doesn't support those (see
-/// `ansi_truecolor_supported`), quantized 256-color-palette codes
-/// (`\x1b[38;5;Nm`) via `quantize_to_ansi256` instead.
-fn render_ansi_frame(image: &RgbaImage, truecolor: bool) -> (Vec<u8>, usize) {
-    let width = image.width();
-    let height = image.height();
-    let rows = height.div_ceil(2) as usize;
-    let mut out = Vec::new();
-    for row in 0..rows {
-        let top_y = (row * 2) as u32;
-        let bottom_y = top_y + 1;
-        for x in 0..width {
-            let (tr, tg, tb) = composite_over_background(*image.get_pixel(x, top_y));
-            let (br, bg, bb) = if bottom_y < height {
-                composite_over_background(*image.get_pixel(x, bottom_y))
-            } else {
-                (tr, tg, tb)
-            };
-            let cell = if truecolor {
-                format!("\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg};{bb}m\u{2580}")
-            } else {
-                let fg = quantize_to_ansi256(tr, tg, tb);
-                let bg = quantize_to_ansi256(br, bg, bb);
-                format!("\x1b[38;5;{fg}m\x1b[48;5;{bg}m\u{2580}")
-            };
-            out.extend_from_slice(cell.as_bytes());
-        }
-        out.extend_from_slice(b"\x1b[0m\n");
-    }
-    (out, rows)
-}
-
-/// Quantizes a 24-bit RGB color to the nearest xterm 256-color palette
-/// index (0-255), for terminals that don't support direct 24-bit color.
-/// Uses the standard xterm-256color palette layout: indices 16-231 are a
-/// 6x6x6 RGB cube (each channel independently quantized to the nearest of
-/// six evenly-spaced levels), and 232-255 are a 24-step grayscale ramp;
-/// picks whichever of the two is closer to the input color by squared
-/// Euclidean distance (a near-gray color quantizes more accurately via the
-/// dedicated ramp than via the coarser color cube's own diagonal). The 16
-/// basic named colors (indices 0-15) are deliberately not used as
-/// quantization targets: their actual displayed RGB values vary by
-/// terminal theme, so there's nothing reliable to quantize against.
-fn quantize_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
-    const CUBE_LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
-    let nearest_level = |value: u8| -> usize {
-        CUBE_LEVELS
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, level)| (*level - i32::from(value)).abs())
-            .map(|(index, _)| index)
-            .expect("CUBE_LEVELS is non-empty")
-    };
-    let squared_distance = |a: i32, b: i32, c: i32, d: i32, e: i32, f: i32| -> i32 {
-        (a - d) * (a - d) + (b - e) * (b - e) + (c - f) * (c - f)
-    };
-
-    let (ri, gi, bi) = (nearest_level(r), nearest_level(g), nearest_level(b));
-    let cube_index = 16 + 36 * ri + 6 * gi + bi;
-    let cube_distance = squared_distance(
-        i32::from(r),
-        i32::from(g),
-        i32::from(b),
-        CUBE_LEVELS[ri],
-        CUBE_LEVELS[gi],
-        CUBE_LEVELS[bi],
-    );
-
-    // 24-step grayscale ramp: index 232 is level 8, index 255 is level 238,
-    // step 10 -- deliberately excludes pure 0/255 (the color cube's own
-    // corners already cover those).
-    let gray_level = (i32::from(r) + i32::from(g) + i32::from(b)) / 3;
-    let gray_step = ((gray_level - 8) / 10).clamp(0, 23);
-    let gray_value = 8 + gray_step * 10;
-    let gray_index = 232 + gray_step;
-    let gray_distance = squared_distance(
-        i32::from(r),
-        i32::from(g),
-        i32::from(b),
-        gray_value,
-        gray_value,
-        gray_value,
-    );
-
-    if gray_distance < cube_distance {
-        gray_index as u8
-    } else {
-        cube_index as u8
-    }
-}
-
-/// Fits `source_width`x`source_height` into the given terminal grid,
-/// leaving a small margin, at one column per pixel horizontally and one
-/// row per two pixels vertically, preserving aspect ratio. Height is
-/// always rounded up to an even number of source rows.
-fn fit_dimensions(source_width: u32, source_height: u32, columns: u16, rows: u16) -> (u32, u32) {
-    let margin_columns = 2u32;
-    let margin_rows = 1u32;
-    let max_columns = u32::from(columns).saturating_sub(margin_columns).max(1);
-    let max_pixel_height = u32::from(rows).saturating_sub(margin_rows).max(1) * 2;
-    let scale_w = f64::from(max_columns) / f64::from(source_width.max(1));
-    let scale_h = f64::from(max_pixel_height) / f64::from(source_height.max(1));
-    let scale = scale_w.min(scale_h);
-    let width = ((f64::from(source_width) * scale).round() as u32).max(1);
-    let mut height = ((f64::from(source_height) * scale).round() as u32).max(1);
-    if !height.is_multiple_of(2) {
-        height += 1;
-    }
-    (width, height.max(2))
-}
-
-fn ansi_target_size(target: &TerminalTarget) -> (u16, u16) {
-    match target {
-        TerminalTarget::Stdout => terminal_size::terminal_size()
-            .map(|(width, height)| (width.0, height.0))
-            .unwrap_or((DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_ROWS)),
-        TerminalTarget::Device(_) => (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_ROWS),
-    }
-}
-
-/// Simulated animation for the ANSI half-block fallback: redraw each frame
-/// in place by moving the cursor back up over the previous frame's rows
-/// before drawing the next one, sleeping for its delay in between, until
-/// `loops` is exhausted or the process is killed.
-fn show_ansi_animation(
-    sink: &mut dyn Write,
-    frames: &[(Vec<u8>, u32)],
-    row_count: usize,
-    loops: Option<u32>,
-) -> std::io::Result<()> {
-    let mut played = 0u32;
-    let mut drawn_before = false;
-    loop {
-        for (rendered, delay) in frames {
-            if drawn_before {
-                sink.write_all(format!("\x1b[{row_count}A").as_bytes())?;
-            }
-            sink.write_all(rendered)?;
-            sink.flush()?;
-            drawn_before = true;
-            std::thread::sleep(Duration::from_millis(u64::from(*delay)));
-        }
-        played += 1;
-        if should_stop_looping(loops, played) {
-            break;
-        }
-    }
-    Ok(())
-}
-
 // -- GIF decoding -----------------------------------------------------------
 
 fn decode_gif_frames(path: &Path) -> Result<Vec<(RgbaImage, u32)>, TerminalError> {
@@ -1061,7 +828,7 @@ fn encode_frames_as_png(
 // collide with an agent's own actively-redrawn TUI (the motivating
 // problem: a detached `show` subprocess's raw pty write has no way to know
 // where a chat transcript ends and an input box begins). This is tried
-// first, ahead of all Kitty/iTerm2/ANSI detection, and used instead of it
+// first, ahead of all Kitty/iTerm2 detection, and used instead of it
 // entirely whenever cmux is reachable. `UnixStream` is POSIX-only, so this
 // whole integration is unix-only; on other platforms (this workspace's CI
 // includes a Windows target) it compiles to a stub that always reports
@@ -1756,119 +1523,6 @@ mod tests {
     }
 
     #[test]
-    fn composite_over_background_blends_partial_alpha_against_black() {
-        assert_eq!(
-            composite_over_background(Rgba([200, 100, 50, 255])),
-            (200, 100, 50)
-        );
-        assert_eq!(
-            composite_over_background(Rgba([200, 100, 50, 0])),
-            (0, 0, 0)
-        );
-        // alpha = 128/255 ~= 0.502; background is black, so the result is
-        // approximately channel * alpha.
-        assert_eq!(
-            composite_over_background(Rgba([200, 100, 50, 128])),
-            (100, 50, 25)
-        );
-    }
-
-    #[test]
-    fn render_ansi_frame_emits_the_documented_half_block_escape_sequence() {
-        let mut image = RgbaImage::new(1, 2);
-        image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
-        image.put_pixel(0, 1, Rgba([0, 255, 0, 255]));
-        let (rendered, rows) = render_ansi_frame(&image, true);
-        assert_eq!(rows, 1);
-        assert_eq!(
-            String::from_utf8(rendered).unwrap(),
-            "\x1b[38;2;255;0;0m\x1b[48;2;0;255;0m\u{2580}\x1b[0m\n"
-        );
-    }
-
-    #[test]
-    fn render_ansi_frame_reuses_the_top_pixel_for_an_odd_final_row() {
-        let mut image = RgbaImage::new(1, 1);
-        image.put_pixel(0, 0, Rgba([10, 20, 30, 255]));
-        let (rendered, rows) = render_ansi_frame(&image, true);
-        assert_eq!(rows, 1);
-        assert_eq!(
-            String::from_utf8(rendered).unwrap(),
-            "\x1b[38;2;10;20;30m\x1b[48;2;10;20;30m\u{2580}\x1b[0m\n"
-        );
-    }
-
-    #[test]
-    fn render_ansi_frame_emits_256_color_codes_when_truecolor_is_unsupported() {
-        let mut image = RgbaImage::new(1, 2);
-        image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
-        image.put_pixel(0, 1, Rgba([0, 0, 0, 255]));
-        let (rendered, rows) = render_ansi_frame(&image, false);
-        assert_eq!(rows, 1);
-        let text = String::from_utf8(rendered).unwrap();
-        assert!(!text.contains(";2;"), "should not use 24-bit color codes");
-        assert!(text.contains("\x1b[38;5;"));
-        assert!(text.contains("\x1b[48;5;"));
-        assert!(text.ends_with("\x1b[0m\n"));
-    }
-
-    #[test]
-    fn quantize_to_ansi256_maps_pure_colors_to_their_known_cube_corners() {
-        // The 6x6x6 cube's eight corners have well-known fixed indices,
-        // independent of the distance-vs-grayscale-ramp logic (pure black
-        // and white are handled by the grayscale-ramp tiebreak below).
-        assert_eq!(quantize_to_ansi256(255, 0, 0), 196); // pure red
-        assert_eq!(quantize_to_ansi256(0, 255, 0), 46); // pure green
-        assert_eq!(quantize_to_ansi256(0, 0, 255), 21); // pure blue
-    }
-
-    #[test]
-    fn quantize_to_ansi256_prefers_the_grayscale_ramp_for_near_gray_colors() {
-        // A genuinely neutral gray should land in the dedicated 24-step
-        // ramp (232-255), not the coarser 6-level-per-channel color cube.
-        let index = quantize_to_ansi256(128, 128, 128);
-        assert!(
-            (232..=255).contains(&index),
-            "expected a grayscale-ramp index, got {index}"
-        );
-    }
-
-    #[test]
-    fn quantize_to_ansi256_is_deterministic_and_always_in_range() {
-        for r in [0u8, 17, 64, 128, 200, 255] {
-            for g in [0u8, 32, 96, 160, 224, 255] {
-                for b in [0u8, 48, 112, 176, 240, 255] {
-                    let first = quantize_to_ansi256(r, g, b);
-                    let second = quantize_to_ansi256(r, g, b);
-                    assert_eq!(first, second);
-                    // 0-15 (the theme-dependent basic colors) are never
-                    // produced by this function -- see its doc comment.
-                    assert!((16..=255).contains(&first));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn ansi_truecolor_supported_requires_an_explicit_colorterm_claim() {
-        assert!(ansi_truecolor_supported(&|name| match name {
-            "COLORTERM" => Some("truecolor".to_string()),
-            _ => None,
-        }));
-        assert!(ansi_truecolor_supported(&|name| match name {
-            "COLORTERM" => Some("24bit".to_string()),
-            _ => None,
-        }));
-        // Confirmed live: Apple's Terminal.app sets TERM=xterm-256color
-        // and leaves COLORTERM unset -- this must resolve to `false`.
-        assert!(!ansi_truecolor_supported(&|name| match name {
-            "TERM" => Some("xterm-256color".to_string()),
-            _ => None,
-        }));
-        assert!(!ansi_truecolor_supported(&|_| None));
-    }
-
-    #[test]
     fn parse_ps_ppid_tty_handles_macos_and_linux_formatting() {
         assert_eq!(
             parse_ps_ppid_tty("  501 ttys008\n"),
@@ -1939,76 +1593,56 @@ mod tests {
 
         assert_eq!(
             detect_protocol_auto(&lookup(&[("KITTY_WINDOW_ID", "1")])),
-            Protocol::Kitty {
+            Some(Protocol::Kitty {
                 animation_capable: true
-            }
+            })
         );
         assert_eq!(
             detect_protocol_auto(&lookup(&[("TERM_PROGRAM", "ghostty")])),
-            Protocol::Kitty {
+            Some(Protocol::Kitty {
                 animation_capable: false
-            }
+            })
         );
         assert_eq!(
             detect_protocol_auto(&lookup(&[("CMUX_WORKSPACE_ID", "abc")])),
-            Protocol::Kitty {
+            Some(Protocol::Kitty {
                 animation_capable: false
-            }
+            })
         );
         assert_eq!(
             detect_protocol_auto(&lookup(&[("TERM_PROGRAM", "WezTerm")])),
-            Protocol::Kitty {
+            Some(Protocol::Kitty {
                 animation_capable: true
-            }
+            })
         );
         assert_eq!(
             detect_protocol_auto(&lookup(&[("TERM_PROGRAM", "iTerm.app")])),
-            Protocol::Iterm2
+            Some(Protocol::Iterm2)
         );
-        assert_eq!(
-            detect_protocol_auto(&lookup(&[])),
-            Protocol::Ansi { truecolor: false }
-        );
-        assert_eq!(
-            detect_protocol_auto(&lookup(&[("COLORTERM", "truecolor")])),
-            Protocol::Ansi { truecolor: true }
-        );
+        // No known graphics-protocol terminal (Apple's Terminal.app
+        // included -- see the module doc comment): `None`, not a
+        // text-based fallback protocol.
+        assert_eq!(detect_protocol_auto(&lookup(&[])), None);
     }
 
     #[test]
     fn resolve_protocol_rejects_unknown_values() {
         let error = resolve_protocol("bogus").unwrap_err();
         assert_eq!(error.code(), "invalid_protocol");
+        // "ansi" was a valid choice before the text-based fallback was
+        // removed; it must now be rejected the same as any other unknown
+        // value, not silently accepted.
+        let error = resolve_protocol("ansi").unwrap_err();
+        assert_eq!(error.code(), "invalid_protocol");
     }
 
     #[test]
     fn resolve_protocol_honors_explicit_choices() {
-        assert_eq!(resolve_protocol("iterm2").unwrap(), Protocol::Iterm2);
-        // `truecolor` depends on this test process's real COLORTERM, same
-        // reason `kitty` below only checks the variant.
-        assert!(matches!(
-            resolve_protocol("ansi").unwrap(),
-            Protocol::Ansi { .. }
-        ));
+        assert_eq!(resolve_protocol("iterm2").unwrap(), Some(Protocol::Iterm2));
         assert!(matches!(
             resolve_protocol("kitty").unwrap(),
-            Protocol::Kitty { .. }
+            Some(Protocol::Kitty { .. })
         ));
-    }
-
-    #[test]
-    fn fit_dimensions_fits_within_the_available_grid_and_keeps_height_even() {
-        let (width, height) = fit_dimensions(400, 200, 82, 25);
-        assert!(width <= 80);
-        assert!(height <= 48);
-        assert_eq!(height % 2, 0);
-    }
-
-    #[test]
-    fn fit_dimensions_never_returns_zero() {
-        let (width, height) = fit_dimensions(1, 1, 3, 2);
-        assert!(width >= 1);
-        assert!(height >= 2);
     }
 
     #[test]

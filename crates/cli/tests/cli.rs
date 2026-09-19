@@ -498,76 +498,92 @@ fn show_writes_an_iterm2_osc_1337_command_for_a_static_png() {
     assert!(text.ends_with('\u{7}'));
 }
 
-/// A static PNG through `--protocol ansi` produces true-color half-block
-/// escape sequences (no graphics-protocol control string at all), when the
-/// terminal has explicitly declared truecolor support via `COLORTERM`.
+/// The text-based ANSI half-block fallback was removed entirely (see
+/// `renderer_terminal`'s module doc comment for why): `"ansi"` must be
+/// rejected as an unknown protocol value the same as any other bogus
+/// string, not silently accepted.
 #[test]
-fn show_writes_ansi_half_blocks_for_a_static_png() {
+fn show_rejects_ansi_as_a_protocol_value() {
     let directory = tempfile::tempdir().unwrap();
     let png_path = directory.path().join("image.png");
     write_test_png(&png_path);
-    let tty_path = directory.path().join("fake-tty");
-    std::fs::write(&tty_path, b"").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
         .env_remove("CMUX_SOCKET_PATH")
-        .env("COLORTERM", "truecolor")
-        .args([
-            "show",
-            png_path.to_str().unwrap(),
-            "--tty",
-            tty_path.to_str().unwrap(),
-            "--protocol",
-            "ansi",
-        ])
+        .args(["show", png_path.to_str().unwrap(), "--protocol", "ansi"])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{output:?}");
-
-    let written = std::fs::read(&tty_path).unwrap();
-    let text = String::from_utf8(written).unwrap();
-    assert!(text.contains("\x1b[38;2;"));
-    assert!(text.contains("\x1b[48;2;"));
-    assert!(text.contains('\u{2580}'));
-    assert!(!text.contains("\x1b_G"));
+    assert!(!output.status.success());
+    let error = parse_error(output.stderr);
+    assert_eq!(error["code"], "invalid_protocol");
 }
 
-/// Without a `COLORTERM=truecolor`/`24bit` claim (e.g. Apple's
-/// Terminal.app, confirmed live: `TERM=xterm-256color`, no `COLORTERM` at
-/// all), `--protocol ansi` must fall back to 256-color-palette escape
-/// codes rather than unconditionally emitting 24-bit codes a real terminal
-/// in that state can't parse -- confirmed live to produce visibly garbled
-/// output instead of a clean "unsupported" no-op.
+/// When no known graphics-protocol terminal is detected (Apple's
+/// Terminal.app included -- it implements neither Kitty's nor iTerm2's
+/// protocol), `show` opens the image with the OS's own default file opener
+/// instead of any text-based approximation. A fake `open`/`xdg-open`
+/// placed first on `PATH` stands in for the real one so this doesn't pop
+/// an actual GUI window during the test run, and lets the test confirm it
+/// was invoked with the right path.
 #[test]
-fn show_writes_256_color_half_blocks_when_colorterm_does_not_claim_truecolor() {
+fn show_opens_the_system_viewer_when_no_known_protocol_is_detected() {
     let directory = tempfile::tempdir().unwrap();
     let png_path = directory.path().join("image.png");
     write_test_png(&png_path);
-    let tty_path = directory.path().join("fake-tty");
-    std::fs::write(&tty_path, b"").unwrap();
+
+    let fake_bin = directory.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let opener_name = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let opener_path = fake_bin.join(opener_name);
+    let log_path = directory.path().join("opener.log");
+    std::fs::write(
+        &opener_path,
+        format!("#!/bin/sh\necho \"$@\" >> {}\n", log_path.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &opener_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let path_value = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
         .env_remove("CMUX_SOCKET_PATH")
-        .env_remove("COLORTERM")
+        .env_remove("KITTY_WINDOW_ID")
+        .env_remove("GHOSTTY_RESOURCES_DIR")
+        .env_remove("CMUX_WORKSPACE_ID")
+        .env_remove("CMUX_SURFACE_ID")
+        .env_remove("TERM_PROGRAM")
         .env("TERM", "xterm-256color")
-        .args([
-            "show",
-            png_path.to_str().unwrap(),
-            "--tty",
-            tty_path.to_str().unwrap(),
-            "--protocol",
-            "ansi",
-        ])
+        .env("PATH", path_value)
+        .args(["show", png_path.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("\"protocol\":\"system_viewer\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"status\":\"displayed\""), "{stdout}");
 
-    let written = std::fs::read(&tty_path).unwrap();
-    let text = String::from_utf8(written).unwrap();
-    assert!(!text.contains(";2;"), "should not use 24-bit color codes");
-    assert!(text.contains("\x1b[38;5;"));
-    assert!(text.contains("\x1b[48;5;"));
-    assert!(text.contains('\u{2580}'));
+    // `open_with_system_viewer` fire-and-forgets the spawn; give the fake
+    // opener a moment to actually write its log.
+    std::thread::sleep(Duration::from_millis(200));
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        logged.contains(png_path.to_str().unwrap()),
+        "opener log: {logged:?}"
+    );
 }
 
 /// A file that isn't a PNG or GIF is rejected with the structured
