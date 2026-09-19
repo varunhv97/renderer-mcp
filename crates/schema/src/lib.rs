@@ -10,25 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use thiserror::Error;
 
-/// The only value `SceneV1::version` accepts today. An exact string match,
-/// not a semver comparison -- a future incompatible schema change gets its
-/// own `renderer.scene.v2` constant and `SceneV2` type rather than trying
-/// to version this one in place.
-pub const SCENE_VERSION_V1: &str = "renderer.scene.v1";
-// The constants below bound resource use so an untrusted scene or patch
-// document can't force the renderer/daemon to do unbounded work.
-pub const MAX_CANVAS_DIMENSION: u32 = 4_096;
-pub const MAX_NODES: usize = 10_000;
-pub const MAX_PATH_POINTS: usize = 4_096;
-pub const MAX_PATCH_OPERATIONS: usize = 1_000;
-/// Maximum number of encoded animation frames. This bounds per-frame setup work.
-pub const MAX_ANIMATION_FRAMES: u64 = 300;
-/// Maximum aggregate raster work for one animation, measured in output pixels.
-pub const MAX_ANIMATION_PIXELS: u64 = 64 * 1024 * 1024;
-/// Maximum byte length of a user-supplied post-process effect shader.
-pub const MAX_EFFECT_SHADER_BYTES: usize = 64 * 1024;
+mod limits;
+pub use limits::*;
+mod error;
+pub use error::*;
 
 /// RGBA, each channel a finite float from 0.0 through 1.0 (see
 /// `validate_color`); values outside that range fail scene validation.
@@ -545,63 +531,6 @@ pub enum PatchOperationV1 {
     RemoveNode { id: String },
     SetTimeline { timeline: TimelineV1 },
     ClearTimeline,
-}
-
-/// Every way a [`SceneV1`] or [`ScenePatchV1`] can fail [`SceneV1::validate`]
-/// / [`ScenePatchV1::validate`]. One variant per distinguishable failure
-/// (rather than an opaque string) so callers -- notably `renderer_daemon`,
-/// which wraps this in `DaemonError::InvalidScene` -- can report a stable
-/// error without string-matching a message.
-#[derive(Clone, Debug, Error, PartialEq)]
-pub enum SceneValidationError {
-    #[error("unsupported scene version: {0}")]
-    UnsupportedVersion(String),
-    #[error("canvas dimensions must be greater than zero")]
-    InvalidCanvasDimensions,
-    #[error("canvas {width}x{height} exceeds {maximum}px per dimension")]
-    CanvasTooLarge {
-        width: u32,
-        height: u32,
-        maximum: u32,
-    },
-    #[error("scene has {actual} nodes; maximum is {maximum}")]
-    TooManyNodes { actual: usize, maximum: usize },
-    #[error("node IDs must not be empty")]
-    EmptyNodeId,
-    #[error("duplicate node ID: {0}")]
-    DuplicateNodeId(String),
-    #[error("{0} must be finite and greater than zero")]
-    InvalidPositiveValue(&'static str),
-    #[error("colors must contain finite values from 0.0 through 1.0")]
-    InvalidColor,
-    #[error("gradient angle_degrees must be finite")]
-    InvalidGradientAngle,
-    #[error(
-        "corner_radius must be finite, non-negative, and no larger than half of the smaller of width/height"
-    )]
-    InvalidCornerRadius,
-    #[error("translate values must be finite")]
-    InvalidTranslate,
-    #[error("paths require at least three points")]
-    InvalidPath,
-    #[error("path has {actual} points; maximum is {maximum}")]
-    TooManyPathPoints { actual: usize, maximum: usize },
-    #[error("text nodes must not be empty")]
-    EmptyText,
-    #[error("patch must contain 1 through {MAX_PATCH_OPERATIONS} operations")]
-    InvalidPatch,
-    #[error("keyframe target does not identify a scene node: {0}")]
-    UnknownKeyframeTarget(String),
-    #[error("animation has {actual} frames; maximum is {maximum}")]
-    TooManyAnimationFrames { actual: u64, maximum: u64 },
-    #[error("animation raster work is {actual} pixels; maximum is {maximum}")]
-    TooManyAnimationPixels { actual: u64, maximum: u64 },
-    #[error("timeline must use 1-60 FPS, last no more than 10 seconds, and contain valid frames")]
-    InvalidTimeline,
-    #[error("effect shader must not be empty")]
-    EmptyEffectShader,
-    #[error("effect shader is {actual} bytes; maximum is {maximum}")]
-    EffectShaderTooLarge { actual: usize, maximum: usize },
 }
 
 fn transparent() -> Color {
