@@ -599,9 +599,14 @@ fn show_rejects_a_file_that_is_not_png_or_gif() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_renderer"))
         .env_remove("CMUX_SOCKET_PATH")
+        // Pin the protocol: with `auto` and no Kitty/iTerm2 signals in the
+        // environment (as on CI), `show` skips terminal writes entirely and
+        // hands the file to the system viewer, never reaching the format check.
         .args([
             "show",
             text_path.to_str().unwrap(),
+            "--protocol",
+            "kitty",
             "--tty",
             tty_path.to_str().unwrap(),
         ])

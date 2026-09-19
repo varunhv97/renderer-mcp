@@ -1424,8 +1424,14 @@ mod cmux_preview {
         Ok(None)
     }
 
+    // Mirrors the unix module's variants so `run_clear`'s exhaustive match
+    // compiles on every platform; only `Unavailable` is ever produced here,
+    // since cmux is a macOS app reached over a Unix domain socket.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[allow(dead_code)]
     pub(super) enum CmuxClearOutcome {
+        Cleared,
+        NoSurface,
         Unavailable,
     }
 
