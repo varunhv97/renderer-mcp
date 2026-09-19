@@ -21,10 +21,18 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
-    time::Duration,
 };
-use thiserror::Error;
 use wgpu::util::DeviceExt;
+
+mod error;
+mod limits;
+
+pub use error::{RenderError, RenderedImage};
+use limits::{
+    MAX_ASSET_BYTES, MAX_ASSET_PIXELS, MAX_COMPOSITION_TEXTURE_PIXELS, MAX_GLYPH_SIZE,
+    MAX_GPU_TEXTURE_DIMENSION, MAX_IMAGE_RASTER_PIXELS, MAX_TEXT_BYTES, MAX_TEXT_GLYPHS,
+    MAX_TEXT_RASTER_PIXELS, SVG_RASTER_TIME_BUDGET,
+};
 
 const ELLIPSE_SEGMENTS: usize = 32;
 /// Arc tessellation resolution for one rounded rect corner (a 90-degree
@@ -83,23 +91,6 @@ const MSAA_SAMPLE_COUNT: u32 = 4;
 /// multisampled texture, resolve texture, and CPU readback buffer are all
 /// 4x the pixel count (factor^2) of a declared-size render.
 const SUPERSAMPLE_FACTOR: u32 = 2;
-const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_ASSET_PIXELS: u64 = 16_000_000;
-const MAX_IMAGE_RASTER_PIXELS: u64 = 4_000_000;
-const MAX_TEXT_BYTES: usize = 16 * 1024;
-const MAX_TEXT_GLYPHS: usize = 1_024;
-const MAX_GLYPH_SIZE: f32 = 1_024.0;
-const MAX_TEXT_RASTER_PIXELS: u64 = 4_000_000;
-const MAX_COMPOSITION_TEXTURE_PIXELS: u64 = 20_000_000;
-const MAX_GPU_TEXTURE_DIMENSION: u32 = 2_048;
-/// Wall-clock ceiling for parsing+rasterizing a single SVG asset. `usvg`
-/// already refuses documents with more than 1,000,000 XML nodes
-/// (`usvg::Error::ElementsLimitReached`, which also bounds `<use>`-expansion
-/// style blowups since expansion copies count against the same limit), but
-/// pathological filter chains (e.g. many chained `feGaussianBlur`s) can still
-/// be expensive without tripping that counter. This budget turns a hang into
-/// a fast, actionable `RenderError::Asset` instead.
-const SVG_RASTER_TIME_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct GpuRenderer {
@@ -121,52 +112,6 @@ pub struct GpuRenderer {
     /// `create_analytic_pipelines`'s doc comment for why a separate pipeline
     /// object is required here even though the shader is identical.
     textured_pipeline_single: wgpu::RenderPipeline,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RenderedImage {
-    pub width: u32,
-    pub height: u32,
-    pub sha256: String,
-    pub frame_count: u32,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Error)]
-pub enum RenderError {
-    #[error("scene validation failed: {0}")]
-    InvalidScene(#[from] renderer_schema::SceneValidationError),
-    #[error("no compatible GPU adapter was found")]
-    NoAdapter,
-    #[error("could not create GPU device: {0}")]
-    Device(#[from] wgpu::RequestDeviceError),
-    #[error("GPU readback failed")]
-    Readback,
-    #[error("could not write image: {0}")]
-    Image(#[from] image::ImageError),
-    #[error("PNG render output must use a .png extension: {0}")]
-    InvalidPngOutputPath(PathBuf),
-    #[error("could not create output directory: {0}")]
-    OutputDirectory(#[source] std::io::Error),
-    #[error("could not write GIF: {0}")]
-    Gif(#[source] image::ImageError),
-    /// Distinct from [`Self::Gif`] (which wraps `image::ImageError` for the
-    /// analytic-AA GIF path, still using the `image` crate's own encoder)
-    /// because [`GpuRenderer::render_gif_with_asset_root`] talks to the
-    /// lower-level `gif` crate directly -- see that method's doc comment.
-    #[error("could not write GIF: {0}")]
-    GifEncoding(#[source] gif::EncodingError),
-    #[error("could not hash emitted output: {0}")]
-    OutputRead(#[source] std::io::Error),
-    #[error("could not load bundled font")]
-    Font,
-    #[error("asset error: {0}")]
-    Asset(String),
-    /// The scene's `effect.shader` failed WGSL compile validation once
-    /// wrapped in the fixed post-process template. Kept at the end of this
-    /// enum to minimize merge-conflict risk with parallel changes elsewhere.
-    #[error("invalid effect shader: {0}")]
-    InvalidEffectShader(String),
 }
 
 impl GpuRenderer {
