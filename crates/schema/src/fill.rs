@@ -134,3 +134,208 @@ pub enum GradientV1 {
         edge: Color,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+
+    #[test]
+    fn fill_v1_round_trips_a_plain_solid_array() {
+        let json = r#"[1.0, 0.5, 0.25, 1.0]"#;
+        let fill: FillV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(fill, FillV1::Solid([1.0, 0.5, 0.25, 1.0]));
+        let re_encoded = serde_json::to_string(&fill).unwrap();
+        assert_eq!(re_encoded, "[1.0,0.5,0.25,1.0]");
+    }
+
+    #[test]
+    fn fill_v1_round_trips_a_linear_gradient_object() {
+        let json = r#"{"kind":"linear_gradient","from":[1.0,0.0,0.0,1.0],"to":[0.0,0.0,1.0,1.0],"angle_degrees":45.0}"#;
+        let fill: FillV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            fill,
+            FillV1::Gradient(GradientV1::LinearGradient {
+                from: [1.0, 0.0, 0.0, 1.0],
+                to: [0.0, 0.0, 1.0, 1.0],
+                angle_degrees: 45.0,
+            })
+        );
+        let re_encoded = serde_json::to_string(&fill).unwrap();
+        let re_decoded: FillV1 = serde_json::from_str(&re_encoded).unwrap();
+        assert_eq!(re_decoded, fill);
+    }
+
+    #[test]
+    fn fill_v1_round_trips_a_radial_gradient_object() {
+        let json =
+            r#"{"kind":"radial_gradient","center":[1.0,1.0,1.0,1.0],"edge":[0.0,0.0,0.0,1.0]}"#;
+        let fill: FillV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            fill,
+            FillV1::Gradient(GradientV1::RadialGradient {
+                center: [1.0, 1.0, 1.0, 1.0],
+                edge: [0.0, 0.0, 0.0, 1.0],
+            })
+        );
+        let re_encoded = serde_json::to_string(&fill).unwrap();
+        let re_decoded: FillV1 = serde_json::from_str(&re_encoded).unwrap();
+        assert_eq!(re_decoded, fill);
+    }
+
+    #[test]
+    fn fill_v1_rejects_unknown_fields_in_a_gradient_object() {
+        let json = r#"{"kind":"linear_gradient","from":[1.0,0.0,0.0,1.0],"to":[0.0,0.0,1.0,1.0],"angle_degrees":0.0,"bogus":1.0}"#;
+        assert!(serde_json::from_str::<FillV1>(json).is_err());
+    }
+
+    #[test]
+    fn fill_v1_rejects_malformed_input_that_is_neither_array_nor_gradient_object() {
+        assert!(serde_json::from_str::<FillV1>(r#"{"kind":"not_a_real_kind"}"#).is_err());
+        assert!(serde_json::from_str::<FillV1>(r#"[1.0, 2.0]"#).is_err());
+        assert!(serde_json::from_str::<FillV1>(r#""red""#).is_err());
+    }
+
+    #[test]
+    fn a_rect_with_a_gradient_fill_round_trips_through_a_full_scene_and_validates() {
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64},
+            "nodes": [{
+                "id": "box", "kind": "rect",
+                "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0,
+                "corner_radius": 2.0,
+                "color": {"kind": "linear_gradient", "from": [1.0, 0.0, 0.0, 1.0], "to": [0.0, 0.0, 1.0, 1.0], "angle_degrees": 0.0}
+            }]
+        }"#;
+        let parsed: SceneV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.validate(), Ok(()));
+        assert_eq!(
+            parsed.nodes[0].kind,
+            NodeKindV1::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                corner_radius: 2.0,
+                fill: FillV1::Gradient(GradientV1::LinearGradient {
+                    from: [1.0, 0.0, 0.0, 1.0],
+                    to: [0.0, 0.0, 1.0, 1.0],
+                    angle_degrees: 0.0,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_gradient_with_an_out_of_range_color_component() {
+        let mut value = scene();
+        value.nodes[0].kind = NodeKindV1::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            corner_radius: 0.0,
+            fill: FillV1::Gradient(GradientV1::LinearGradient {
+                from: [2.0, 0.0, 0.0, 1.0],
+                to: [0.0, 0.0, 1.0, 1.0],
+                angle_degrees: 0.0,
+            }),
+        };
+        assert_eq!(value.validate(), Err(SceneValidationError::InvalidColor));
+    }
+
+    #[test]
+    fn rejects_a_gradient_with_a_non_finite_angle() {
+        let mut value = scene();
+        value.nodes[0].kind = NodeKindV1::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            corner_radius: 0.0,
+            fill: FillV1::Gradient(GradientV1::LinearGradient {
+                from: [1.0, 0.0, 0.0, 1.0],
+                to: [0.0, 0.0, 1.0, 1.0],
+                angle_degrees: f32::NAN,
+            }),
+        };
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidGradientAngle)
+        );
+    }
+
+    #[test]
+    fn rejects_a_radial_gradient_with_an_out_of_range_color_component() {
+        let mut value = scene();
+        value.nodes[0].kind = NodeKindV1::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            corner_radius: 0.0,
+            fill: FillV1::Gradient(GradientV1::RadialGradient {
+                center: [1.0, 1.0, 1.0, 1.0],
+                edge: [0.0, 0.0, 0.0, -1.0],
+            }),
+        };
+        assert_eq!(value.validate(), Err(SceneValidationError::InvalidColor));
+    }
+
+    #[test]
+    fn fill_v1_resolve_solid_returns_the_color_for_a_solid_fill() {
+        assert_eq!(
+            FillV1::Solid([1.0, 0.5, 0.25, 1.0]).resolve_solid(),
+            [1.0, 0.5, 0.25, 1.0]
+        );
+    }
+
+    #[test]
+    fn fill_v1_resolve_solid_returns_the_midpoint_of_a_gradient() {
+        let fill = FillV1::Gradient(GradientV1::LinearGradient {
+            from: [0.0, 0.0, 0.0, 0.0],
+            to: [1.0, 1.0, 1.0, 1.0],
+            angle_degrees: 0.0,
+        });
+        assert_eq!(fill.resolve_solid(), [0.5, 0.5, 0.5, 0.5]);
+
+        let fill = FillV1::Gradient(GradientV1::RadialGradient {
+            center: [1.0, 0.0, 0.0, 1.0],
+            edge: [0.0, 1.0, 0.0, 0.0],
+        });
+        assert_eq!(fill.resolve_solid(), [0.5, 0.5, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn fill_v1_multiply_alpha_scales_every_stop_a_gradient_carries() {
+        let mut fill = FillV1::Gradient(GradientV1::LinearGradient {
+            from: [1.0, 0.0, 0.0, 1.0],
+            to: [0.0, 0.0, 1.0, 0.5],
+            angle_degrees: 0.0,
+        });
+        fill.multiply_alpha(0.5);
+        assert_eq!(
+            fill,
+            FillV1::Gradient(GradientV1::LinearGradient {
+                from: [1.0, 0.0, 0.0, 0.5],
+                to: [0.0, 0.0, 1.0, 0.25],
+                angle_degrees: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn fill_v1_as_solid_and_set_solid_round_trip() {
+        let mut fill = FillV1::Solid([1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(fill.as_solid(), Some([1.0, 0.0, 0.0, 1.0]));
+        fill.set_solid([0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(fill, FillV1::Solid([0.0, 1.0, 0.0, 1.0]));
+
+        let gradient = FillV1::Gradient(GradientV1::RadialGradient {
+            center: [1.0; 4],
+            edge: [0.0; 4],
+        });
+        assert_eq!(gradient.as_solid(), None);
+    }
+}

@@ -157,3 +157,197 @@ pub struct PointV1 {
     pub x: f32,
     pub y: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+
+    #[test]
+    fn rejects_unknown_fields_on_a_node() {
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64},
+            "nodes": [{
+                "id": "box", "kind": "rect",
+                "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                "color": [1.0, 1.0, 1.0, 1.0],
+                "strokeWidth": 2.0
+            }]
+        }"#;
+        assert!(serde_json::from_str::<SceneV1>(json).is_err());
+    }
+
+    #[test]
+    fn validates_every_supported_node_kind() {
+        let mut value = scene();
+        value.nodes = vec![
+            NodeV1 {
+                id: "ellipse".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Ellipse {
+                    cx: 4.0,
+                    cy: 4.0,
+                    rx: 2.0,
+                    ry: 2.0,
+                    fill: FillV1::Solid([0.0; 4]),
+                },
+            },
+            NodeV1 {
+                id: "line".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Line {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: 3.0,
+                    y2: 3.0,
+                    thickness: 1.0,
+                    fill: FillV1::Solid([0.0; 4]),
+                },
+            },
+            NodeV1 {
+                id: "path".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Path {
+                    points: vec![
+                        PointV1 { x: 0.0, y: 0.0 },
+                        PointV1 { x: 1.0, y: 0.0 },
+                        PointV1 { x: 0.0, y: 1.0 },
+                    ],
+                    fill: FillV1::Solid([0.0; 4]),
+                },
+            },
+            NodeV1 {
+                id: "text".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Text {
+                    x: 0.0,
+                    y: 0.0,
+                    text: "ok".into(),
+                    size: 1.0,
+                    fill: FillV1::Solid([0.0; 4]),
+                },
+            },
+            NodeV1 {
+                id: "image".into(),
+                translate: [0.0, 0.0],
+                kind: NodeKindV1::Image {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                    source: "asset.png".into(),
+                },
+            },
+        ];
+        assert_eq!(value.validate(), Ok(()));
+    }
+
+    #[test]
+    fn node_translate_defaults_to_zero_when_absent_from_json() {
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64},
+            "nodes": [{
+                "id": "box", "kind": "rect",
+                "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                "color": [1.0, 1.0, 1.0, 1.0]
+            }]
+        }"#;
+        let parsed: SceneV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.nodes[0].translate, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn rect_corner_radius_defaults_to_zero_when_absent_from_json() {
+        let json = r#"{
+            "version": "renderer.scene.v1",
+            "canvas": {"width": 64, "height": 64},
+            "nodes": [{
+                "id": "box", "kind": "rect",
+                "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                "color": [1.0, 1.0, 1.0, 1.0]
+            }]
+        }"#;
+        let parsed: SceneV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.nodes[0].kind,
+            NodeKindV1::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                corner_radius: 0.0,
+                fill: FillV1::Solid([1.0, 1.0, 1.0, 1.0]),
+            }
+        );
+        assert_eq!(parsed.validate(), Ok(()));
+    }
+
+    #[test]
+    fn accepts_a_valid_corner_radius() {
+        let mut value = scene();
+        value.nodes[0].kind = NodeKindV1::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 6.0,
+            corner_radius: 3.0,
+            fill: FillV1::Solid([1.0; 4]),
+        };
+        assert_eq!(value.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_a_negative_corner_radius() {
+        let mut value = scene();
+        value.nodes[0].kind = NodeKindV1::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            corner_radius: -1.0,
+            fill: FillV1::Solid([1.0; 4]),
+        };
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidCornerRadius)
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_finite_corner_radius() {
+        let mut value = scene();
+        value.nodes[0].kind = NodeKindV1::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            corner_radius: f32::NAN,
+            fill: FillV1::Solid([1.0; 4]),
+        };
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidCornerRadius)
+        );
+    }
+
+    #[test]
+    fn rejects_a_corner_radius_larger_than_half_the_smaller_dimension() {
+        let mut value = scene();
+        // width=10 height=6 -> max valid radius is 3.0 (half of the
+        // smaller dimension, height).
+        value.nodes[0].kind = NodeKindV1::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 6.0,
+            corner_radius: 3.0001,
+            fill: FillV1::Solid([1.0; 4]),
+        };
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidCornerRadius)
+        );
+    }
+}

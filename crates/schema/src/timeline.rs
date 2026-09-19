@@ -80,3 +80,114 @@ pub enum AnimatedPropertyV1 {
     Color(Color),
     Translate([f32; 2]),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+
+    #[test]
+    fn rejects_unknown_keyframe_targets_and_excessive_animation_work() {
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: String::new(),
+                property: AnimatedPropertyV1::Opacity(1.0),
+            }],
+        });
+        assert!(matches!(
+            value.validate(),
+            Err(SceneValidationError::UnknownKeyframeTarget(_))
+        ));
+
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: "missing".into(),
+                property: AnimatedPropertyV1::Opacity(1.0),
+            }],
+        });
+        assert!(matches!(
+            value.validate(),
+            Err(SceneValidationError::UnknownKeyframeTarget(_))
+        ));
+
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 60,
+            duration_ms: 10_000,
+            keyframes: vec![],
+        });
+        assert!(matches!(
+            value.validate(),
+            Err(SceneValidationError::TooManyAnimationFrames { .. })
+        ));
+
+        let mut value = scene();
+        value.canvas.width = MAX_CANVAS_DIMENSION;
+        value.canvas.height = MAX_CANVAS_DIMENSION;
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 5_000,
+            keyframes: vec![],
+        });
+        assert!(matches!(
+            value.validate(),
+            Err(SceneValidationError::TooManyAnimationPixels { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_a_valid_translate_keyframe() {
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: "box".into(),
+                property: AnimatedPropertyV1::Translate([12.5, -7.0]),
+            }],
+        });
+        assert_eq!(value.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_a_non_finite_translate_keyframe_value() {
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: "box".into(),
+                property: AnimatedPropertyV1::Translate([f32::NAN, 0.0]),
+            }],
+        });
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidTranslate)
+        );
+
+        let mut value = scene();
+        value.timeline = Some(TimelineV1 {
+            fps: 1,
+            duration_ms: 1,
+            keyframes: vec![KeyframeV1 {
+                at_ms: 0,
+                target: "box".into(),
+                property: AnimatedPropertyV1::Translate([0.0, f32::INFINITY]),
+            }],
+        });
+        assert_eq!(
+            value.validate(),
+            Err(SceneValidationError::InvalidTranslate)
+        );
+    }
+}

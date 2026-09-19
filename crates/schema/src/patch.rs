@@ -31,3 +31,28 @@ pub enum PatchOperationV1 {
     SetTimeline { timeline: TimelineV1 },
     ClearTimeline,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_bounded_nonempty_patches() {
+        assert_eq!(
+            ScenePatchV1 {
+                expected_revision: None,
+                operations: vec![],
+            }
+            .validate(),
+            Err(SceneValidationError::InvalidPatch)
+        );
+        assert_eq!(
+            ScenePatchV1 {
+                expected_revision: Some(1),
+                operations: vec![PatchOperationV1::ClearTimeline],
+            }
+            .validate(),
+            Ok(())
+        );
+    }
+}
