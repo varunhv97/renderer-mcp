@@ -22,7 +22,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, Mutex, MutexGuard, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -47,10 +47,19 @@ const DEFAULT_METRICS_DIR: &str = ".renderer/metrics";
 /// in-process or wrapped by [`serve`] for TCP access. A single
 /// `GpuRenderer` is shared across every scene (named or inline) rather than
 /// one per scene, since GPU device/pipeline setup is the expensive part.
-#[derive(Debug)]
+///
+/// Cheaply `Clone`able (both fields are `Arc`s) so [`serve_with_metrics_dir`]
+/// can hand one clone to a thread per connection: `GpuRenderer`'s render
+/// methods take `&self` and touch no shared mutable state (every per-frame
+/// cache is a local built inside that call), so renders on different
+/// connections genuinely run concurrently; `SceneStore` mutations go through
+/// the `Mutex` and are held only long enough to read or update the map, never
+/// for the duration of a render, so a slow `export_named_gif` on one
+/// connection doesn't block a `get_scene`/`patch_scene` on another.
+#[derive(Debug, Clone)]
 pub struct RendererDaemon {
-    renderer: GpuRenderer,
-    scenes: SceneStore,
+    renderer: Arc<GpuRenderer>,
+    scenes: Arc<Mutex<SceneStore>>,
 }
 
 /// Named scenes held by one running daemon, keyed by caller-chosen
@@ -176,41 +185,64 @@ impl DaemonError {
 impl RendererDaemon {
     pub fn new() -> Result<Self, DaemonError> {
         Ok(Self {
-            renderer: GpuRenderer::new()?,
-            scenes: SceneStore::default(),
+            renderer: Arc::new(GpuRenderer::new()?),
+            scenes: Arc::new(Mutex::new(SceneStore::default())),
         })
     }
 
+    /// Locks the scene store, recovering rather than panicking if a prior
+    /// panic (e.g. inside a patch operation on some other connection's
+    /// thread) poisoned it -- one connection's bug shouldn't wedge every
+    /// other connection's access to the store.
+    fn lock_scenes(&self) -> MutexGuard<'_, SceneStore> {
+        self.scenes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn create_scene(
-        &mut self,
+        &self,
         scene_id: String,
         scene: SceneV1,
         asset_root: Option<PathBuf>,
     ) -> Result<u64, DaemonError> {
-        self.scenes.create(scene_id, scene, asset_root)
+        self.lock_scenes().create(scene_id, scene, asset_root)
     }
 
     pub fn get_scene(&self, scene_id: &str) -> Result<SceneSnapshot, DaemonError> {
-        self.scenes.get(scene_id)
+        self.lock_scenes().get(scene_id)
     }
 
     pub fn replace_scene(
-        &mut self,
+        &self,
         scene_id: String,
         scene: SceneV1,
         expected_revision: Option<u64>,
         asset_root: Option<PathBuf>,
     ) -> Result<u64, DaemonError> {
-        self.scenes
+        self.lock_scenes()
             .replace(scene_id, scene, expected_revision, asset_root)
     }
 
-    pub fn patch_scene(&mut self, scene_id: &str, patch: ScenePatchV1) -> Result<u64, DaemonError> {
-        self.scenes.patch(scene_id, patch)
+    pub fn patch_scene(&self, scene_id: &str, patch: ScenePatchV1) -> Result<u64, DaemonError> {
+        self.lock_scenes().patch(scene_id, patch)
     }
 
-    pub fn destroy_scene(&mut self, scene_id: &str) -> Result<(), DaemonError> {
-        self.scenes.destroy(scene_id)
+    pub fn destroy_scene(&self, scene_id: &str) -> Result<(), DaemonError> {
+        self.lock_scenes().destroy(scene_id)
+    }
+
+    /// Looks up the named scene and clones just the (scene, asset_root) pair
+    /// needed to render it, releasing the scene-store lock before handing
+    /// off to the GPU: a render can take seconds, and nothing else touching
+    /// the store should have to wait behind it.
+    fn scene_for_render(&self, scene_id: &str) -> Result<(SceneV1, Option<PathBuf>), DaemonError> {
+        let stored = self.lock_scenes();
+        let stored = stored
+            .scenes
+            .get(scene_id)
+            .ok_or_else(|| DaemonError::SceneNotFound(scene_id.into()))?;
+        Ok((stored.scene.clone(), stored.asset_root.clone()))
     }
 
     pub fn render_scene(
@@ -218,16 +250,12 @@ impl RendererDaemon {
         scene_id: &str,
         output: &Path,
     ) -> Result<RenderedImage, DaemonError> {
-        let stored = self
-            .scenes
-            .scenes
-            .get(scene_id)
-            .ok_or_else(|| DaemonError::SceneNotFound(scene_id.into()))?;
-        require_asset_root(&stored.scene, &stored.asset_root)?;
-        let root = stored.asset_root.as_deref().unwrap_or(Path::new("."));
+        let (scene, asset_root) = self.scene_for_render(scene_id)?;
+        require_asset_root(&scene, &asset_root)?;
+        let root = asset_root.as_deref().unwrap_or(Path::new("."));
         Ok(self
             .renderer
-            .render_png_with_asset_root(&stored.scene, output, root)?)
+            .render_png_with_asset_root(&scene, output, root)?)
     }
 
     pub fn render_gif_scene(
@@ -235,16 +263,12 @@ impl RendererDaemon {
         scene_id: &str,
         output: &Path,
     ) -> Result<RenderedImage, DaemonError> {
-        let stored = self
-            .scenes
-            .scenes
-            .get(scene_id)
-            .ok_or_else(|| DaemonError::SceneNotFound(scene_id.into()))?;
-        require_asset_root(&stored.scene, &stored.asset_root)?;
-        let root = stored.asset_root.as_deref().unwrap_or(Path::new("."));
+        let (scene, asset_root) = self.scene_for_render(scene_id)?;
+        require_asset_root(&scene, &asset_root)?;
+        let root = asset_root.as_deref().unwrap_or(Path::new("."));
         Ok(self
             .renderer
-            .render_gif_with_asset_root(&stored.scene, output, root)?)
+            .render_gif_with_asset_root(&scene, output, root)?)
     }
 
     pub fn render_inline(
@@ -286,7 +310,7 @@ impl RendererDaemon {
     }
 
     pub fn scene_count(&self) -> usize {
-        self.scenes.scenes.len()
+        self.lock_scenes().scenes.len()
     }
 }
 
@@ -587,6 +611,10 @@ struct MetricEvent {
 /// Records request timings for one daemon session (one `serve` invocation)
 /// without blocking the connection-handling loop: `record` only pushes onto
 /// an unbounded channel, and a background thread owns the actual file I/O.
+/// `Clone` (a `String` and an `mpsc::Sender`, both cheap) so every
+/// per-connection thread spawned by [`serve_with_metrics_dir`] can hold its
+/// own handle to the same session's recorder.
+#[derive(Clone)]
 struct MetricsRecorder {
     session_id: String,
     sender: mpsc::Sender<MetricEvent>,
@@ -679,7 +707,7 @@ pub fn serve_with_metrics_dir(
 ) -> Result<(), DaemonError> {
     ensure_loopback(endpoint)?;
     let listener = TcpListener::bind(endpoint).map_err(DaemonError::Bind)?;
-    let mut daemon = RendererDaemon::new()?;
+    let daemon = RendererDaemon::new()?;
     let metrics = metrics_dir.and_then(|dir| match MetricsRecorder::start(dir) {
         Ok(recorder) => Some(recorder),
         Err(error) => {
@@ -687,14 +715,22 @@ pub fn serve_with_metrics_dir(
             None
         }
     });
+    // One thread per connection: `RendererDaemon` is cheap to clone (two
+    // `Arc`s), so a slow request (an animated GIF export can take seconds)
+    // only blocks the connection that made it, not every other in-flight
+    // MCP/CLI call against this daemon.
     for mut stream in listener.incoming().flatten() {
-        let _ = handle_connection(&mut daemon, &mut stream, metrics.as_ref());
+        let daemon = daemon.clone();
+        let metrics = metrics.clone();
+        thread::spawn(move || {
+            let _ = handle_connection(&daemon, &mut stream, metrics.as_ref());
+        });
     }
     Ok(())
 }
 
 fn handle_connection(
-    daemon: &mut RendererDaemon,
+    daemon: &RendererDaemon,
     stream: &mut TcpStream,
     metrics: Option<&MetricsRecorder>,
 ) -> Result<(), DaemonError> {
@@ -749,7 +785,7 @@ fn read_request(stream: &mut TcpStream) -> Result<DaemonRequest, DaemonError> {
     Ok(envelope.request)
 }
 
-fn dispatch(daemon: &mut RendererDaemon, request: DaemonRequest) -> DaemonResponse {
+fn dispatch(daemon: &RendererDaemon, request: DaemonRequest) -> DaemonResponse {
     let result = match request {
         DaemonRequest::Health => Ok(DaemonResult::Health),
         DaemonRequest::CreateScene {
@@ -1145,16 +1181,16 @@ mod tests {
 
     #[test]
     fn dispatch_handles_every_request_kind_end_to_end() {
-        let Ok(mut daemon) = RendererDaemon::new() else {
+        let Ok(daemon) = RendererDaemon::new() else {
             return;
         };
         let directory = tempfile::tempdir().unwrap();
 
-        let health = dispatch(&mut daemon, DaemonRequest::Health);
+        let health = dispatch(&daemon, DaemonRequest::Health);
         assert!(matches!(health.result, Some(DaemonResult::Health)));
 
         let create = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::CreateScene {
                 scene_id: "s".into(),
                 scene: scene(),
@@ -1167,7 +1203,7 @@ mod tests {
         ));
 
         let get = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::GetScene {
                 scene_id: "s".into(),
             },
@@ -1175,7 +1211,7 @@ mod tests {
         assert!(matches!(get.result, Some(DaemonResult::Scene { .. })));
 
         let missing = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::GetScene {
                 scene_id: "nope".into(),
             },
@@ -1183,7 +1219,7 @@ mod tests {
         assert_eq!(missing.error.unwrap().code, "not_found");
 
         let conflict = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::ReplaceScene {
                 scene_id: "s".into(),
                 scene: scene(),
@@ -1194,7 +1230,7 @@ mod tests {
         assert_eq!(conflict.error.unwrap().code, "revision_conflict");
 
         let replace = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::ReplaceScene {
                 scene_id: "s".into(),
                 scene: scene(),
@@ -1208,7 +1244,7 @@ mod tests {
         ));
 
         let patch = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::PatchScene {
                 scene_id: "s".into(),
                 patch: ScenePatchV1 {
@@ -1254,7 +1290,7 @@ mod tests {
         ));
 
         let render = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::RenderScene {
                 scene_id: "s".into(),
                 output: directory.path().join("s.png"),
@@ -1263,7 +1299,7 @@ mod tests {
         assert!(matches!(render.result, Some(DaemonResult::Rendered { .. })));
 
         let render_gif = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::RenderGifScene {
                 scene_id: "s".into(),
                 output: directory.path().join("s.gif"),
@@ -1275,7 +1311,7 @@ mod tests {
         ));
 
         let destroy = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::DestroyScene {
                 scene_id: "s".into(),
             },
@@ -1283,7 +1319,7 @@ mod tests {
         assert!(matches!(destroy.result, Some(DaemonResult::Destroyed)));
 
         let destroy_missing = dispatch(
-            &mut daemon,
+            &daemon,
             DaemonRequest::DestroyScene {
                 scene_id: "s".into(),
             },
