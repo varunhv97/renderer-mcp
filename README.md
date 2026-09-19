@@ -2,54 +2,17 @@
 
 A local GPU-accelerated visual runtime for coding agents.
 
-The workspace is intentionally CLI and MCP first: agents submit a versioned JSON
-scene or drawing-command document, receive a saved image plus structured
-metadata, and can keep a named scene alive during a local daemon session.
-Scenes compose vector shapes, local raster and SVG images, and embedded-font
-text into one ordered GPU pass; PNG and keyframed GIF export both work from
-the same scene document. Nodes can be keyframe-animated by opacity, color, or
-position (an additive `translate` offset applied on top of the node's own
-coordinates, uniform across every node kind). Rects support an optional
-`corner_radius` for rounded corners, and every shape's `color` field accepts
-either a plain solid RGBA array (unchanged from before) or a gradient object
-(`{"kind": "linear_gradient", ...}` or `{"kind": "radial_gradient", ...}`);
-rects and ellipses render a true per-pixel gradient, while lines, paths, and
-text resolve a gradient fill to one flat color. Vector shapes (rects,
-ellipses, lines, paths) are anti-aliased via 4x MSAA plus 2x supersampling
-(the whole scene renders at
-2x linear resolution and is downsampled with a Lanczos3 filter before
-output), matching the anti-aliased edges text and SVG content already had.
-Image nodes accept local PNG, JPEG, GIF, WebP, or SVG assets; SVG assets are
-rasterized directly at each node's declared size rather than decoded and
-rescaled.
+Agents submit a versioned JSON scene (vector shapes, local images and SVG,
+text), and get back a saved PNG or animated GIF plus structured metadata. It
+ships as a CLI (`renderer`) and an MCP server (`renderer-mcp`), so an agent can
+draw something, look at it, and iterate.
 
-An experimental, opt-in analytic (signed-distance-field) anti-aliasing
-pipeline is also available for vector shapes, as a shadow-mode alternative to
-the default MSAA+supersampling path — a completely separate, additive set of
-pipelines/shaders that the default path never touches. Compute a per-fragment
-exact distance to each shape's true boundary instead of sampling/averaging;
-measured more accurate against numeric ground-truth pixel coverage than
-MSAA+supersampling on this project's own test scenes. Try it with:
+## Install
 
-```sh
-cargo run -p renderer-cli -- render --input examples/basic.scene.json --output out.png --experimental-analytic-aa
-```
-
-and compare the result against a normal `render` (no flag) of the same
-input; `.gif` output works too. Not currently wired into the daemon, named
-scenes, or MCP — CLI-only, for local comparison.
-
-## Installation
-
-Requirements:
-
-- A recent stable Rust toolchain (the workspace uses edition 2024, so Rust 1.85
-  or newer).
-- A GPU adapter that [wgpu](https://wgpu.rs) can use: Metal on macOS, Vulkan on
-  Linux, or DX12 on Windows. Rendering runs on the GPU, so a headless machine
-  or container without one cannot render.
-
-Build from source:
+You need a recent stable Rust toolchain (Rust 1.85 or newer) and a GPU that
+[wgpu](https://wgpu.rs) can use: Metal on macOS, Vulkan on Linux, or DX12 on
+Windows. There is no software fallback, so a headless machine without a GPU
+cannot render.
 
 ```sh
 git clone https://github.com/varunhv97/renderer-mcp.git
@@ -57,25 +20,25 @@ cd renderer-mcp
 cargo build --release
 ```
 
-This produces `target/release/renderer` (the CLI) and
-`target/release/renderer-mcp` (the MCP server). To put both on your `PATH`
-instead, install them into `~/.cargo/bin`:
+This produces `target/release/renderer` and `target/release/renderer-mcp`. To
+put them on your `PATH` instead:
 
 ```sh
 cargo install --path crates/cli
 cargo install --path crates/mcp
 ```
 
-Check that rendering works:
+Check that it works:
 
 ```sh
 renderer render --input examples/basic.scene.json --output out.png
 renderer show out.png
 ```
 
-To use it from an MCP-capable agent such as Claude Code, start the daemon and
-register the server (the daemon is only required for the named-scene tools; see
-[MCP server](#mcp-server) for the full tool list):
+## Use it from an agent
+
+Start the daemon, then register the MCP server. The daemon is only needed for
+the named-scene tools; `render_scene` and `show_image` work without it.
 
 ```sh
 renderer daemon serve --endpoint 127.0.0.1:9472
@@ -86,284 +49,54 @@ claude mcp add renderer \
 ```
 
 Restart the agent so it picks the server up. After rebuilding, restart the
-daemon too: a long-running `daemon serve` keeps running the old code.
+daemon too: a running `daemon serve` keeps the old code.
 
-## Supported terminals and limitations
+Typical flow: `create_scene`, optionally `patch_scene`, then `export_named_gif`
+(or `render_named_scene` for a still), then `show_image`.
 
-`renderer show` and the MCP `show_image` tool display the result inline when the
-terminal supports a real graphics protocol, and open it in an external viewer
-otherwise. Details are in [Inline terminal preview](#inline-terminal-preview).
+| Tool | Needs daemon | What it does |
+| --- | --- | --- |
+| `render_scene` | no | One-shot render of an inline scene to PNG |
+| `create_scene`, `get_scene`, `replace_scene`, `patch_scene`, `destroy_scene` | yes | Manage a named scene that stays alive in the daemon |
+| `render_named_scene` | yes | Render a named scene to PNG (a static frame, ignores the timeline) |
+| `export_named_gif` | yes | Export a scene's timeline as an animated GIF |
+| `inspect_image` | no | Dimensions, MIME type and SHA-256 of an image file |
+| `show_image` | no | Display a PNG or GIF inline in your terminal |
+
+## Supported terminals
+
+`show_image` and `renderer show` display results inline when the terminal has a
+real graphics protocol, and open the OS viewer otherwise.
 
 | Environment | How the image is shown | Animated GIFs |
 | --- | --- | --- |
 | [cmux](https://cmux.dev) | Native file-preview panel | Animate natively |
 | Kitty, WezTerm | Kitty graphics protocol | Animate natively |
-| Ghostty | Kitty graphics protocol | Simulated by re-sending frames; `show` keeps running until `--loops` is exhausted |
-| iTerm2 | iTerm2 inline images (OSC 1337) | iTerm2 decodes and loops the GIF itself |
-| Apple Terminal.app and any other terminal | Opens the OS default viewer (`open` on macOS, `xdg-open` on Linux) | Handled by the viewer |
-| Windows | No viewer is launched; the image path is printed | -- |
+| Ghostty | Kitty graphics protocol | Simulated by re-sending frames |
+| iTerm2 | Inline images (OSC 1337) | iTerm2 loops the GIF itself |
+| Apple Terminal.app, anything else | OS default viewer (`open` on macOS, `xdg-open` on Linux) | Handled by the viewer |
+| Windows | No viewer is launched; the path is printed | none |
 
-Known limitations:
+Limitations:
 
-- There is no text or ANSI fallback. A terminal without a graphics protocol gets
-  the system viewer, not a blocky approximation.
-- The protocol is auto-detected from environment variables. Use
-  `--protocol kitty|iterm2` (CLI) or `protocol` (MCP) to override it.
-- When the process has no controlling terminal of its own (for example when an
-  agent spawns it as a detached subprocess), it always uses the system viewer
-  and never writes escape sequences to a terminal it does not own.
-- Use through tmux, screen, or SSH has not been tested. Graphics escape
-  sequences may not pass through those layers.
-- Rendering needs a GPU adapter; there is no software fallback for headless
-  machines.
-- The named-scene MCP tools need a running daemon. `render_scene` and
-  `show_image` do not.
+- There is no text or ANSI fallback.
+- Use through tmux, screen, or SSH has not been tested.
 - The daemon client has a fixed 5 second timeout, so a very large or long
-  animated export can fail with a connection error instead of finishing.
+  animated export can fail with a connection error.
 - The daemon binds loopback addresses only, and scenes can reference local
   assets only. Remote asset fetching is intentionally not supported.
 
-## Development
+## Docs
 
-```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo llvm-cov --workspace --all-targets --all-features --fail-under-lines 65
-```
+- [Rendering and scenes](docs/rendering.md): the scene format, node types,
+  animation, gradients, effects, and one-shot rendering
+- [Persistent named scenes](docs/daemon.md): the daemon, patching, and metrics
+- [MCP server](docs/mcp.md): the JSON-RPC server and its tools in detail
+- [Inline terminal preview](docs/terminal-preview.md): protocol detection,
+  cmux, and every terminal flag
+- [Development](docs/development.md): checks, coverage, and testing
 
-`cargo llvm-cov` needs `llvm-tools`. If your toolchain came from `rustup`,
-`rustup component add llvm-tools-preview` is enough. On a Homebrew-installed
-stable toolchain (no `rustup`), point it at a matching LLVM instead:
+## License
 
-```sh
-brew install llvm
-LLVM_COV="$(brew --prefix llvm)/bin/llvm-cov" \
-LLVM_PROFDATA="$(brew --prefix llvm)/bin/llvm-profdata" \
-cargo llvm-cov --workspace --all-targets --all-features --fail-under-lines 65
-```
-
-Building produces two binaries: `renderer` (CLI, package `renderer-cli`) and
-`renderer-mcp` (MCP server, package `renderer-mcp`).
-
-```sh
-cargo build --release
-```
-
-## One-shot rendering
-
-```sh
-cargo run -p renderer-cli -- render --input examples/basic.scene.json --output out.png
-cargo run -p renderer-cli -- render --input examples/pulse.scene.json --output out.gif
-cargo run -p renderer-cli -- inspect --input out.png
-```
-
-`render` accepts a `SceneV1` JSON document and writes `.png` or `.gif` based on
-the output extension; GIF export uses the scene's keyframe timeline. `inspect`
-reports dimensions, MIME type, and the SHA-256 of the exact output bytes.
-Diagnostics (missing assets, invalid scenes, resource-limit violations) are
-returned as structured JSON, not silent failures.
-
-A scene may also include an optional, scene-level full-canvas post-process
-`effect`: a WGSL `shader` string defining exactly one function,
-`fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>`, that transforms
-the already-composited color at each pixel (see `examples/effect.scene.json`,
-a color-invert effect). The renderer wraps this function in a fixed internal
-template (vertex stage, texture bindings) so authors only ever write a pure
-color transform; they never supply bindings, vertex data, or a full pipeline.
-A shader that fails WGSL validation is rejected with a structured error
-rather than crashing the process.
-
-```sh
-cargo run -p renderer-cli -- render --input examples/effect.scene.json --output out-effect.png
-```
-
-## Persistent named scenes
-
-Start a foreground local daemon in one terminal:
-
-```sh
-cargo run -p renderer-cli -- daemon serve --endpoint 127.0.0.1:9472
-```
-
-In another terminal, create, patch, and render a scene through the same
-loopback-only endpoint. Patch files contain typed `ScenePatchV1` operations and
-may include an `expected_revision` to avoid overwriting a newer scene revision.
-
-```sh
-cargo run -p renderer-cli -- scene --endpoint 127.0.0.1:9472 create demo --input examples/basic.scene.json
-cargo run -p renderer-cli -- scene --endpoint 127.0.0.1:9472 get demo
-cargo run -p renderer-cli -- scene --endpoint 127.0.0.1:9472 render demo --output .renderer/output/demo.png
-cargo run -p renderer-cli -- scene --endpoint 127.0.0.1:9472 destroy demo
-```
-
-The daemon only ever binds a loopback address, caps requests at 1 MiB, and
-rejects unknown fields/operations. Everything under `.renderer/` is generated
-local output and is not committed.
-
-### Per-session performance metrics
-
-Each `daemon serve` run is one session. A background thread appends one JSON
-line per request to `.renderer/metrics/<session-id>.jsonl` (method, scene ID,
-duration, and outcome) so local performance testing doesn't need extra
-instrumentation:
-
-```sh
-cat .renderer/metrics/*.jsonl | jq -c '{method, duration_ms, success}'
-```
-
-Recording only enqueues onto a channel from the request-handling path, so it
-adds no latency there; if the metrics directory can't be created, the daemon
-logs a warning and keeps serving without it.
-
-## Inline terminal preview
-
-`renderer show <path>` displays a local PNG or GIF directly inline in the
-terminal -- useful for a coding-agent workflow where the agent renders a
-visual and wants to show it to the human without them opening a separate
-image viewer:
-
-```sh
-cargo run -p renderer-cli -- show out.png
-cargo run -p renderer-cli -- show out.gif --loops 3
-cargo run -p renderer-cli -- show --clear
-```
-
-### cmux native file preview
-
-In [cmux](https://cmux.dev) (a native macOS terminal for running coding
-agents, built on Ghostty), `show` skips terminal escape sequences entirely
-and instead opens the file in cmux's own **native file-preview panel** -- a
-UI surface completely separate from the terminal grid, so unlike a raw pty
-write it can never land on top of an agent's own actively-redrawn TUI (e.g.
-Claude Code's input box). This is detected automatically: if the
-`CMUX_SOCKET_PATH` environment variable is set and its Unix domain socket
-actually accepts a connection, `show` sends a `file.open` JSON-RPC request
-over that socket and reports `"protocol":"cmux"` in its status JSON, instead
-of running any of the Kitty/iTerm2 detection below. If the variable is
-unset, or the socket can't be reached, `show` falls back to the
-terminal-protocol behavior described in the rest of this section, unchanged.
-Both static PNGs and animated GIFs open the same way -- cmux decodes and
-loops the GIF itself, so there's no simulated-animation loop to run.
-`show --clear` in cmux closes the most recently opened preview surface (its
-id is persisted to `.renderer/cmux-preview-surface.json`, following the same
-local-generated-state convention as `.renderer/metrics/`) via cmux's
-`surface.close` RPC, or is a no-op if nothing was recorded yet -- rather than
-sending a Kitty delete-all command that would have no effect there.
-
-When cmux isn't available, `show` only ever reaches for a **real graphics
-protocol** -- there is no text-based fallback. The terminal protocol is
-auto-detected from environment variables unless overridden:
-
-| Terminal signal | Protocol used |
-| --- | --- |
-| `KITTY_WINDOW_ID`, `TERM=xterm-kitty`, `TERM_PROGRAM=ghostty`, `GHOSTTY_RESOURCES_DIR`, `CMUX_WORKSPACE_ID`/`CMUX_SURFACE_ID` (cmux is Ghostty-based), or `TERM_PROGRAM=WezTerm` | Kitty graphics protocol |
-| `TERM_PROGRAM=iTerm.app` | iTerm2 OSC 1337 inline images |
-| anything else (Apple's Terminal.app included -- it implements neither) | the OS's own default file opener |
-
-Earlier versions of this tool had a third path: an ANSI 24-bit half-block
-text approximation for terminals supporting neither real protocol, driven by
-writing raw escape sequences directly into whatever tty could be found.
-Removed entirely after a full round of live debugging in a real Terminal.app
-window turned up a real quality ceiling as well as a safety issue: writing
-into a discovered-but-unowned tty (the case when `renderer` runs as a
-detached subprocess of an agent's tool-calling mechanism, so stdout is piped
-rather than a real terminal) risks two writers' raw bytes interleaving
-mid-escape-sequence, which once corrupted a real terminal window badly
-enough that not even a terminal reset run the same way could recover it (it
-needs tty ioctl access that subprocess doesn't have); and even after fixing
-that and the resulting color-palette bugs, the text approximation's quality
-ceiling turned out to be low regardless -- confirmed live, even proper
-Floyd-Steinberg error-diffusion dithering read as visible noise rather than
-a smoother gradient at real terminal-cell resolution. A full-quality
-external viewer is strictly better than a blocky, palette-limited
-approximation, so that's the fallback now for every case that isn't a real
-graphics protocol: no known Kitty/iTerm2 signals, or nowhere safe to write
-escape sequences to at all (the same discovered-tty case above, which now
-never attempts a raw write regardless of which protocol would have been
-used). `show` launches the OS's own default file opener as a separate
-process -- `open` on macOS, `xdg-open` on Linux -- reports
-`"protocol":"system_viewer"`, and lets that GUI application (e.g. Preview)
-display the image in its own window, untangled from the terminal entirely.
-`--tty <path>` still writes Kitty/iTerm2 escape sequences directly to an
-explicitly named device when a real protocol is detected, for a caller that
-knows that target is safe. On an OS with no such opener, or if no terminal
-or opener is available at all, `show` prints `no interactive terminal
-detected; image saved at <path>, open it manually` and exits 0 rather than
-failing.
-
-For an animated GIF, WezTerm and plain Kitty use the Kitty protocol's native
-animation extension (the terminal itself handles frame timing and looping).
-Ghostty and cmux support the Kitty graphics protocol but not its animation
-extension, so a GIF headed there is played back as *simulated* animation
-instead: `show` itself loops, retransmitting each frame and sleeping for its
-delay, until `--loops` (0 or omitted means loop forever, like a normal GIF)
-is exhausted or the process is killed. iTerm2 always gets the raw GIF bytes
-as-is and handles decoding and looping itself. The system-viewer path
-doesn't loop anything itself -- Preview/QuickLook handle GIF animation on
-their own once the file is open.
-
-Flags: `--tty <path>` writes to a specific device file instead of
-auto-detecting one (mainly for testing against a particular terminal
-session); `--protocol <auto|kitty|iterm2>` overrides detection (this flag has
-no effect on the cmux path, which is tried first regardless, or on the
-system-viewer fallback, which needs no protocol at all); `--clear` sends
-only a Kitty delete-all-images command and exits (or, in cmux, closes the
-last-opened preview surface as described above); `--loops <n>` bounds a
-simulated/native animation's loop count.
-
-All of the above -- terminal detection, the Kitty/iTerm2 encoders, the
-system-viewer fallback, and the cmux integration -- lives in the shared
-`renderer-terminal` crate (`crates/terminal`), not the CLI binary itself, so
-it also backs the MCP server's `show_image` tool below with identical
-behavior (same protocol detection, same cmux preference, same fallback
-messages), per this workspace's CLI/MCP parity principle.
-
-## MCP server
-
-`renderer-mcp` speaks newline-delimited JSON-RPC over stdio (`initialize`,
-`tools/list`, `tools/call`) and never listens on a network socket. It exposes
-one-shot `render_scene` plus named-scene tools (`create_scene`, `get_scene`,
-`replace_scene`, `patch_scene`, `render_named_scene`, `export_named_gif`,
-`inspect_image`, `destroy_scene`) backed by the same daemon protocol used by
-the CLI, plus `show_image` -- the MCP counterpart to `renderer show`
-described above, sharing its implementation via the `renderer-terminal`
-crate. Named-scene tools require a running `daemon serve` and the endpoint
-supplied via `RENDERER_DAEMON_ENDPOINT`; `render_scene` and `show_image` need
-neither. `show_image` takes `path` (required unless `clear` is true),
-`protocol` (`auto`/`kitty`/`iterm2`, default `auto`), `tty`, `clear`,
-and `loops` -- the same parameters as the CLI's flags -- and returns only a
-text summary (`status` and `protocol` used), not image content: the image is
-already visible to the user via the terminal/cmux mechanism, so there's
-nothing to hand back as base64.
-
-To register it with an MCP-capable agent host, point the host at the built
-binary and set the endpoint as an environment variable, for example:
-
-```json
-{
-  "mcpServers": {
-    "renderer": {
-      "command": "/absolute/path/to/target/release/renderer-mcp",
-      "env": { "RENDERER_DAEMON_ENDPOINT": "127.0.0.1:9472" }
-    }
-  }
-}
-```
-
-Start `renderer daemon serve --endpoint 127.0.0.1:9472` before using any
-named-scene tool; `render_scene` works even without a daemon running. Named
-PNG/GIF exports return the daemon's metadata followed by inline base64 image
-content so compatible hosts can display the result immediately.
-
-## Testing
-
-Unit tests are colocated with each crate; cross-crate CLI and MCP protocol
-tests live under `crates/cli/tests` and `crates/mcp/tests`. The renderer crate
-also includes deterministic golden-image tests (fixtures under
-`crates/renderer/assets/golden/`) that render representative scenes and diff
-the output against checked-in reference PNGs within a documented pixel
-tolerance; like the other GPU-backed tests, they skip rather than fail on a
-host with no GPU adapter. CI enforces formatting, Clippy, the full test suite,
-and a 65% workspace line-coverage floor via `cargo llvm-cov` on macOS, Linux,
-and Windows.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
