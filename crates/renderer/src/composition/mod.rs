@@ -240,7 +240,7 @@ pub(crate) fn composition_plan(
     Ok(plan)
 }
 
-pub(crate) fn upload_dimensions(
+fn upload_dimensions(
     source_width: u32,
     source_height: u32,
     target_width: u32,
@@ -280,10 +280,7 @@ pub(crate) fn add_textured_rect(
     vertices.extend([a, b, c, a, c, d]);
 }
 
-pub(crate) fn reserve_composition_pixels(
-    current: u64,
-    additional: u64,
-) -> Result<u64, RenderError> {
+fn reserve_composition_pixels(current: u64, additional: u64) -> Result<u64, RenderError> {
     let total = current
         .checked_add(additional)
         .ok_or_else(|| RenderError::Asset("composition texture budget overflowed".into()))?;

@@ -36,13 +36,13 @@ pub(crate) const GIF_QUANTIZATION_SPEED: i32 = 10;
 /// training update (see `search_netindex`'s early-exit search), so output
 /// quality doesn't suffer from the palette itself only having been trained
 /// on a sample.
-pub(crate) const PALETTE_TRAINING_PIXEL_BUDGET: usize = 200_000;
+const PALETTE_TRAINING_PIXEL_BUDGET: usize = 200_000;
 
 /// Returns an evenly strided subset of `pixels` (RGBA, 4 bytes per pixel)
 /// with at most `budget` pixels, spread across the whole buffer so a long
 /// animation's later frames contribute samples too, not just its first one.
 /// See [`PALETTE_TRAINING_PIXEL_BUDGET`] for why this exists.
-pub(crate) fn subsample_for_palette_training(pixels: &[u8], budget: usize) -> Vec<u8> {
+fn subsample_for_palette_training(pixels: &[u8], budget: usize) -> Vec<u8> {
     let total_pixels = pixels.len() / 4;
     if total_pixels <= budget {
         return pixels.to_vec();
@@ -184,7 +184,7 @@ pub(crate) fn encode_gif_with_shared_palette(
 // to quantize it); a params struct for this one internal helper would only
 // add indirection, not clarity -- same call as `add_rect_analytic` above.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_gif_frames<W: Write>(
+fn write_gif_frames<W: Write>(
     encoder: &mut gif::Encoder<W>,
     pixels: &[u8],
     frame_len: usize,

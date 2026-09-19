@@ -18,15 +18,15 @@ use wgpu::util::DeviceExt;
 /// buffer are the largest, most expensive-to-allocate resources in the whole
 /// render path.
 pub(crate) struct FrameTargets {
-    pub(crate) texture: wgpu::Texture,
-    pub(crate) view: wgpu::TextureView,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
     // Never read again after `msaa_view` is created from it below, but must
     // stay alive for as long as `msaa_view` does -- kept as a named field
     // (rather than let it drop at the end of `create_frame_targets`) purely
     // for that ownership, not to be used directly.
     #[allow(dead_code)]
-    pub(crate) msaa_texture: wgpu::Texture,
-    pub(crate) msaa_view: wgpu::TextureView,
+    msaa_texture: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
     /// Two readback buffers, not one, ping-ponged across frames by
     /// `GpuRenderer::record_frame`/`finish_frame`: a GIF export can submit
     /// frame N+1's GPU work (into the buffer frame N *isn't* using) while
@@ -35,9 +35,9 @@ pub(crate) struct FrameTargets {
     /// The single-shot PNG path always uses index 0 and never pipelines --
     /// there's only one frame, nothing to overlap.
     pub(crate) output_buffers: [wgpu::Buffer; 2],
-    pub(crate) effect: Option<EffectTargets>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    effect: Option<EffectTargets>,
+    width: u32,
+    height: u32,
 }
 
 /// The extra GPU state a scene's post-process `effect` needs, held on
@@ -46,11 +46,11 @@ pub(crate) struct FrameTargets {
 /// calls, so this alone is worth hoisting out of a GIF's per-frame loop) plus
 /// its own target texture/view and the bind group sampling `FrameTargets`'s
 /// main composite `view`.
-pub(crate) struct EffectTargets {
-    pub(crate) pipeline: wgpu::RenderPipeline,
-    pub(crate) texture: wgpu::Texture,
-    pub(crate) view: wgpu::TextureView,
-    pub(crate) bind_group: wgpu::BindGroup,
+struct EffectTargets {
+    pipeline: wgpu::RenderPipeline,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
 }
 
 /// One frame's GPU work, submitted by [`GpuRenderer::record_frame`] but not
@@ -59,13 +59,13 @@ pub(crate) struct EffectTargets {
 /// readback into declared-size pixels once it's ready (sizing, since the
 /// downsample step needs both the oversized and declared dimensions).
 pub(crate) struct PendingFrame {
-    pub(crate) receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-    pub(crate) unpadded_bytes_per_row: u32,
-    pub(crate) padded_bytes_per_row: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) declared_width: u32,
-    pub(crate) declared_height: u32,
+    receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    unpadded_bytes_per_row: u32,
+    padded_bytes_per_row: u32,
+    width: u32,
+    height: u32,
+    declared_width: u32,
+    declared_height: u32,
 }
 
 impl GpuRenderer {
@@ -89,7 +89,7 @@ impl GpuRenderer {
     /// `AssetCache` across many calls -- e.g. once per GIF frame -- so a
     /// given asset is decoded/rasterized at most once across all of them.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(crate) fn render_composed_rgba_with_cache(
+    fn render_composed_rgba_with_cache(
         &self,
         scene: &SceneV1,
         asset_root: &Path,

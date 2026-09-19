@@ -9,10 +9,10 @@ pub(crate) const ELLIPSE_SEGMENTS: usize = 32;
 /// segments cover one 90-degree corner at the same degrees-per-segment
 /// density (`add_rect`'s tessellation technique otherwise mirrors
 /// `add_ellipse`'s triangle-fan-from-center approach directly).
-pub(crate) const RECT_CORNER_SEGMENTS: usize = ELLIPSE_SEGMENTS / 4;
+const RECT_CORNER_SEGMENTS: usize = ELLIPSE_SEGMENTS / 4;
 
 #[cfg(test)]
-pub(crate) fn vertices_for_scene(scene: &SceneV1) -> (Vec<Vertex>, Vec<String>) {
+fn vertices_for_scene(scene: &SceneV1) -> (Vec<Vertex>, Vec<String>) {
     let mut vertices = Vec::new();
     let warnings = Vec::new();
     for node in &scene.nodes {
@@ -107,7 +107,7 @@ pub(crate) fn add_node_vertices(
 /// between two straight-edge endpoints and the center is already exact.
 // See `add_rect_analytic`'s identical justification for this attribute.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn add_rect(
+fn add_rect(
     vertices: &mut Vec<Vertex>,
     x: f32,
     y: f32,
@@ -172,7 +172,7 @@ pub(crate) fn add_rect(
     vertices.extend([center_vertex, make(last.0, last.1), make(first.0, first.1)]);
 }
 
-pub(crate) fn add_ellipse(
+fn add_ellipse(
     vertices: &mut Vec<Vertex>,
     cx: f32,
     cy: f32,
@@ -203,7 +203,7 @@ pub(crate) fn add_ellipse(
     }
 }
 
-pub(crate) fn add_line(
+fn add_line(
     vertices: &mut Vec<Vertex>,
     start: [f32; 2],
     end: [f32; 2],
@@ -242,7 +242,7 @@ pub(crate) fn add_path(
     }
 }
 
-pub(crate) fn vertex(x: f32, y: f32, color: Color, scene: &SceneV1) -> Vertex {
+fn vertex(x: f32, y: f32, color: Color, scene: &SceneV1) -> Vertex {
     Vertex {
         position: [
             x / scene.canvas.width as f32 * 2.0 - 1.0,

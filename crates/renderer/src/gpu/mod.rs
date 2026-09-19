@@ -60,7 +60,7 @@ pub(crate) const MSAA_SAMPLE_COUNT: u32 = 4;
 /// Memory cost at factor 2 is real and worth stating plainly: the
 /// multisampled texture, resolve texture, and CPU readback buffer are all
 /// 4x the pixel count (factor^2) of a declared-size render.
-pub(crate) const SUPERSAMPLE_FACTOR: u32 = 2;
+const SUPERSAMPLE_FACTOR: u32 = 2;
 
 #[derive(Debug)]
 pub struct GpuRenderer {

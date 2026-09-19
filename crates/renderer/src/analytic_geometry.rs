@@ -1,11 +1,11 @@
 use crate::{fill::*, tessellation::*, vertex::AnalyticVertex};
 use renderer_schema::{Color, FillV1, SceneV1};
 
-pub(crate) const ANALYTIC_SHAPE_RECT: u32 = 0;
+const ANALYTIC_SHAPE_RECT: u32 = 0;
 
-pub(crate) const ANALYTIC_SHAPE_ELLIPSE: u32 = 1;
+const ANALYTIC_SHAPE_ELLIPSE: u32 = 1;
 
-pub(crate) const ANALYTIC_SHAPE_LINE: u32 = 2;
+const ANALYTIC_SHAPE_LINE: u32 = 2;
 
 /// Geometry margin, in scene-pixel units, that every analytic-AA shape
 /// builder expands its emitted triangle(s) by beyond the shape's true
@@ -18,11 +18,11 @@ pub(crate) const ANALYTIC_SHAPE_LINE: u32 = 2;
 /// producing a hard clip at the true edge instead of a smooth fade beside
 /// it. 2 scene pixels is comfortably wider than the ~1-pixel coverage band
 /// `fs_main` computes for any shape/canvas size this renderer supports.
-pub(crate) const ANALYTIC_AA_MARGIN: f32 = 2.0;
+const ANALYTIC_AA_MARGIN: f32 = 2.0;
 
 /// Same clip-space mapping as `vertex()`/`add_textured_rect`'s `point()`
 /// helper above, factored out for the three analytic-AA shape builders.
-pub(crate) fn analytic_clip_position(x: f32, y: f32, scene: &SceneV1) -> [f32; 2] {
+fn analytic_clip_position(x: f32, y: f32, scene: &SceneV1) -> [f32; 2] {
     [
         x / scene.canvas.width as f32 * 2.0 - 1.0,
         1.0 - y / scene.canvas.height as f32 * 2.0,

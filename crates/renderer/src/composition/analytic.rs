@@ -347,7 +347,7 @@ pub(crate) fn composition_plan_analytic(
 /// `Primitive` commands above), otherwise pushes a new one. A no-op when
 /// `start == end` (an unfilled range, matching e.g. `add_line_analytic`'s
 /// early return for a zero-length line).
-pub(crate) fn push_analytic_range(commands: &mut Vec<AnalyticDrawCommand>, start: u32, end: u32) {
+fn push_analytic_range(commands: &mut Vec<AnalyticDrawCommand>, start: u32, end: u32) {
     if start == end {
         return;
     }

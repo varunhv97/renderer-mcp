@@ -70,7 +70,7 @@ pub(crate) fn fill_vertex_color(
     }
 }
 
-pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     [
         a[0] + (b[0] - a[0]) * t,
         a[1] + (b[1] - a[1]) * t,

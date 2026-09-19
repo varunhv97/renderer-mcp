@@ -87,7 +87,7 @@ pub(crate) fn rasterize_svg(
     }
 }
 
-pub(crate) fn rasterize_svg_blocking(
+fn rasterize_svg_blocking(
     data: &[u8],
     asset_root: &Path,
     source: &str,

@@ -81,7 +81,7 @@ pub(crate) fn fill_of(kind: &NodeKindV1) -> Option<FillV1> {
     }
 }
 
-pub(crate) fn interpolate_color(frames: &[&KeyframeV1], at_ms: u32) -> Option<Color> {
+fn interpolate_color(frames: &[&KeyframeV1], at_ms: u32) -> Option<Color> {
     let values: Vec<_> = frames
         .iter()
         .filter_map(|frame| match frame.property {
@@ -94,7 +94,7 @@ pub(crate) fn interpolate_color(frames: &[&KeyframeV1], at_ms: u32) -> Option<Co
     })
 }
 
-pub(crate) fn interpolate_opacity(frames: &[&KeyframeV1], at_ms: u32) -> Option<f32> {
+fn interpolate_opacity(frames: &[&KeyframeV1], at_ms: u32) -> Option<f32> {
     let values: Vec<_> = frames
         .iter()
         .filter_map(|frame| match frame.property {
@@ -107,7 +107,7 @@ pub(crate) fn interpolate_opacity(frames: &[&KeyframeV1], at_ms: u32) -> Option<
     })
 }
 
-pub(crate) fn interpolate_translate(frames: &[&KeyframeV1], at_ms: u32) -> Option<[f32; 2]> {
+fn interpolate_translate(frames: &[&KeyframeV1], at_ms: u32) -> Option<[f32; 2]> {
     let values: Vec<_> = frames
         .iter()
         .filter_map(|frame| match frame.property {

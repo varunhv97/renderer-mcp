@@ -192,7 +192,7 @@ pub(crate) fn create_analytic_pipelines(
     (analytic_pipeline, textured_pipeline_single)
 }
 
-pub(crate) fn color_target() -> wgpu::ColorTargetState {
+fn color_target() -> wgpu::ColorTargetState {
     wgpu::ColorTargetState {
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
