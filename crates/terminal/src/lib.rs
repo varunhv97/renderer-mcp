@@ -42,6 +42,9 @@ use std::{
 /// Cap on how many ancestor processes to walk before giving up on finding a
 /// real controlling terminal -- avoids any pathological loop in a broken
 /// process tree.
+// Ancestor-tty discovery (this and the helpers below) only runs on unix, where
+// `ps` exists; the code still compiles everywhere so its tests do too.
+#[cfg_attr(not(unix), allow(dead_code))]
 const MAX_ANCESTOR_DEPTH: u32 = 32;
 /// Kitty graphics protocol payload chunk size, in base64-encoded bytes.
 const KITTY_CHUNK_LIMIT: usize = 4096;
@@ -494,6 +497,7 @@ enum TerminalResolution {
     /// override still resolves to `Target(TerminalTarget::Device)` and
     /// keeps the old inline-write behavior, since a caller passing that
     /// flag is knowingly taking responsibility for it being safe.
+    #[cfg_attr(not(unix), allow(dead_code))]
     DiscoveredDevice,
     NoTerminal,
 }
@@ -564,6 +568,7 @@ fn open_sink(target: &TerminalTarget) -> Result<Box<dyn Write>, TerminalError> {
 /// True when a `ps` `tty` column value names a real terminal device rather
 /// than "no controlling terminal" -- BSD `ps` (macOS) prints `??`, GNU `ps`
 /// (Linux) prints `?`, and both may print nothing at all.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn is_real_tty_name(tty: &str) -> bool {
     let trimmed = tty.trim();
     !(trimmed.is_empty() || trimmed == "?" || trimmed == "??" || trimmed == "-")
@@ -571,6 +576,7 @@ fn is_real_tty_name(tty: &str) -> bool {
 
 /// Parses one line of `ps -o ppid=,tty= -p <pid>` output. Defensive about
 /// whitespace since BSD and GNU `ps` pad columns differently.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn parse_ps_ppid_tty(output: &str) -> Option<(u32, String)> {
     let line = output.lines().find(|line| !line.trim().is_empty())?;
     let mut fields = line.split_whitespace();
@@ -585,6 +591,7 @@ fn parse_ps_ppid_tty(output: &str) -> Option<(u32, String)> {
 /// `lookup`/parsing fails, or `max_depth` is exceeded. `lookup` is injected
 /// so this is testable against canned `ps` output instead of a live process
 /// tree.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn walk_ancestors_for_tty<F>(start_pid: u32, max_depth: u32, mut lookup: F) -> Option<String>
 where
     F: FnMut(u32) -> Option<String>,

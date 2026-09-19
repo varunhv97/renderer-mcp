@@ -13,6 +13,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # GitHub's Linux runners have no GPU; a software Vulkan driver (lavapipe)
+      # lets wgpu find an adapter so the GPU tests run instead of skipping,
+      # which the 65% line-coverage floor below depends on.
+      - name: Install software Vulkan driver
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, llvm-tools-preview
